@@ -98,6 +98,14 @@ st.markdown(
     .trade-grid {display:grid;grid-template-columns:repeat(3,1fr);gap:7px;}
     .trade-box {background:#1b202a;border-radius:9px;padding:8px 7px;min-height:50px;}
     .trade-box span {display:block;color:#8993a5;font-size:.65rem;margin-bottom:3px;}.trade-box b {font-size:.9rem;}
+    .mobile-summary {display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px;}
+    .mobile-kpi {background:#1b202a;border-radius:11px;padding:10px;}
+    .mobile-kpi span {display:block;color:#8d97aa;font-size:.68rem;margin-bottom:4px;}
+    .mobile-kpi b {font-size:1rem;color:#eef2f8;}
+    .reason-list {margin-top:10px;padding-top:9px;border-top:1px dashed #313846;}
+    .reason-item {font-size:.78rem;line-height:1.65;color:#dce2ec;}
+    .progress-wrap {background:#252b35;border-radius:999px;height:10px;overflow:hidden;margin:8px 0 5px;}
+    .progress-bar {height:100%;background:linear-gradient(90deg,#5ed887,#ffd15c,#ff777d);}
     @media (max-width: 520px) {
         .block-container {padding:.55rem .55rem 1rem;}
         .stock-card {padding:12px 11px; border-radius:14px;}
@@ -1331,32 +1339,37 @@ def _pct_change_from(history, sessions):
 
 
 def analyze_runup_stage(history, event_date_text=""):
-    """최근 60일 박스 돌파와 거래량 확대로 런업 시작·진행·후반을 구분한다."""
+    """최근 60일 가격·거래량으로 런업 시작·진행·후반을 일관되게 판정한다."""
+    empty = {
+        "런업단계": "⚪ 데이터부족", "런업진행도(%)": 0.0,
+        "런업시작일": "", "런업시작가($)": 0.0, "런업이후(%)": 0.0,
+        "3일(%)": 0.0, "5일(%)": 0.0, "10일(%)": 0.0, "20일(%)": 0.0,
+        "거래량배수": 0.0, "최근고점대비(%)": 0.0,
+        "진입판정": "⚪ 일봉 데이터 대기", "진입근거": [],
+    }
     if len(history) < 22:
-        return {
-            "런업단계": "⚪ 데이터부족", "런업진행도(%)": 0.0,
-            "런업시작일": "", "런업시작가($)": 0.0, "런업이후(%)": 0.0,
-            "3일(%)": 0.0, "5일(%)": 0.0, "10일(%)": 0.0, "20일(%)": 0.0,
-            "거래량배수": 0.0, "진입판정": "⚪ 일봉 데이터 대기",
-        }
+        return empty
+
     closes = [to_float(x.get("close")) for x in history]
     highs = [to_float(x.get("high")) for x in history]
     volumes = [to_float(x.get("volume")) for x in history]
     current = closes[-1]
-    lookback = min(60, len(history))
-    start_index = max(0, len(history) - lookback)
-    # 런업 시작: 직전 20일 고점 돌파 + 거래량 1.5배가 처음 나타난 지점.
+    if current <= 0:
+        return empty
+
+    start_index = max(0, len(history) - min(60, len(history)))
     detected = None
+    # 첫 유효 돌파일: 직전 20일 고점 +1% 돌파와 거래량 1.5배를 동시에 만족.
     for i in range(max(start_index + 20, 20), len(history)):
         prior_high = max(highs[i-20:i])
-        prior_vol = sum(volumes[i-20:i]) / 20 if sum(volumes[i-20:i]) > 0 else 0
-        breakout = closes[i] >= prior_high * 1.01
-        vol_expand = prior_vol > 0 and volumes[i] >= prior_vol * 1.5
-        if breakout and vol_expand:
+        prior_vols = volumes[i-20:i]
+        prior_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 0
+        if closes[i] >= prior_high * 1.01 and prior_vol > 0 and volumes[i] >= prior_vol * 1.5:
             detected = i
             break
+
+    # 명확한 돌파가 없으면 최근 60일 저점 이후 8% 상승한 첫날을 보조 시작점으로 사용.
     if detected is None:
-        # 박스권 저점 이후 첫 8% 상승점을 보조 시작점으로 사용.
         window = closes[start_index:]
         low_rel = min(range(len(window)), key=lambda j: window[j])
         low_index = start_index + low_rel
@@ -1365,9 +1378,13 @@ def analyze_runup_stage(history, event_date_text=""):
             if closes[i] >= closes[low_index] * 1.08:
                 detected = i
                 break
+
     start_price = closes[detected]
     runup_gain = (current / start_price - 1) * 100 if start_price > 0 else 0.0
-    avg20 = sum(volumes[-21:-1]) / min(20, len(volumes[-21:-1])) if volumes[-21:-1] else 0
+    ret3, ret5 = _pct_change_from(history, 3), _pct_change_from(history, 5)
+    ret10, ret20 = _pct_change_from(history, 10), _pct_change_from(history, 20)
+    prior_20_vols = volumes[-21:-1]
+    avg20 = sum(prior_20_vols) / len(prior_20_vols) if prior_20_vols else 0
     volume_multiple = volumes[-1] / avg20 if avg20 > 0 else 0.0
     recent_high = max(highs[max(detected, len(history)-20):])
     drawdown = (current / recent_high - 1) * 100 if recent_high > 0 else 0.0
@@ -1375,37 +1392,60 @@ def analyze_runup_stage(history, event_date_text=""):
     event_date = _parse_iso_or_us_date(event_date_text)
     today = datetime.now(ZoneInfo("America/New_York")).date()
     days = (event_date - today).days if event_date else None
-    # 진행도: 상승폭·이벤트 근접·최근 고점 접근도를 합산. 예측값이 아닌 단계 지표다.
-    gain_progress = min(max(runup_gain, 0) / 80 * 55, 55)
-    event_progress = 0
-    if days is not None:
-        event_progress = 30 if days <= 2 else 24 if days <= 5 else 17 if days <= 10 else 10 if days <= 20 else 4
-    high_progress = 15 if drawdown >= -3 else 10 if drawdown >= -8 else 5
-    progress = min(100.0, gain_progress + event_progress + high_progress)
 
-    ret3, ret5 = _pct_change_from(history, 3), _pct_change_from(history, 5)
-    ret10, ret20 = _pct_change_from(history, 10), _pct_change_from(history, 20)
-    if progress < 35 and runup_gain <= 35:
+    # 진행도는 반드시 단계와 같은 방향으로 움직이도록 구성한다.
+    gain_component = min(max(runup_gain, 0.0), 120.0) / 120.0 * 60.0
+    time_component = 0.0
+    if days is not None:
+        time_component = (
+            30.0 if days <= 2 else
+            24.0 if days <= 5 else
+            17.0 if days <= 10 else
+            10.0 if days <= 20 else
+            4.0
+        )
+    high_component = 10.0 if drawdown >= -3 else 6.0 if drawdown >= -8 else 2.0
+    progress = round(min(100.0, max(0.0, gain_component + time_component + high_component)), 1)
+
+    # 시작 이후 하락이면 런업 실패/무효로 처리.
+    if runup_gain < -5:
+        stage = "⚪ 런업 무효"
+        entry = "🔴 신규진입 금지"
+    elif progress < 35:
         stage = "🟢 런업 초기"
-    elif progress < 70 and runup_gain <= 90:
+        entry = "👀 초기 돌파 확인"
+    elif progress < 70:
         stage = "🟡 런업 진행"
+        entry = "🟡 눌림 진입대기"
     else:
         stage = "🔴 런업 후반"
-
-    # 진입은 초기 또는 건강한 중기 눌림에서만 허용한다.
-    healthy_pullback = -8 <= drawdown <= -1
-    acceleration = ret3 > 0 and ret5 > 0 and volume_multiple >= 1.2
-    if stage.startswith("🟢") and acceleration and (days is None or 5 <= days <= 30):
-        entry = "🔥 지금 진입 검토"
-    elif stage.startswith("🟡") and healthy_pullback and ret3 >= -3 and volume_multiple >= 0.8:
-        entry = "🟡 눌림 분할진입 대기"
-    elif stage.startswith("🔴") or (days is not None and days <= 2):
         entry = "🔴 신규진입 금지"
-    else:
-        entry = "👀 관찰"
+
+    healthy_pullback = -8 <= drawdown <= -1
+    momentum_ok = ret3 > 0 and ret5 > 0
+    volume_ok = volume_multiple >= 1.2
+    event_window_ok = days is None or 5 <= days <= 30
+
+    reasons = []
+    if momentum_ok:
+        reasons.append("최근 3·5일 상승")
+    if volume_ok:
+        reasons.append(f"거래량 {volume_multiple:.1f}배")
+    if healthy_pullback:
+        reasons.append(f"고점 대비 {drawdown:.1f}% 눌림")
+    if event_window_ok:
+        reasons.append("이벤트 시기 적정")
+    if runup_gain <= 35:
+        reasons.append("아직 과도한 선반영 아님")
+
+    if stage.startswith("🟢") and momentum_ok and volume_ok and event_window_ok and 0 <= runup_gain <= 35:
+        entry = "🔥 지금 진입 검토"
+    elif stage.startswith("🟡") and healthy_pullback and ret3 >= -3 and volume_multiple >= 0.8 and event_window_ok:
+        entry = "🟡 눌림 분할진입 대기"
+
     return {
         "런업단계": stage,
-        "런업진행도(%)": round(progress, 1),
+        "런업진행도(%)": progress,
         "런업시작일": str(history[detected].get("date") or ""),
         "런업시작가($)": round(start_price, 4),
         "런업이후(%)": round(runup_gain, 1),
@@ -1414,6 +1454,7 @@ def analyze_runup_stage(history, event_date_text=""):
         "거래량배수": round(volume_multiple, 2),
         "최근고점대비(%)": round(drawdown, 1),
         "진입판정": entry,
+        "진입근거": reasons,
     }
 
 
@@ -1519,7 +1560,7 @@ def build_dynamic_us_runup_top5(token, session_mode):
             )
         )
         technical = _runup_technical_score(item)
-        total = technical + max(best_event_score, 0)
+        raw_total = technical + max(best_event_score, 0)
         try:
             history = get_us_daily_history(token, item.get("거래소코드"), ticker, 80)
             stage_info = analyze_runup_stage(history, (best_event or {}).get("event_date"))
@@ -1528,9 +1569,9 @@ def build_dynamic_us_runup_top5(token, session_mode):
             news_errors.append(f"{ticker} 일봉: {history_error}")
         # 초기·진행 단계는 가점, 후반은 감점한다.
         stage_name = str(stage_info.get("런업단계") or "")
-        total += 18 if stage_name.startswith("🟢") else 8 if stage_name.startswith("🟡") else -18 if stage_name.startswith("🔴") else 0
+        raw_total += 18 if stage_name.startswith("🟢") else 8 if stage_name.startswith("🟡") else -18 if stage_name.startswith("🔴") else 0
         if not verified:
-            total -= 18
+            raw_total -= 18
             best_event = {
                 "event_title": "기술적 후보·구체적 일정 미확인",
                 "event_date": "",
@@ -1541,6 +1582,9 @@ def build_dynamic_us_runup_top5(token, session_mode):
 
         rate = to_float(item.get("등락률(%)"))
         vwap_gap = to_float(item.get("VWAP위치(%)"))
+        runup_gain = to_float(stage_info.get("런업이후(%)"))
+        # 100점 체계로 정규화한다. 예측확률이 아니라 후보 비교점수다.
+        total = max(0.0, min(100.0, raw_total))
         entry_decision = str(stage_info.get("진입판정") or "👀 관찰")
         if entry_decision.startswith("🔥") and verified and total >= 70 and -2 <= vwap_gap <= 6:
             verdict = "🔥 런업 진입후보"
@@ -1552,6 +1596,10 @@ def build_dynamic_us_runup_top5(token, session_mode):
             verdict = "👀 런업 관찰"
         else:
             verdict = "⚪ 재료·추세 확인"
+
+        # 재료가 확인되지 않았거나 기타 분류이거나 런업 시작 이후 -5% 이하이면 Top5에서 제외한다.
+        if (not verified) or best_category == "기타" or runup_gain < -5:
+            continue
 
         item.update(stage_info)
         item.update({
@@ -5112,52 +5160,71 @@ if has_current_scan and not is_domestic:
     table = st.session_state["scan_table"].copy()
 
     if strategy_code == "runup":
-        st.subheader("🚀 미국 런업 자동분류 Top 5")
-        st.caption("미국 소형 바이오·임상·FDA·계약·AI·우주 이벤트주만 선별합니다. 우량주와 급등주 엔진은 기존대로 유지됩니다.")
-        runup_cols = [
-            "런업순위", "종목코드", "종목명", "런업분류", "현재가($)",
-            "등락률(%)", "런업이후(%)", "3일(%)", "5일(%)", "10일(%)", "20일(%)",
-            "런업단계", "런업진행도(%)", "거래량배수", "런업점수", "현재판정",
-            "D-day", "예정일", "재료", "재료확인", "자료출처",
-        ]
-        visible_cols = [column for column in runup_cols if column in table.columns]
-        st.dataframe(table[visible_cols].head(5), use_container_width=True, hide_index=True)
-        for _, runup_row in table.head(5).iterrows():
-            category = html.escape(str(runup_row.get("런업분류") or "기타"))
-            ticker = html.escape(str(runup_row.get("종목코드") or ""))
-            name = html.escape(str(runup_row.get("종목명") or ticker))
-            verdict = html.escape(str(runup_row.get("현재판정") or ""))
-            catalyst = html.escape(str(runup_row.get("재료") or ""))
-            dday = html.escape(str(runup_row.get("D-day") or ""))
-            score = to_float(runup_row.get("런업점수"))
-            price = to_float(runup_row.get("현재가($)"))
-            rate = to_float(runup_row.get("등락률(%)"))
-            stage = html.escape(str(runup_row.get("런업단계") or ""))
-            progress = to_float(runup_row.get("런업진행도(%)"))
-            runup_gain = to_float(runup_row.get("런업이후(%)"))
-            r3, r5 = to_float(runup_row.get("3일(%)")), to_float(runup_row.get("5일(%)"))
-            r10, r20 = to_float(runup_row.get("10일(%)")), to_float(runup_row.get("20일(%)"))
-            vol_multi = to_float(runup_row.get("거래량배수"))
-            start_date = html.escape(str(runup_row.get("런업시작일") or ""))
-            start_price = to_float(runup_row.get("런업시작가($)"))
-            klass = "v-green" if verdict.startswith(("🟢", "🔥")) else "v-yellow" if verdict.startswith(("🟡", "👀")) else "v-red" if verdict.startswith("🔴") else "v-gray"
-            render_compact_html(f"""
-            <div class="stock-card">
-              <div class="card-head"><div><div class="stock-name">{name}</div><div class="ticker">{ticker} · {category} · {dday}</div></div>
-              <div><div class="price">${price:,.4f}</div><div class="{'change-up' if rate >= 0 else 'change-down'}">{rate:+.2f}%</div></div></div>
-              <div class="verdict {klass}">{verdict} · {stage} · 진행도 {progress:.0f}%</div>
-              <div class="metric-grid">
-                <div class="metric"><span>런업 시작</span><b>{start_date} · ${start_price:,.4f}</b></div>
-                <div class="metric"><span>시작 이후</span><b>{runup_gain:+.1f}%</b></div>
-                <div class="metric"><span>3일 / 5일</span><b>{r3:+.1f}% / {r5:+.1f}%</b></div>
-                <div class="metric"><span>10일 / 20일</span><b>{r10:+.1f}% / {r20:+.1f}%</b></div>
-                <div class="metric"><span>거래량</span><b>20일 평균의 {vol_multi:.2f}배</b></div>
-                <div class="metric"><span>폭발가능성 점수</span><b>{score:.1f}</b></div>
-              </div>
-              <div class="footnote">{catalyst}</div>
-            </div>
-            """)
-        st.warning("런업 점수는 후보 우선순위이며 상승을 보장하지 않습니다. FDA·임상 일정은 회사 공시와 FDA 공식 자료를 최종 확인하세요.")
+        st.subheader("🚀 미국 소형주 런업 TOP5")
+        st.caption("FDA·임상·실적·계약·AI·우주 재료가 확인된 소형주만 표시합니다. 대형 우량주는 제외됩니다.")
+
+        if table.empty:
+            st.warning("현재 조건을 통과한 런업 후보가 없습니다.")
+        else:
+            for _, runup_row in table.head(5).iterrows():
+                category = html.escape(str(runup_row.get("런업분류") or ""))
+                ticker = html.escape(str(runup_row.get("종목코드") or ""))
+                name = html.escape(str(runup_row.get("종목명") or ticker))
+                verdict = html.escape(str(runup_row.get("현재판정") or ""))
+                catalyst = html.escape(str(runup_row.get("재료") or ""))
+                dday = html.escape(str(runup_row.get("D-day") or ""))
+                score = max(0.0, min(100.0, to_float(runup_row.get("런업점수"))))
+                price = to_float(runup_row.get("현재가($)"))
+                rate = to_float(runup_row.get("등락률(%)"))
+                stage = html.escape(str(runup_row.get("런업단계") or ""))
+                progress = max(0.0, min(100.0, to_float(runup_row.get("런업진행도(%)"))))
+                runup_gain = to_float(runup_row.get("런업이후(%)"))
+                vol_multi = to_float(runup_row.get("거래량배수"))
+                start_date = html.escape(str(runup_row.get("런업시작일") or ""))
+                drawdown = to_float(runup_row.get("최근고점대비(%)"))
+                reasons = runup_row.get("진입근거") or []
+                if isinstance(reasons, str):
+                    reasons = [reasons]
+                reasons_html = "".join(
+                    f'<div class="reason-item">✓ {html.escape(str(reason))}</div>'
+                    for reason in reasons[:5]
+                ) or '<div class="reason-item">• 조건 확인 중</div>'
+                klass = (
+                    "v-green" if verdict.startswith(("🟢", "🔥"))
+                    else "v-yellow" if verdict.startswith(("🟡", "👀"))
+                    else "v-red" if verdict.startswith("🔴")
+                    else "v-gray"
+                )
+                render_compact_html(f"""
+                <div class="stock-card">
+                  <div class="card-head">
+                    <div>
+                      <div class="stock-name">{name}</div>
+                      <div class="ticker">{ticker} · {category} · {dday}</div>
+                    </div>
+                    <div>
+                      <div class="price">${price:,.4f}</div>
+                      <div class="{'change-up' if rate >= 0 else 'change-down'}">{rate:+.2f}%</div>
+                    </div>
+                  </div>
+                  <div class="verdict {klass}">{verdict}</div>
+                  <div class="mobile-summary">
+                    <div class="mobile-kpi"><span>런업 단계</span><b>{stage}</b></div>
+                    <div class="mobile-kpi"><span>시작 이후</span><b>{runup_gain:+.1f}%</b></div>
+                    <div class="mobile-kpi"><span>거래량</span><b>{vol_multi:.1f}배</b></div>
+                    <div class="mobile-kpi"><span>폭발 가능성</span><b>{score:.0f}/100</b></div>
+                  </div>
+                  <div class="progress-wrap"><div class="progress-bar" style="width:{progress:.0f}%"></div></div>
+                  <div class="footnote">진행도 {progress:.0f}% · 시작 {start_date} · 고점 대비 {drawdown:+.1f}%</div>
+                  <div class="reason-list">
+                    <div class="trade-title">왜 이 후보인가</div>
+                    {reasons_html}
+                  </div>
+                  <div class="footnote">{catalyst}</div>
+                </div>
+                """)
+
+        st.warning("폭발 가능성 점수와 진행도는 비교 지표이며 수익 확률이 아닙니다. 일정은 회사 공시와 공식 자료로 최종 확인하세요.")
     # 화면을 가만히 보고 있어도 시세 나이는 계속 증가해야 한다.
     if "수신타임스탬프" in table.columns:
         now_epoch = time.time()
@@ -5736,6 +5803,65 @@ if has_current_scan and not is_domestic:
             st.warning("이 표는 후보 압축용이며 매수 신호가 아닙니다. RSI·MACD는 선택 종목 정밀검사에서 확인하세요.")
 
 
+def render_domestic_mobile_live_card(selected_row, scanner_type, auto_live):
+    """모바일용 국내 선택 종목 자동감시 카드."""
+    ticker = str(selected_row.get("종목코드") or "")
+    base_row = dict(selected_row)
+    now = time.time()
+    cache_key = f"kr_live_analysis_{scanner_type}_{ticker}"
+    cached = st.session_state.get(cache_key, {})
+    try:
+        token = issue_access_token(APP_KEY, APP_SECRET)
+        quote = get_integrated_price(token, ticker) or {}
+        base_row.update(quote)
+        # 분봉은 8초마다만 갱신해 API 호출을 줄인다.
+        if (not cached) or now - float(cached.get("updated_at", 0) or 0) >= 8:
+            minute = get_recent_minutes(token, ticker, pages=2)
+            if len(minute) >= 35:
+                analysis = analyze_selected_stock(minute, base_row)
+                cached = {"analysis": analysis, "updated_at": now}
+                st.session_state[cache_key] = cached
+        analysis = cached.get("analysis")
+    except Exception as error:
+        analysis = cached.get("analysis")
+        st.caption(f"국내 자동감시 지연: {error}")
+
+    name = html.escape(str(base_row.get("종목명") or ticker))
+    price = to_int(base_row.get("현재가"))
+    rate = to_float(base_row.get("등락률(%)"))
+    verdict = "⚪ 차트 계산 대기"
+    klass = "v-gray"
+    reasons = []
+    if analysis:
+        if analysis.get("status_color") == "green":
+            verdict, klass = "🟢 지금 진입 검토", "v-green"
+        elif analysis.get("status_color") == "yellow":
+            verdict, klass = "🟡 눌림·재돌파 대기", "v-yellow"
+        else:
+            verdict, klass = "🔴 조건 미충족", "v-red"
+        if 0 <= to_float(analysis.get("vwap_gap")) <= 2:
+            reasons.append("VWAP 근처 또는 위")
+        if analysis.get("bullish_macd"):
+            reasons.append("MACD 상승")
+        if analysis.get("trend_1") and analysis.get("trend_3"):
+            reasons.append("1·3분 추세 상승")
+        if to_float(analysis.get("volume_speed")) >= 1:
+            reasons.append(f"거래량 {to_float(analysis.get('volume_speed')):.1f}배")
+    reason_html = "".join(f'<div class="reason-item">✓ {html.escape(x)}</div>' for x in reasons[:4])
+    render_compact_html(f"""
+    <div class="stock-card">
+      <div class="card-head">
+        <div><div class="stock-name">{name}</div><div class="ticker">{ticker} · 국내 자동감시</div></div>
+        <div><div class="price">{price:,}원</div><div class="{'change-up' if rate >= 0 else 'change-down'}">{rate:+.2f}%</div></div>
+      </div>
+      <div class="verdict {klass}">{verdict}</div>
+      <div class="reason-list">{reason_html or '<div class="reason-item">• 조건 계산 중</div>'}</div>
+      <div class="footnote">현재가 약 4초 · 차트판정 약 8초 자동갱신 · 자동주문 없음</div>
+    </div>
+    """)
+
+
+
 if has_current_scan and is_domestic:
     table = st.session_state["scan_table"]
     display_columns = [
@@ -5772,9 +5898,29 @@ if has_current_scan and is_domestic:
         f"{row['현재판정']}  {row['종목명']} ({row['종목코드']})": index
         for index, row in preferred.iterrows()
     }
-    selected_label = st.selectbox("정밀검사할 종목", list(labels.keys()))
+    selected_label = st.selectbox(
+        "정밀검사할 종목",
+        list(labels.keys()),
+        label_visibility="collapsed" if MOBILE_SIMPLE_UI else "visible",
+    )
+    selected_row_for_live = table.loc[labels[selected_label]].to_dict()
+    kr_auto_live = st.toggle(
+        "⚡ 국내 자동 실시간 감시",
+        value=True,
+        key=f"kr_auto_live_{scanner_type}",
+        help="현재가는 약 4초마다, 차트판정은 약 8초마다 자동 갱신합니다.",
+    )
+    if hasattr(st, "fragment"):
+        @st.fragment(run_every="4s" if kr_auto_live else None)
+        def _domestic_live_fragment():
+            render_domestic_mobile_live_card(selected_row_for_live, scanner_type, kr_auto_live)
+        _domestic_live_fragment()
+    else:
+        render_domestic_mobile_live_card(selected_row_for_live, scanner_type, False)
+        if kr_auto_live:
+            st.warning("자동 부분갱신을 위해 Streamlit을 최신 버전으로 업데이트하세요.")
 
-    if st.button("선택 종목 한눈에 검사", type="secondary"):
+    if st.button("선택 종목 상세검사", type="secondary", use_container_width=True):
         selected_row = table.loc[labels[selected_label]]
         st.session_state.pop("last_analysis", None)
         try:
@@ -5843,7 +5989,7 @@ if (
 
 if has_current_scan and is_domestic:
     table = st.session_state["scan_table"]
-    with st.expander(f"전체 {len(table)}종목 표 보기"):
+    with st.expander(f"전체 {len(table)}종목 표 보기 · 필요할 때만 열기", expanded=False):
         st.caption("현재가·VWAP·거래량·거래대금은 한국투자증권 통합시장(UN) 값입니다.")
         safe_display_columns = [column for column in display_columns if column in table.columns]
         st.dataframe(
