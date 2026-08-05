@@ -3620,6 +3620,85 @@ def render_us_reference_card(item):
     )
 
 
+def update_us_signal_item_in_state(updated_item):
+    """자동 감시로 갱신한 종목 카드 한 개를 세션 목록에 반영한다."""
+    ticker = str((updated_item.get("row") or {}).get("종목코드", "")).upper()
+    items = list(st.session_state.get("us_penny_signals", []))
+    replaced = False
+    for index, item in enumerate(items):
+        item_ticker = str((item.get("row") or {}).get("종목코드", "")).upper()
+        if ticker and item_ticker == ticker:
+            items[index] = updated_item
+            replaced = True
+            break
+    if not replaced:
+        items.insert(0, updated_item)
+    st.session_state["us_penny_signals"] = items[:12]
+
+
+def refresh_one_us_signal_item(item, session_choice, scanner_type, deep_check=False):
+    """선택 종목 한 개만 빠르게 현재가 갱신하고 필요할 때 분봉 신호도 재계산한다."""
+    row = dict(item.get("row") or {})
+    ticker = str(row.get("종목코드", "")).upper()
+    exchange = str(row.get("거래소코드", "")).upper()
+    if not ticker or not exchange:
+        return item, "종목코드 또는 거래소코드가 없습니다."
+
+    token = issue_access_token(APP_KEY, APP_SECRET)
+    session_mode, session_detail, _ = resolve_us_session(session_choice)
+    one = pd.DataFrame([row])
+    rest_rows, rest_errors = get_us_multiple_prices(token, [(exchange, ticker)], session_mode)
+    if rest_rows:
+        one = apply_us_rest_prices(one, rest_rows, "penny" if scanner_type == "penny" else "momentum")
+        row = one.iloc[0].to_dict()
+        row["세션"] = session_detail
+
+    analysis = item.get("analysis")
+    error = item.get("error", "")
+    if deep_check:
+        minute = get_us_recent_minutes(token, exchange, ticker, session_mode, pages=1)
+        if len(minute) >= 35:
+            analysis = analyze_us_penny_stock(minute, row)
+            error = ""
+        else:
+            error = f"분봉 {len(minute)}개(최소 35개 필요)"
+
+    updated = {"row": row, "analysis": analysis, "error": error}
+    update_us_signal_item_in_state(updated)
+    return updated, " / ".join(rest_errors)
+
+
+def render_auto_us_card(item, session_choice, scanner_type, auto_enabled):
+    """Streamlit fragment를 지원하면 선택 카드만 주기적으로 다시 실행한다."""
+    if not auto_enabled:
+        render_us_reference_card(item)
+        render_us_entry_lock_controls(item, scanner_type)
+        return
+
+    ticker = str((item.get("row") or {}).get("종목코드", "")).upper()
+    counter_key = f"auto_signal_counter_{scanner_type}_{ticker}"
+    counter = int(st.session_state.get(counter_key, 0)) + 1
+    st.session_state[counter_key] = counter
+    # 현재가는 매 회차 갱신하고, 분봉 신호는 약 8초마다 재계산해 API 과호출을 줄인다.
+    deep_check = counter == 1 or counter % 2 == 0
+    try:
+        updated, warning = refresh_one_us_signal_item(
+            item, session_choice, scanner_type, deep_check=deep_check
+        )
+        render_us_reference_card(updated)
+        render_us_entry_lock_controls(updated, scanner_type)
+        if warning:
+            st.caption(f"자동감시 일부 경고: {warning}")
+        st.caption(
+            "자동감시 ON · 현재가 약 4초 간격 · 첫 눌림/재상승 판정 약 8초 간격 "
+            "· 접근토큰은 저장된 토큰을 재사용합니다."
+        )
+    except Exception as error:
+        render_us_reference_card(item)
+        render_us_entry_lock_controls(item, scanner_type)
+        st.caption(f"자동감시 일시 실패: {error}")
+
+
 def render_us_entry_lock_controls(item, scanner_type):
     """녹색 카드에서만 실제 체결가를 고정한다."""
     row = item.get("row") or {}
@@ -4330,16 +4409,8 @@ if has_current_scan and not is_domestic:
                             active_position,
                         ),
                     }
-            if strategy_code in ("penny", "momentum"):
-                # 깊은 과거재생 결과는 90초 캐시하고,
-                # 빠른 갱신에서는 최신 120분봉만 다시 판독한다.
-                st.session_state["us_penny_signals"] = analyze_us_penny_candidates(
-                    issue_access_token(APP_KEY, APP_SECRET),
-                    table,
-                    session_mode,
-                    limit=12,
-                    pages=1,
-                )
+            # 빠른 새로고침에서는 12종목 분봉을 전부 다시 읽지 않는다.
+            # 선택 카드는 자동감시 fragment가 별도로 현재가·첫 눌림 신호를 갱신한다.
             st.toast(f"현재가 {len(rest_rows)}종목 · 실체결 {len(snapshots)}종목 갱신 완료")
             st.rerun()
         except Exception as error:
@@ -4383,8 +4454,27 @@ if has_current_scan and not is_domestic:
                 key=f"simple_card_{scanner_type}",
             )
             selected_item = signal_items[labels[selected_label]]
-            render_us_reference_card(selected_item)
-            render_us_entry_lock_controls(selected_item, scanner_type)
+            auto_live = st.toggle(
+                "⚡ 자동 실시간 감시",
+                value=True,
+                key=f"auto_live_{scanner_type}",
+                help="현재가는 약 4초마다, 첫 눌림·재상승 판정은 약 8초마다 자동 갱신합니다.",
+            )
+            if hasattr(st, "fragment"):
+                @st.fragment(run_every="4s" if auto_live else None)
+                def _selected_live_fragment():
+                    render_auto_us_card(
+                        selected_item, us_session_choice, scanner_type, auto_live
+                    )
+                _selected_live_fragment()
+            else:
+                render_us_reference_card(selected_item)
+                render_us_entry_lock_controls(selected_item, scanner_type)
+                if auto_live:
+                    st.warning(
+                        "현재 Streamlit 버전은 자동 부분갱신을 지원하지 않습니다. "
+                        "터미널에서 pip install -U streamlit 후 다시 실행하세요."
+                    )
 
     if not MOBILE_SIMPLE_UI and strategy_code in ("penny", "momentum"):
         st.subheader("⚡ 삼중순위 교집합 후보")
