@@ -1,5 +1,7 @@
+import html
 import time
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -14,6 +16,62 @@ st.set_page_config(
 
 st.title("📡 국내 우량주 당일 단타 스캐너")
 st.caption("통합시장 현재가로 1차 선별한 뒤, 선택 종목의 RSI·MACD·VWAP·1·3·5·15분 추세를 검사합니다.")
+
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 1rem; padding-bottom: 2rem; max-width: 760px;}
+    h1 {font-size: clamp(1.65rem, 7vw, 2.35rem) !important; line-height: 1.15 !important;}
+    h2, h3 {font-size: 1.15rem !important;}
+    div[data-testid="stButton"] > button {width: 100%; min-height: 3rem; font-weight: 800;}
+    div[data-testid="stSelectbox"] {margin-bottom: .2rem;}
+    .stock-card {
+        background: #11151d;
+        color: #e7ebf3;
+        border: 1px solid #293142;
+        border-radius: 18px;
+        padding: 16px;
+        margin: 10px 0;
+        box-shadow: 0 8px 24px rgba(0,0,0,.18);
+    }
+    .card-head {display:flex; justify-content:space-between; gap:12px; align-items:flex-start;}
+    .stock-name {font-size:1.3rem; font-weight:900; line-height:1.2;}
+    .ticker {color:#8b95a8; font-size:.82rem; margin-top:4px;}
+    .price {font-size:1.35rem; font-weight:900; color:#f4f7fb; text-align:right; white-space:nowrap;}
+    .change-up {color:#57cf78; font-size:.86rem; text-align:right;}
+    .change-down {color:#ff6b6b; font-size:.86rem; text-align:right;}
+    .verdict {margin:14px 0 10px; padding:10px 12px; border-radius:11px; font-weight:900; font-size:1.05rem;}
+    .v-green {background:#153723; color:#6ee79a; border:1px solid #285f3c;}
+    .v-yellow {background:#3c3213; color:#ffd45d; border:1px solid #6b571a;}
+    .v-red {background:#431d20; color:#ff858b; border:1px solid #743038;}
+    .v-gray {background:#242a34; color:#c6cedb; border:1px solid #3a4250;}
+    .warning-box {background:#321b1e; color:#ff9b9f; border:1px solid #6d3037; border-radius:10px; padding:9px 11px; margin:8px 0 12px; font-size:.88rem;}
+    .grid2 {display:grid; grid-template-columns:1fr 1fr; gap:0 14px;}
+    .data-row {display:flex; justify-content:space-between; gap:8px; padding:9px 0; border-bottom:1px solid #252c37; font-size:.88rem;}
+    .data-label {color:#8993a5; white-space:nowrap;}
+    .data-value {font-weight:800; text-align:right;}
+    .tf-grid {display:grid; grid-template-columns:repeat(4,1fr); gap:7px; margin:12px 0;}
+    .tf {background:#1b202a; border-radius:9px; padding:8px 3px; text-align:center; font-size:.75rem;}
+    .tf strong {display:block; font-size:.9rem; margin-bottom:2px;}
+    .ok {color:#63db88;} .bad {color:#ff777d;} .neutral {color:#ffd15c;}
+    .levels-title {font-size:.88rem; color:#aeb7c6; font-weight:800; margin:14px 0 6px;}
+    .levels {display:grid; grid-template-columns:repeat(2,1fr); gap:8px;}
+    .level {background:#1a202a; padding:10px; border-radius:10px;}
+    .level span {display:block; color:#8993a5; font-size:.72rem; margin-bottom:3px;}
+    .level b {font-size:1rem;}
+    .entry {color:#f4f7fb;} .stop {color:#ff7278;} .target {color:#62dc88;}
+    .footnote {color:#7f899b; font-size:.72rem; margin-top:12px; line-height:1.45;}
+    @media (max-width: 520px) {
+        .block-container {padding-left:.75rem; padding-right:.75rem;}
+        .stock-card {padding:14px 12px; border-radius:14px;}
+        .grid2 {grid-template-columns:1fr 1fr; gap:0 10px;}
+        .data-row {font-size:.78rem;}
+        .tf {font-size:.68rem;}
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 def load_secret(name):
@@ -389,6 +447,18 @@ def analyze_selected_stock(minute, quote_row):
         target1 = entry * 1.02
         target2 = entry * 1.035
 
+    timeframe_summary = {}
+    for minutes, frame in frames.items():
+        rsi_value = safe_last(frame["RSI"], float("nan"))
+        macd_value = safe_last(frame["MACD"])
+        signal_value = safe_last(frame["MACD시그널"])
+        timeframe_summary[minutes] = {
+            "trend": safe_last(frame["종가"]) >= safe_last(frame["EMA9"]),
+            "rsi": rsi_value,
+            "macd_up": macd_value > signal_value,
+            "bars": len(frame),
+        }
+
     return {
         "frames": frames,
         "verdict": verdict,
@@ -409,7 +479,110 @@ def analyze_selected_stock(minute, quote_row):
         "stop": round(stop),
         "target1": round(target1),
         "target2": round(target2),
+        "timeframe_summary": timeframe_summary,
     }
+
+
+def render_compact_card(saved):
+    analysis = saved["analysis"]
+    quote = saved["row"]
+    stock_name = html.escape(str(quote["종목명"]))
+    ticker = html.escape(str(quote["종목코드"]))
+    market = html.escape(str(quote["시장"]))
+    change_pct = float(quote["등락률(%)"])
+    change_class = "change-up" if change_pct >= 0 else "change-down"
+
+    verdict = analysis["verdict"]
+    if verdict.startswith("🟢"):
+        verdict_class = "v-green"
+    elif verdict.startswith("🟡"):
+        verdict_class = "v-yellow"
+    elif verdict.startswith("🔴"):
+        verdict_class = "v-red"
+    else:
+        verdict_class = "v-gray"
+
+    warnings = []
+    if analysis["vwap_gap"] < 0:
+        warnings.append("현재가가 VWAP 아래")
+    elif analysis["vwap_gap"] > 3:
+        warnings.append("VWAP에서 너무 멀어 추격 위험")
+    if analysis["rsi_1"] >= 78 or analysis["rsi_3"] >= 75:
+        warnings.append("RSI 과열")
+    if not analysis["bullish_macd"]:
+        warnings.append("3분 MACD 상승 확인 안 됨")
+    if analysis["volume_speed"] < 1:
+        warnings.append("최근 거래량 속도 둔화")
+    if not analysis["trend_15"]:
+        warnings.append("15분 상승 추세 미확인")
+    warning_text = " · ".join(warnings) if warnings else "핵심 경고 없음 — 호가와 체결 상태를 마지막으로 확인하세요."
+
+    timeframe_cards = []
+    for minutes in (1, 3, 5, 15):
+        item = analysis["timeframe_summary"][minutes]
+        if item["bars"] < 3:
+            css_class = "neutral"
+            state = "부족"
+        elif item["trend"] and item["macd_up"]:
+            css_class = "ok"
+            state = "상승"
+        elif not item["trend"] and not item["macd_up"]:
+            css_class = "bad"
+            state = "약세"
+        else:
+            css_class = "neutral"
+            state = "혼조"
+        rsi_text = "-" if pd.isna(item["rsi"]) else f"{item['rsi']:.0f}"
+        timeframe_cards.append(
+            f'<div class="tf"><strong>{minutes}분</strong><span class="{css_class}">{state}</span><br>RSI {rsi_text}</div>'
+        )
+
+    macd_text = "상승" if analysis["bullish_macd"] else "약화"
+    macd_class = "ok" if analysis["bullish_macd"] else "bad"
+    updated_at = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%m/%d %H:%M")
+
+    card_html = f"""
+    <div class="stock-card">
+      <div class="card-head">
+        <div>
+          <div class="stock-name">{stock_name}</div>
+          <div class="ticker">{market} · {ticker} · 통합(UN)</div>
+        </div>
+        <div>
+          <div class="price">{int(quote['현재가']):,}원</div>
+          <div class="{change_class}">{change_pct:+.2f}%</div>
+        </div>
+      </div>
+      <div class="verdict {verdict_class}">{html.escape(verdict)} · 점수 {analysis['score']}/6</div>
+      <div class="warning-box">⚠️ {html.escape(warning_text)}</div>
+      <div class="tf-grid">{''.join(timeframe_cards)}</div>
+      <div class="grid2">
+        <div>
+          <div class="data-row"><span class="data-label">당일 VWAP</span><span class="data-value">{int(quote['VWAP']):,}원</span></div>
+          <div class="data-row"><span class="data-label">VWAP 위치</span><span class="data-value">{analysis['vwap_gap']:+.2f}%</span></div>
+          <div class="data-row"><span class="data-label">RSI 1/3/5분</span><span class="data-value">{analysis['rsi_1']:.0f}/{analysis['rsi_3']:.0f}/{analysis['rsi_5']:.0f}</span></div>
+          <div class="data-row"><span class="data-label">오늘 거래량</span><span class="data-value">{int(quote['오늘누적거래량']):,}주</span></div>
+          <div class="data-row"><span class="data-label">전일 대비 거래량</span><span class="data-value">{float(quote['전일대비거래량(%)']):,.1f}%</span></div>
+        </div>
+        <div>
+          <div class="data-row"><span class="data-label">3분 MACD</span><span class="data-value {macd_class}">{macd_text}</span></div>
+          <div class="data-row"><span class="data-label">거래량 속도</span><span class="data-value">{analysis['volume_speed']:.2f}배</span></div>
+          <div class="data-row"><span class="data-label">거래대금</span><span class="data-value">{float(quote['오늘거래대금(억원)']):,.0f}억원</span></div>
+          <div class="data-row"><span class="data-label">시가총액</span><span class="data-value">{float(quote['시가총액(조원)']):,.2f}조원</span></div>
+          <div class="data-row"><span class="data-label">당일 고가/저가</span><span class="data-value">{int(quote['고가']):,}/{int(quote['저가']):,}</span></div>
+        </div>
+      </div>
+      <div class="levels-title">매매 레벨 · 조건 충족 시 참고</div>
+      <div class="levels">
+        <div class="level"><span>조건부 진입가</span><b class="entry">{analysis['entry']:,}원</b></div>
+        <div class="level"><span>손절 기준</span><b class="stop">{analysis['stop']:,}원</b></div>
+        <div class="level"><span>1차 목표</span><b class="target">{analysis['target1']:,}원</b></div>
+        <div class="level"><span>2차 목표</span><b class="target">{analysis['target2']:,}원</b></div>
+      </div>
+      <div class="footnote">갱신 {updated_at} · 자동매수 신호가 아닙니다. 실제 주문 전 메리츠 통합호가와 시장 상태를 확인하세요.</div>
+    </div>
+    """
+    st.markdown(card_html, unsafe_allow_html=True)
 
 
 def decide_status(row):
@@ -443,11 +616,7 @@ if not APP_KEY or not APP_SECRET:
     st.error("한국투자증권 API 키가 설정되지 않았습니다.")
     st.stop()
 
-st.success("한국투자증권 API 연결 준비가 완료됐습니다.")
-st.info(
-    "시가총액 순위 선정에는 KRX 자료를 사용하지만, 아래 표의 현재가·VWAP·거래량·거래대금은 "
-    "한국투자증권 주식현재가 시세2의 통합시장(UN) 값만 표시합니다."
-)
+st.caption("✅ 한국투자증권 통합시장(UN) 연결 준비")
 
 if st.button("통합 현재가 우량주 검사", type="primary"):
     try:
@@ -474,7 +643,8 @@ if st.button("통합 현재가 우량주 검사", type="primary"):
             st.stop()
 
         st.session_state["scan_table"] = table
-        st.success(f"통합시장 현재가를 받은 {len(table)}종목을 표시합니다.")
+        st.session_state.pop("last_analysis", None)
+        st.toast(f"통합시장 현재가 {len(table)}종목 갱신 완료")
     except Exception as error:
         st.error("통합시장 검사에 실패했습니다.")
         st.code(str(error))
@@ -487,34 +657,17 @@ if "scan_table" in st.session_state:
         "VWAP", "VWAP위치(%)", "오늘누적거래량", "전일대비거래량(%)",
         "오늘거래대금(억원)", "현재판정",
     ]
-    st.subheader("1차 유동성·VWAP 검사")
-    st.dataframe(
-        table[display_columns],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "현재가": st.column_config.NumberColumn(format="%d원"),
-            "등락률(%)": st.column_config.NumberColumn(format="%.2f%%"),
-            "VWAP": st.column_config.NumberColumn(format="%.0f원"),
-            "VWAP위치(%)": st.column_config.NumberColumn(format="%.2f%%"),
-            "오늘누적거래량": st.column_config.NumberColumn(format="%d주"),
-            "전일대비거래량(%)": st.column_config.NumberColumn(format="%.1f%%"),
-            "오늘거래대금(억원)": st.column_config.NumberColumn(format="%.1f억원"),
-        },
-    )
-
     preferred = table[table["현재판정"].isin(["🟢 기술지표검사 대상", "🟡 눌림대기"])].copy()
     if preferred.empty:
         preferred = table.head(10).copy()
 
     labels = {
-        f"{row['종목명']} ({row['종목코드']})": index
+        f"{row['현재판정']}  {row['종목명']} ({row['종목코드']})": index
         for index, row in preferred.iterrows()
     }
-    st.subheader("2차 RSI·MACD·분봉 정밀검사")
     selected_label = st.selectbox("정밀검사할 종목", list(labels.keys()))
 
-    if st.button("선택 종목 기술지표 검사", type="secondary"):
+    if st.button("선택 종목 한눈에 검사", type="secondary"):
         selected_row = table.loc[labels[selected_label]]
         try:
             with st.spinner("통합시장 최근 분봉 120개를 불러와 기술지표를 계산하는 중입니다..."):
@@ -535,30 +688,10 @@ if "scan_table" in st.session_state:
             st.error("기술지표 검사에 실패했습니다.")
             st.code(str(error))
 
-
 if "last_analysis" in st.session_state:
     saved = st.session_state["last_analysis"]
     analysis = saved["analysis"]
-    quote = saved["row"]
-    st.divider()
-    st.subheader(f"{saved['label']} 정밀검사 결과")
-
-    if analysis["verdict"].startswith("🟢"):
-        st.success(analysis["verdict"])
-    elif analysis["verdict"].startswith("🔴"):
-        st.error(analysis["verdict"])
-    elif analysis["verdict"].startswith("🟡"):
-        st.warning(analysis["verdict"])
-    else:
-        st.info(analysis["verdict"])
-
-    metric_columns = st.columns(6)
-    metric_columns[0].metric("통합 현재가", f"{int(quote['현재가']):,}원")
-    metric_columns[1].metric("당일 VWAP", f"{int(quote['VWAP']):,}원", f"{analysis['vwap_gap']:+.2f}%")
-    metric_columns[2].metric("RSI 1분", f"{analysis['rsi_1']:.1f}")
-    metric_columns[3].metric("RSI 3분", f"{analysis['rsi_3']:.1f}")
-    metric_columns[4].metric("RSI 5분", f"{analysis['rsi_5']:.1f}")
-    metric_columns[5].metric("최근 거래량 속도", f"{analysis['volume_speed']:.2f}배")
+    render_compact_card(saved)
 
     reasons = pd.DataFrame([
         {"검사항목": "VWAP", "결과": "통과" if 0 <= analysis["vwap_gap"] <= 2 else "미통과", "현재값": f"{analysis['vwap_gap']:+.2f}%"},
@@ -568,29 +701,41 @@ if "last_analysis" in st.session_state:
         {"검사항목": "15분 추세", "결과": "통과" if analysis["trend_15"] else "미통과", "현재값": "상승" if analysis["trend_15"] else "확인필요"},
         {"검사항목": "거래량 속도", "결과": "통과" if analysis["volume_speed"] >= 1 else "미통과", "현재값": f"{analysis['volume_speed']:.2f}배"},
     ])
-    st.dataframe(reasons, use_container_width=True, hide_index=True)
+    with st.expander("세부 판정 근거 보기"):
+        st.dataframe(reasons, use_container_width=True, hide_index=True)
 
-    levels = st.columns(4)
-    levels[0].metric("조건부 진입가", f"{analysis['entry']:,}원")
-    levels[1].metric("손절 기준", f"{analysis['stop']:,}원")
-    levels[2].metric("1차 목표", f"{analysis['target1']:,}원")
-    levels[3].metric("2차 목표", f"{analysis['target2']:,}원")
+    with st.expander("상세 차트 열기"):
+        st.caption("상단 카드는 이 차트들의 RSI·MACD·EMA9 계산 결과를 요약한 것입니다.")
+        tab1, tab3, tab5, tab15 = st.tabs(["1분", "3분", "5분", "15분"])
+        for tab, minutes in ((tab1, 1), (tab3, 3), (tab5, 5), (tab15, 15)):
+            with tab:
+                frame = analysis["frames"][minutes]
+                st.caption(f"{minutes}분 가격·EMA9")
+                st.line_chart(frame[["종가", "EMA9"]], use_container_width=True, height=220)
+                if frame["RSI"].notna().any():
+                    st.caption("RSI(14)")
+                    st.line_chart(frame[["RSI"]], use_container_width=True, height=170)
+                st.caption("MACD(12,26,9)")
+                st.line_chart(frame[["MACD", "MACD시그널"]], use_container_width=True, height=170)
+                st.caption("거래량")
+                st.bar_chart(frame[["거래량"]], use_container_width=True, height=170)
 
-    tab1, tab3, tab5, tab15 = st.tabs(["1분", "3분", "5분", "15분"])
-    for tab, minutes in ((tab1, 1), (tab3, 3), (tab5, 5), (tab15, 15)):
-        with tab:
-            frame = analysis["frames"][minutes]
-            st.caption(f"{minutes}분 가격·EMA9")
-            st.line_chart(frame[["종가", "EMA9"]], use_container_width=True)
-            if frame["RSI"].notna().any():
-                st.caption("RSI(14)")
-                st.line_chart(frame[["RSI"]], use_container_width=True)
-            st.caption("MACD(12,26,9)")
-            st.line_chart(frame[["MACD", "MACD시그널"]], use_container_width=True)
-            st.caption("거래량")
-            st.bar_chart(frame[["거래량"]], use_container_width=True)
 
-    st.warning(
-        "'진입 조건 충족'은 자동매수나 수익 보장이 아닙니다. 현재 버전은 당일 분봉 기반 시험 신호이며, "
-        "실전 진입 전 메리츠 호가·시장 상태를 확인하고 손절 기준을 지켜야 합니다."
-    )
+if "scan_table" in st.session_state:
+    table = st.session_state["scan_table"]
+    with st.expander(f"전체 {len(table)}종목 표 보기"):
+        st.caption("현재가·VWAP·거래량·거래대금은 한국투자증권 통합시장(UN) 값입니다.")
+        st.dataframe(
+            table[display_columns],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "현재가": st.column_config.NumberColumn(format="%d원"),
+                "등락률(%)": st.column_config.NumberColumn(format="%.2f%%"),
+                "VWAP": st.column_config.NumberColumn(format="%.0f원"),
+                "VWAP위치(%)": st.column_config.NumberColumn(format="%.2f%%"),
+                "오늘누적거래량": st.column_config.NumberColumn(format="%d주"),
+                "전일대비거래량(%)": st.column_config.NumberColumn(format="%.1f%%"),
+                "오늘거래대금(억원)": st.column_config.NumberColumn(format="%.1f억원"),
+            },
+        )
