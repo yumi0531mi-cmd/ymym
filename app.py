@@ -1,4 +1,5 @@
 import time
+from datetime import datetime, timedelta
 
 import pandas as pd
 import requests
@@ -12,7 +13,7 @@ st.set_page_config(
 )
 
 st.title("📡 국내 우량주 당일 단타 스캐너")
-st.caption("시가총액 상위 60종목 중 거래가 활발한 종목을 통합시장(KRX+NXT) 현재가로 다시 검사합니다.")
+st.caption("통합시장 현재가로 1차 선별한 뒤, 선택 종목의 RSI·MACD·VWAP·1·3·5·15분 추세를 검사합니다.")
 
 
 def load_secret(name):
@@ -194,6 +195,223 @@ def collect_integrated_prices(token, tickers):
     return prices, errors
 
 
+def subtract_one_minute(hhmmss):
+    try:
+        value = datetime.strptime(hhmmss, "%H%M%S") - timedelta(minutes=1)
+        return value.strftime("%H%M%S")
+    except Exception:
+        return "000000"
+
+
+def get_minute_page(token, ticker, end_time):
+    response = requests.get(
+        f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+        headers=make_headers(token, "FHKST03010200"),
+        params={
+            "FID_COND_MRKT_DIV_CODE": "UN",
+            "FID_INPUT_ISCD": ticker,
+            "FID_INPUT_HOUR_1": end_time,
+            "FID_PW_DATA_INCU_YN": "Y",
+            "FID_ETC_CLS_CODE": "",
+        },
+        timeout=20,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"{ticker} 분봉 조회 실패: HTTP {response.status_code}")
+    data = response.json()
+    if data.get("rt_cd") != "0":
+        raise RuntimeError(data.get("msg1", f"{ticker} 분봉을 받지 못했습니다."))
+    return data.get("output2") or []
+
+
+def get_recent_minutes(token, ticker, pages=4):
+    all_rows = []
+    cursor = "235959"
+
+    for _ in range(pages):
+        rows = get_minute_page(token, ticker, cursor)
+        if not rows:
+            break
+        all_rows.extend(rows)
+
+        valid_times = [str(row.get("stck_cntg_hour", "")) for row in rows]
+        valid_times = [value for value in valid_times if len(value) == 6 and value.isdigit()]
+        if not valid_times:
+            break
+        next_cursor = subtract_one_minute(min(valid_times))
+        if next_cursor == cursor or next_cursor == "000000":
+            break
+        cursor = next_cursor
+        time.sleep(0.18)
+
+    records = []
+    for row in all_rows:
+        date_text = str(row.get("stck_bsop_date", "")).strip()
+        time_text = str(row.get("stck_cntg_hour", "")).strip()
+        if len(date_text) != 8 or len(time_text) != 6:
+            continue
+        try:
+            timestamp = pd.to_datetime(date_text + time_text, format="%Y%m%d%H%M%S")
+        except Exception:
+            continue
+        records.append({
+            "시간": timestamp,
+            "시가": to_float(row.get("stck_oprc")),
+            "고가": to_float(row.get("stck_hgpr")),
+            "저가": to_float(row.get("stck_lwpr")),
+            "종가": to_float(row.get("stck_prpr")),
+            "거래량": to_float(row.get("cntg_vol")),
+        })
+
+    minute = pd.DataFrame(records)
+    if minute.empty:
+        return minute
+    minute = minute.drop_duplicates("시간").sort_values("시간").set_index("시간")
+    minute = minute[(minute[["시가", "고가", "저가", "종가"]] > 0).all(axis=1)]
+    return minute.tail(120)
+
+
+def resample_bars(minute, minutes):
+    if minute.empty:
+        return minute
+    bars = minute.resample(f"{minutes}min").agg({
+        "시가": "first",
+        "고가": "max",
+        "저가": "min",
+        "종가": "last",
+        "거래량": "sum",
+    })
+    return bars.dropna(subset=["시가", "고가", "저가", "종가"])
+
+
+def add_indicators(bars):
+    result = bars.copy()
+    close = result["종가"]
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    result["RSI"] = 100 - (100 / (1 + rs))
+    result.loc[(avg_loss == 0) & (avg_gain > 0), "RSI"] = 100
+
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    result["MACD"] = ema12 - ema26
+    result["MACD시그널"] = result["MACD"].ewm(span=9, adjust=False).mean()
+    result["MACD히스토그램"] = result["MACD"] - result["MACD시그널"]
+    result["EMA9"] = close.ewm(span=9, adjust=False).mean()
+
+    prev_close = close.shift(1)
+    true_range = pd.concat([
+        result["고가"] - result["저가"],
+        (result["고가"] - prev_close).abs(),
+        (result["저가"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    result["ATR"] = true_range.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    return result
+
+
+def safe_last(series, default=0.0):
+    try:
+        value = series.dropna().iloc[-1]
+        return float(value)
+    except Exception:
+        return default
+
+
+def analyze_selected_stock(minute, quote_row):
+    frames = {}
+    for minutes in (1, 3, 5, 15):
+        frames[minutes] = add_indicators(resample_bars(minute, minutes))
+
+    one = frames[1]
+    three = frames[3]
+    five = frames[5]
+    fifteen = frames[15]
+    price = float(quote_row["현재가"])
+    day_vwap = float(quote_row["VWAP"])
+    change_pct = float(quote_row["등락률(%)"])
+
+    rsi_1 = safe_last(one["RSI"])
+    rsi_3 = safe_last(three["RSI"])
+    rsi_5 = safe_last(five["RSI"])
+    macd_3 = safe_last(three["MACD"])
+    signal_3 = safe_last(three["MACD시그널"])
+    hist_3 = safe_last(three["MACD히스토그램"])
+    previous_hist_3 = float(three["MACD히스토그램"].dropna().iloc[-2]) if three["MACD히스토그램"].dropna().shape[0] >= 2 else 0
+
+    trend_1 = safe_last(one["종가"]) >= safe_last(one["EMA9"])
+    trend_3 = safe_last(three["종가"]) >= safe_last(three["EMA9"])
+    trend_5 = safe_last(five["종가"]) >= safe_last(five["EMA9"])
+    trend_15 = len(fifteen) >= 3 and safe_last(fifteen["종가"]) >= safe_last(fifteen["EMA9"])
+
+    recent_volume = one["거래량"].tail(5).mean() if len(one) >= 5 else 0
+    prior_volume = one["거래량"].iloc[-25:-5].mean() if len(one) >= 25 else 0
+    volume_speed = float(recent_volume / prior_volume) if prior_volume and prior_volume > 0 else 0
+    vwap_gap = ((price / day_vwap) - 1) * 100 if day_vwap > 0 else 0
+
+    bullish_macd = macd_3 > signal_3 and hist_3 >= previous_hist_3
+    rsi_ok = 45 <= rsi_3 <= 70 and 42 <= rsi_5 <= 72
+    price_ok = 0 <= vwap_gap <= 2.0
+    trend_ok = trend_1 and trend_3 and trend_5
+    volume_ok = volume_speed >= 1.0
+    overheated = rsi_1 >= 78 or rsi_3 >= 75 or vwap_gap > 3.0 or change_pct >= 12
+
+    score = sum([
+        price_ok,
+        rsi_ok,
+        bullish_macd,
+        trend_ok,
+        trend_15,
+        volume_ok,
+    ])
+
+    if overheated:
+        verdict = "🔴 추격 금지"
+    elif score >= 5 and price_ok and bullish_macd and trend_ok:
+        verdict = "🟢 진입 조건 충족"
+    elif score >= 3:
+        verdict = "🟡 눌림 대기"
+    else:
+        verdict = "⚪ 진입 금지"
+
+    atr_5 = safe_last(five["ATR"])
+    recent_low = float(five["저가"].tail(3).min()) if not five.empty else price
+    entry = min(price, max(day_vwap, safe_last(one["EMA9"], price)))
+    if atr_5 > 0:
+        stop = min(recent_low, entry - 0.8 * atr_5)
+        target1 = entry + 1.2 * atr_5
+        target2 = entry + 2.0 * atr_5
+    else:
+        stop = entry * 0.985
+        target1 = entry * 1.02
+        target2 = entry * 1.035
+
+    return {
+        "frames": frames,
+        "verdict": verdict,
+        "score": score,
+        "rsi_1": rsi_1,
+        "rsi_3": rsi_3,
+        "rsi_5": rsi_5,
+        "macd_3": macd_3,
+        "signal_3": signal_3,
+        "volume_speed": volume_speed,
+        "vwap_gap": vwap_gap,
+        "trend_1": trend_1,
+        "trend_3": trend_3,
+        "trend_5": trend_5,
+        "trend_15": trend_15,
+        "bullish_macd": bullish_macd,
+        "entry": round(entry),
+        "stop": round(stop),
+        "target1": round(target1),
+        "target2": round(target2),
+    }
+
+
 def decide_status(row):
     price = row["현재가"]
     vwap = row["VWAP"]
@@ -244,7 +462,6 @@ if st.button("통합 현재가 우량주 검사", type="primary"):
             st.stop()
 
         targets = universe.nlargest(30, "1차거래대금근사")["종목코드"].tolist()
-
         with st.spinner("통합시장 현재가를 순서대로 조회하는 중입니다..."):
             prices, price_errors = collect_integrated_prices(token, targets)
             table = merge_realtime(universe, prices)
@@ -256,31 +473,124 @@ if st.button("통합 현재가 우량주 검사", type="primary"):
             st.warning("KRX 가격으로 임의 대체하지 않았습니다.")
             st.stop()
 
+        st.session_state["scan_table"] = table
         st.success(f"통합시장 현재가를 받은 {len(table)}종목을 표시합니다.")
-        st.caption("현재가가 메리츠의 '통합' 현재가와 일치하는지 삼성전자 등 한 종목을 먼저 비교해 주세요.")
-
-        display_columns = [
-            "시장", "시총순위", "종목코드", "종목명", "시세기준", "현재가", "등락률(%)",
-            "VWAP", "VWAP위치(%)", "오늘누적거래량", "전일대비거래량(%)",
-            "오늘거래대금(억원)", "현재판정",
-        ]
-        st.dataframe(
-            table[display_columns],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "현재가": st.column_config.NumberColumn(format="%d원"),
-                "등락률(%)": st.column_config.NumberColumn(format="%.2f%%"),
-                "VWAP": st.column_config.NumberColumn(format="%.0f원"),
-                "VWAP위치(%)": st.column_config.NumberColumn(format="%.2f%%"),
-                "오늘누적거래량": st.column_config.NumberColumn(format="%d주"),
-                "전일대비거래량(%)": st.column_config.NumberColumn(format="%.1f%%"),
-                "오늘거래대금(억원)": st.column_config.NumberColumn(format="%.1f억원"),
-            },
-        )
-
-        st.warning("아직 RSI·MACD·분봉 추세를 넣기 전입니다. '기술지표검사 대상'은 매수 신호가 아닙니다.")
-
     except Exception as error:
-        st.error("통합 실시간 검사에 실패했습니다.")
+        st.error("통합시장 검사에 실패했습니다.")
         st.code(str(error))
+
+
+if "scan_table" in st.session_state:
+    table = st.session_state["scan_table"]
+    display_columns = [
+        "시장", "시총순위", "종목코드", "종목명", "시세기준", "현재가", "등락률(%)",
+        "VWAP", "VWAP위치(%)", "오늘누적거래량", "전일대비거래량(%)",
+        "오늘거래대금(억원)", "현재판정",
+    ]
+    st.subheader("1차 유동성·VWAP 검사")
+    st.dataframe(
+        table[display_columns],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "현재가": st.column_config.NumberColumn(format="%d원"),
+            "등락률(%)": st.column_config.NumberColumn(format="%.2f%%"),
+            "VWAP": st.column_config.NumberColumn(format="%.0f원"),
+            "VWAP위치(%)": st.column_config.NumberColumn(format="%.2f%%"),
+            "오늘누적거래량": st.column_config.NumberColumn(format="%d주"),
+            "전일대비거래량(%)": st.column_config.NumberColumn(format="%.1f%%"),
+            "오늘거래대금(억원)": st.column_config.NumberColumn(format="%.1f억원"),
+        },
+    )
+
+    preferred = table[table["현재판정"].isin(["🟢 기술지표검사 대상", "🟡 눌림대기"])].copy()
+    if preferred.empty:
+        preferred = table.head(10).copy()
+
+    labels = {
+        f"{row['종목명']} ({row['종목코드']})": index
+        for index, row in preferred.iterrows()
+    }
+    st.subheader("2차 RSI·MACD·분봉 정밀검사")
+    selected_label = st.selectbox("정밀검사할 종목", list(labels.keys()))
+
+    if st.button("선택 종목 기술지표 검사", type="secondary"):
+        selected_row = table.loc[labels[selected_label]]
+        try:
+            with st.spinner("통합시장 최근 분봉 120개를 불러와 기술지표를 계산하는 중입니다..."):
+                token = issue_access_token(APP_KEY, APP_SECRET)
+                minute = get_recent_minutes(token, selected_row["종목코드"], pages=4)
+
+            if len(minute) < 35:
+                st.warning(f"분봉이 {len(minute)}개뿐이라 RSI·MACD 판정을 만들지 않았습니다.")
+                st.stop()
+
+            analysis = analyze_selected_stock(minute, selected_row)
+            st.session_state["last_analysis"] = {
+                "label": selected_label,
+                "row": selected_row.to_dict(),
+                "analysis": analysis,
+            }
+        except Exception as error:
+            st.error("기술지표 검사에 실패했습니다.")
+            st.code(str(error))
+
+
+if "last_analysis" in st.session_state:
+    saved = st.session_state["last_analysis"]
+    analysis = saved["analysis"]
+    quote = saved["row"]
+    st.divider()
+    st.subheader(f"{saved['label']} 정밀검사 결과")
+
+    if analysis["verdict"].startswith("🟢"):
+        st.success(analysis["verdict"])
+    elif analysis["verdict"].startswith("🔴"):
+        st.error(analysis["verdict"])
+    elif analysis["verdict"].startswith("🟡"):
+        st.warning(analysis["verdict"])
+    else:
+        st.info(analysis["verdict"])
+
+    metric_columns = st.columns(6)
+    metric_columns[0].metric("통합 현재가", f"{int(quote['현재가']):,}원")
+    metric_columns[1].metric("당일 VWAP", f"{int(quote['VWAP']):,}원", f"{analysis['vwap_gap']:+.2f}%")
+    metric_columns[2].metric("RSI 1분", f"{analysis['rsi_1']:.1f}")
+    metric_columns[3].metric("RSI 3분", f"{analysis['rsi_3']:.1f}")
+    metric_columns[4].metric("RSI 5분", f"{analysis['rsi_5']:.1f}")
+    metric_columns[5].metric("최근 거래량 속도", f"{analysis['volume_speed']:.2f}배")
+
+    reasons = pd.DataFrame([
+        {"검사항목": "VWAP", "결과": "통과" if 0 <= analysis["vwap_gap"] <= 2 else "미통과", "현재값": f"{analysis['vwap_gap']:+.2f}%"},
+        {"검사항목": "RSI", "결과": "통과" if 45 <= analysis["rsi_3"] <= 70 else "미통과", "현재값": f"3분 {analysis['rsi_3']:.1f}"},
+        {"검사항목": "MACD", "결과": "통과" if analysis["bullish_macd"] else "미통과", "현재값": "상승" if analysis["bullish_macd"] else "약화"},
+        {"검사항목": "1·3·5분 추세", "결과": "통과" if analysis["trend_1"] and analysis["trend_3"] and analysis["trend_5"] else "미통과", "현재값": f"{analysis['trend_1']}/{analysis['trend_3']}/{analysis['trend_5']}"},
+        {"검사항목": "15분 추세", "결과": "통과" if analysis["trend_15"] else "미통과", "현재값": "상승" if analysis["trend_15"] else "확인필요"},
+        {"검사항목": "거래량 속도", "결과": "통과" if analysis["volume_speed"] >= 1 else "미통과", "현재값": f"{analysis['volume_speed']:.2f}배"},
+    ])
+    st.dataframe(reasons, use_container_width=True, hide_index=True)
+
+    levels = st.columns(4)
+    levels[0].metric("조건부 진입가", f"{analysis['entry']:,}원")
+    levels[1].metric("손절 기준", f"{analysis['stop']:,}원")
+    levels[2].metric("1차 목표", f"{analysis['target1']:,}원")
+    levels[3].metric("2차 목표", f"{analysis['target2']:,}원")
+
+    tab1, tab3, tab5, tab15 = st.tabs(["1분", "3분", "5분", "15분"])
+    for tab, minutes in ((tab1, 1), (tab3, 3), (tab5, 5), (tab15, 15)):
+        with tab:
+            frame = analysis["frames"][minutes]
+            st.caption(f"{minutes}분 가격·EMA9")
+            st.line_chart(frame[["종가", "EMA9"]], use_container_width=True)
+            if frame["RSI"].notna().any():
+                st.caption("RSI(14)")
+                st.line_chart(frame[["RSI"]], use_container_width=True)
+            st.caption("MACD(12,26,9)")
+            st.line_chart(frame[["MACD", "MACD시그널"]], use_container_width=True)
+            st.caption("거래량")
+            st.bar_chart(frame[["거래량"]], use_container_width=True)
+
+    st.warning(
+        "'진입 조건 충족'은 자동매수나 수익 보장이 아닙니다. 현재 버전은 당일 분봉 기반 시험 신호이며, "
+        "실전 진입 전 메리츠 호가·시장 상태를 확인하고 손절 기준을 지켜야 합니다."
+    )
