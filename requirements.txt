@@ -1,4 +1,1 @@
-streamlit
-requests
-websocket-client
-pandas
+streamlit==1.48.0
