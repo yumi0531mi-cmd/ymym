@@ -1,5 +1,6 @@
 import html
 import math
+import re
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -16,7 +17,7 @@ st.set_page_config(
 )
 
 st.title("📡 한·미 당일 단타 스캐너")
-st.caption("📱 모바일 V6 · 미국 우량주/급등주 1차 연결 검증")
+st.caption("📱 모바일 V7 · 미국 주간·프리·정규·애프터 고속 조회")
 
 st.markdown(
     """
@@ -434,6 +435,281 @@ def build_us_momentum_table(price_rows, surge_rows):
     if table.empty:
         return table
     return table.sort_values("급등점수", ascending=False).head(30).reset_index(drop=True)
+
+
+# 미국 순위 API는 장 구분에 따라 공백 또는 입력값 오류를 반환할 수 있어,
+# V7은 한투 공식 '해외주식 복수종목 시세조회'(최대 10종목)로 검증한다.
+US_QUALITY_UNIVERSE = [
+    ("NAS", "AAPL"), ("NAS", "MSFT"), ("NAS", "NVDA"),
+    ("NAS", "AMZN"), ("NAS", "GOOGL"), ("NAS", "META"),
+    ("NAS", "AVGO"), ("NAS", "TSLA"), ("NAS", "COST"),
+    ("NAS", "NFLX"), ("NAS", "AMD"), ("NAS", "QCOM"),
+    ("NAS", "AMAT"), ("NAS", "MU"), ("NAS", "CSCO"),
+    ("NAS", "ADBE"), ("NAS", "INTU"), ("NAS", "PEP"),
+    ("NAS", "TXN"), ("NAS", "AMGN"),
+    ("NYS", "ORCL"), ("NYS", "JPM"), ("NYS", "V"),
+    ("NYS", "MA"), ("NYS", "WMT"), ("NYS", "LLY"),
+    ("NYS", "XOM"), ("NYS", "UNH"), ("NYS", "HD"),
+    ("NYS", "PG"), ("NYS", "JNJ"), ("NYS", "ABBV"),
+    ("NYS", "BAC"), ("NYS", "KO"), ("NYS", "CRM"),
+    ("NYS", "CVX"), ("NYS", "IBM"), ("NYS", "GE"),
+    ("NYS", "CAT"), ("NYS", "DIS"),
+]
+
+US_MOMENTUM_SEED = [
+    ("NAS", "NVDA"), ("NAS", "TSLA"), ("NAS", "AMD"),
+    ("NAS", "PLTR"), ("NAS", "SOFI"), ("NAS", "RIVN"),
+    ("NAS", "LCID"), ("NAS", "MARA"), ("NAS", "RIOT"),
+    ("NAS", "MSTR"), ("NAS", "COIN"), ("NAS", "HOOD"),
+    ("NAS", "SMCI"), ("NAS", "ARM"), ("NAS", "INTC"),
+    ("NAS", "RKLB"), ("NAS", "ASTS"), ("NAS", "IONQ"),
+    ("NAS", "RGTI"), ("NAS", "QBTS"), ("NAS", "APP"),
+    ("NAS", "ALAB"), ("NAS", "CELH"), ("NAS", "UPST"),
+    ("NAS", "AFRM"), ("NAS", "DKNG"), ("NAS", "CLSK"),
+    ("NAS", "BITF"), ("NAS", "HUT"), ("NAS", "WULF"),
+    ("NAS", "OPEN"), ("NAS", "GRAB"),
+    ("NYS", "BBAI"), ("NYS", "PATH"), ("NYS", "U"),
+    ("NYS", "JOBY"), ("NYS", "ACHR"), ("NYS", "SNAP"),
+    ("NYS", "NIO"), ("NYS", "BABA"), ("NYS", "CAVA"),
+    ("NYS", "CVNA"), ("NYS", "GME"), ("NYS", "AMC"),
+    ("NYS", "MP"), ("NYS", "OKLO"), ("NYS", "NU"),
+    ("NYS", "SE"), ("NYS", "NET"), ("NYS", "HIMS"),
+]
+
+US_DAY_EXCHANGE = {"NAS": "BAQ", "NYS": "BAY", "AMS": "BAA"}
+US_NORMAL_EXCHANGE = {value: key for key, value in US_DAY_EXCHANGE.items()}
+
+
+def unique_us_pairs(pairs):
+    seen = set()
+    result = []
+    for exchange, ticker in pairs:
+        exchange = US_NORMAL_EXCHANGE.get(str(exchange).upper(), str(exchange).upper())
+        ticker = str(ticker).strip().upper()
+        key = (exchange, ticker)
+        if exchange not in US_EXCHANGE_NAMES or not re.fullmatch(r"[A-Z]{1,6}", ticker):
+            continue
+        if key not in seen:
+            seen.add(key)
+            result.append(key)
+    return result
+
+
+def resolve_us_session(session_choice):
+    """한투 미국 주간거래는 별도 거래소 코드를 사용한다."""
+    now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+    now_ny = datetime.now(ZoneInfo("America/New_York"))
+    summer = bool(now_ny.dst())
+    minutes = now_kst.hour * 60 + now_kst.minute
+    day_end = 17 * 60 if summer else 18 * 60
+
+    if session_choice.startswith("주간"):
+        mode = "day"
+    elif session_choice.startswith("프리"):
+        mode = "normal"
+    else:
+        mode = "day" if 10 * 60 <= minutes < day_end else "normal"
+
+    if mode == "day":
+        detail = f"주간거래 10:00~{('17:00' if summer else '18:00')}"
+    else:
+        pre_start = 17 * 60 if summer else 18 * 60
+        regular_start = 22 * 60 + 30 if summer else 23 * 60 + 30
+        regular_end = 5 * 60 if summer else 6 * 60
+        if pre_start <= minutes < regular_start:
+            detail = "프리마켓"
+        elif minutes >= regular_start or minutes < regular_end:
+            detail = "정규장"
+        elif regular_end <= minutes < 9 * 60:
+            detail = "애프터마켓"
+        else:
+            detail = "휴장·전환 구간(직전 정규시세)"
+    return mode, detail, now_kst.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def session_exchange(exchange, session_mode):
+    normal = US_NORMAL_EXCHANGE.get(exchange, exchange)
+    if session_mode == "day":
+        return US_DAY_EXCHANGE.get(normal, normal)
+    return normal
+
+
+def chunks(items, size):
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def get_us_multiple_prices(token, pairs, session_mode):
+    """한투 공식 API로 한 호출에 최대 10종목을 조회한다."""
+    pairs = unique_us_pairs(pairs)
+    rows = []
+    errors = []
+
+    for batch in chunks(pairs, 10):
+        params = {"AUTH": "", "NREC": str(len(batch))}
+        for number, (exchange, ticker) in enumerate(batch, start=1):
+            params[f"EXCD_{number:02d}"] = session_exchange(exchange, session_mode)
+            params[f"SYMB_{number:02d}"] = ticker
+
+        response = None
+        for attempt in range(3):
+            try:
+                response = requests.get(
+                    f"{BASE_URL}/uapi/overseas-price/v1/quotations/multprice",
+                    headers=make_headers(token, "HHDFS76220000"),
+                    params=params,
+                    timeout=12,
+                )
+                if response.status_code == 200:
+                    break
+                if response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                    time.sleep(0.45 * (attempt + 1))
+                    continue
+                break
+            except requests.RequestException as error:
+                if attempt == 2:
+                    errors.append(str(error))
+                else:
+                    time.sleep(0.45 * (attempt + 1))
+
+        if response is None:
+            continue
+        if response.status_code != 200:
+            errors.append(f"복수종목 시세 HTTP {response.status_code}")
+            continue
+        data = response.json()
+        if data.get("rt_cd") != "0":
+            errors.append(data.get("msg1") or "복수종목 시세 조회 실패")
+            continue
+
+        requested = {ticker: exchange for exchange, ticker in batch}
+        output_rows = data.get("output2") or data.get("output") or []
+        if isinstance(output_rows, dict):
+            output_rows = output_rows.get("output2") or []
+        for row in output_rows:
+            row = dict(row)
+            ticker = str(row.get("symb", "")).strip().upper()
+            row["_base_exchange"] = requested.get(ticker, "")
+            row["_session_mode"] = session_mode
+            rows.append(row)
+
+        # 초당 호출 한도에 여유를 두되, 기존 1종목씩 호출보다 훨씬 빠르다.
+        time.sleep(0.08)
+
+    return rows, errors
+
+
+YAHOO_EXCHANGE_MAP = {
+    "NMS": "NAS", "NGM": "NAS", "NCM": "NAS", "NAS": "NAS",
+    "NYQ": "NYS", "NYS": "NYS", "ASE": "AMS", "AMS": "AMS",
+}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_yahoo_us_gainers():
+    """야후는 후보 발견용일 뿐이며 가격·판정은 반드시 한투로 재검증한다."""
+    url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+    response = requests.get(
+        url,
+        params={"scrIds": "day_gainers", "count": "50", "start": "0"},
+        headers={"user-agent": "Mozilla/5.0"},
+        timeout=3.5,
+    )
+    response.raise_for_status()
+    data = response.json()
+    result = ((data.get("finance") or {}).get("result") or [{}])[0]
+    pairs = []
+    for quote in result.get("quotes") or []:
+        ticker = str(quote.get("symbol", "")).upper()
+        exchange = YAHOO_EXCHANGE_MAP.get(str(quote.get("exchange", "")).upper())
+        if exchange and re.fullmatch(r"[A-Z]{1,6}", ticker):
+            pairs.append((exchange, ticker))
+    return unique_us_pairs(pairs)
+
+
+def build_us_fast_table(rows, candidates, strategy):
+    order = {ticker: index + 1 for index, (_, ticker) in enumerate(candidates)}
+    records = []
+    for row in rows:
+        ticker = str(row.get("symb", "")).strip().upper()
+        exchange = str(row.get("_base_exchange") or row.get("excd") or "").strip()
+        exchange = US_NORMAL_EXCHANGE.get(exchange, exchange)
+        price = to_float(row.get("last"))
+        base = to_float(row.get("base"))
+        rate = to_float(row.get("rate"))
+        if rate == 0 and price > 0 and base > 0:
+            rate = (price / base - 1) * 100
+        volume = to_int(row.get("tvol"))
+        previous_volume = to_int(row.get("pvol"))
+        amount = to_float(row.get("tamt"))
+        vwap = amount / volume if amount > 0 and volume > 0 else 0
+        vwap_gap = (price / vwap - 1) * 100 if vwap > 0 else 0
+        volume_ratio = volume / previous_volume * 100 if previous_volume > 0 else 0
+        market_cap = to_float(row.get("tomv"))
+        strength = to_float(row.get("powx"))
+        name = str(row.get("knam") or row.get("name") or ticker).strip()
+        if price <= 0:
+            continue
+
+        score = (
+            max(rate, -20) * 4
+            + min(math.log10(max(amount, 1)), 12) * 3
+            + min(volume_ratio, 1000) / 25
+            + max(vwap_gap, -10)
+        )
+        if strategy == "momentum":
+            passed = rate >= 2 and volume >= 10_000 and amount >= 100_000
+            if rate >= 25 or vwap_gap >= 10:
+                status = "🔴 추격주의"
+            elif passed and price >= vwap:
+                status = "🟢 급등 정밀검사"
+            elif rate >= 1 or volume_ratio >= 120:
+                status = "🟡 거래량 확대 감시"
+            else:
+                status = "⚪ 조건대기"
+        else:
+            passed = 0.2 <= rate <= 8 and amount >= 1_000_000
+            if rate >= 10 or vwap_gap >= 6:
+                status = "🔴 추격주의"
+            elif passed and price >= vwap:
+                status = "🟢 기술지표 후보"
+            elif price < vwap and rate < 0:
+                status = "⚪ 약세·대기"
+            else:
+                status = "🟡 유동성 관찰"
+
+        records.append({
+            "시장": US_EXCHANGE_NAMES.get(exchange, exchange),
+            "종목코드": ticker,
+            "종목명": name,
+            "현재가($)": round(price, 4),
+            "등락률(%)": round(rate, 2),
+            "세션": "주간거래" if row.get("_session_mode") == "day" else "프리·정규·애프터",
+            "시세시간(KST)": str(row.get("khms") or ""),
+            "오늘거래량": volume,
+            "전일대비거래량(%)": round(volume_ratio, 1),
+            "오늘거래대금(백만$)": round(amount / 1_000_000, 2),
+            "VWAP($)": round(vwap, 4),
+            "VWAP위치(%)": round(vwap_gap, 2),
+            "체결강도": round(strength, 1),
+            "시가총액(API)": market_cap,
+            "후보순위": order.get(ticker, 999),
+            "고속점수": round(score, 2),
+            "조건통과": passed,
+            "현재판정": status,
+        })
+
+    table = pd.DataFrame(records)
+    if table.empty:
+        return table
+    if strategy == "momentum":
+        passed = table[table["조건통과"]].copy()
+        if not passed.empty:
+            table = passed
+        return table.sort_values("고속점수", ascending=False).head(30).reset_index(drop=True)
+    return table.sort_values(
+        ["시가총액(API)", "오늘거래대금(백만$)"], ascending=False
+    ).head(30).reset_index(drop=True)
 
 
 def is_excluded_product(name):
@@ -1046,15 +1322,28 @@ is_domestic = market_code == "kr"
 scan_button_labels = {
     "kr_quality": "국내 우량주 통합시장 검사",
     "kr_momentum": "국내 급등주 거래량 검사",
-    "us_quality": "미국 우량주 순위·가격 검사",
-    "us_momentum": "미국 급등주 거래량 검사",
+    "us_quality": "미국 우량주 10종목씩 고속 검사",
+    "us_momentum": "미국 급등주 10종목씩 고속 검사",
 }
 
+us_session_choice = "자동(현재 장)"
+use_yahoo_candidates = False
 if not is_domestic:
     st.info(
-        "미국 V6는 NASDAQ·NYSE·AMEX 후보와 달러 가격·거래량을 먼저 검증합니다. "
-        "아직 RSI·MACD 매수 판정 단계가 아닙니다."
+        "미국 V7은 한투 공식 복수종목 시세로 한 번에 10종목씩 조회합니다. "
+        "가격·거래량·판정은 한투 데이터만 사용합니다."
     )
+    us_session_choice = st.selectbox(
+        "미국장 시세 선택",
+        ["자동(현재 장)", "주간거래", "프리·정규·애프터"],
+        help="자동은 한국시간에 따라 주간거래 코드와 미국 정규거래소 코드를 바꾸어 조회합니다.",
+    )
+    if strategy_code == "momentum":
+        use_yahoo_candidates = st.checkbox(
+            "야후 급등종목을 후보목록에만 추가",
+            value=False,
+            help="야후는 후보 발견용입니다. 표시 가격과 최종 판정은 모두 한투 API로 다시 확인합니다.",
+        )
 
 if st.button(scan_button_labels[scanner_type], type="primary"):
     try:
@@ -1086,23 +1375,42 @@ if st.button(scan_button_labels[scanner_type], type="primary"):
                 table = merge_realtime(universe, prices, scanner_type="momentum")
 
         elif scanner_type == "us_quality":
-            with st.spinner("NASDAQ·NYSE 시가총액 상위 우량주를 조회하는 중입니다..."):
-                market_rows = []
-                for exchange in ("NAS", "NYS"):
-                    market_rows.extend(get_us_market_cap_rows(token, exchange))
-                    time.sleep(0.15)
-                table = build_us_quality_table(market_rows)
+            with st.spinner("미국 우량주를 10종목씩 빠르게 조회하는 중입니다..."):
+                session_mode, session_detail, scan_time = resolve_us_session(us_session_choice)
+                us_candidates = unique_us_pairs(US_QUALITY_UNIVERSE)
+                market_rows, price_errors = get_us_multiple_prices(
+                    token, us_candidates, session_mode
+                )
+                table = build_us_fast_table(
+                    market_rows, us_candidates, strategy="quality"
+                )
+                us_source_note = "한투 공식 우량주 후보목록"
 
         else:
-            with st.spinner("NASDAQ·NYSE·AMEX 가격급등·거래량급증 종목을 조회하는 중입니다..."):
-                price_rows = []
-                surge_rows = []
-                for exchange in ("NAS", "NYS", "AMS"):
-                    price_rows.extend(get_us_price_fluct_rows(token, exchange))
-                    time.sleep(0.15)
-                    surge_rows.extend(get_us_volume_surge_rows(token, exchange))
-                    time.sleep(0.15)
-                table = build_us_momentum_table(price_rows, surge_rows)
+            with st.spinner("미국 급등주 후보를 10종목씩 빠르게 조회하는 중입니다..."):
+                session_mode, session_detail, scan_time = resolve_us_session(us_session_choice)
+                us_candidates = list(US_MOMENTUM_SEED)
+                yahoo_count = 0
+                yahoo_error = ""
+                if use_yahoo_candidates:
+                    try:
+                        yahoo_pairs = get_yahoo_us_gainers()
+                        yahoo_count = len(yahoo_pairs)
+                        us_candidates = yahoo_pairs + us_candidates
+                    except Exception as error:
+                        yahoo_error = str(error)
+                us_candidates = unique_us_pairs(us_candidates)[:80]
+                market_rows, price_errors = get_us_multiple_prices(
+                    token, us_candidates, session_mode
+                )
+                table = build_us_fast_table(
+                    market_rows, us_candidates, strategy="momentum"
+                )
+                us_source_note = (
+                    f"한투 검증 + 야후 후보 {yahoo_count}종목"
+                    if use_yahoo_candidates and not yahoo_error
+                    else "한투 공식 급등 감시목록"
+                )
 
         if table.empty:
             if price_errors:
@@ -1111,6 +1419,13 @@ if st.button(scan_button_labels[scanner_type], type="primary"):
 
         st.session_state["scan_table"] = table
         st.session_state["scan_type"] = scanner_type
+        if not is_domestic:
+            st.session_state["us_scan_meta"] = {
+                "session": session_detail,
+                "time": scan_time,
+                "source": us_source_note,
+                "errors": price_errors,
+            }
         st.session_state.pop("last_analysis", None)
         market_text = "국내" if is_domestic else "미국"
         kind_text = "우량주" if strategy_code == "quality" else "급등주"
@@ -1127,20 +1442,20 @@ has_current_scan = (
 
 if has_current_scan and not is_domestic:
     table = st.session_state["scan_table"]
+    us_meta = st.session_state.get("us_scan_meta", {})
     st.success(f"미국 {('우량주' if strategy_code == 'quality' else '급등주')} 후보 {len(table)}종목을 받았습니다.")
-    st.caption("가격은 미국 달러(USD) 기준입니다. 이 표는 1차 연결 검증용이며 아직 진입 신호가 아닙니다.")
+    st.caption(
+        f"세션: {us_meta.get('session', '-')} · "
+        f"갱신: {us_meta.get('time', '-')} KST · "
+        f"후보: {us_meta.get('source', '-')}. "
+        "표시 가격과 판정은 한투 API 기준입니다."
+    )
 
-    if strategy_code == "quality":
-        us_columns = [
-            "시장", "시총순위", "종목코드", "종목명", "현재가($)", "등락률(%)",
-            "오늘거래량", "오늘거래대금(백만$)", "VWAP근사($)", "VWAP위치(%)", "현재판정",
-        ]
-    else:
-        us_columns = [
-            "시장", "종목코드", "종목명", "현재가($)", "등락률(%)", "15분등락률(%)",
-            "거래량증가율(%)", "오늘거래량", "오늘거래대금(백만$)",
-            "VWAP근사($)", "VWAP위치(%)", "현재판정",
-        ]
+    us_columns = [
+        "종목코드", "종목명", "현재가($)", "등락률(%)", "오늘거래량",
+        "전일대비거래량(%)", "오늘거래대금(백만$)", "VWAP($)",
+        "VWAP위치(%)", "체결강도", "현재판정",
+    ]
 
     st.dataframe(
         table[us_columns],
@@ -1150,15 +1465,17 @@ if has_current_scan and not is_domestic:
         column_config={
             "현재가($)": st.column_config.NumberColumn(format="$%.2f"),
             "등락률(%)": st.column_config.NumberColumn(format="%.2f%%"),
-            "15분등락률(%)": st.column_config.NumberColumn(format="%.2f%%"),
-            "거래량증가율(%)": st.column_config.NumberColumn(format="%.1f%%"),
             "오늘거래량": st.column_config.NumberColumn(format="%d주"),
+            "전일대비거래량(%)": st.column_config.NumberColumn(format="%.1f%%"),
             "오늘거래대금(백만$)": st.column_config.NumberColumn(format="$%.2fM"),
-            "VWAP근사($)": st.column_config.NumberColumn(format="$%.2f"),
+            "VWAP($)": st.column_config.NumberColumn(format="$%.2f"),
             "VWAP위치(%)": st.column_config.NumberColumn(format="%.2f%%"),
+            "체결강도": st.column_config.NumberColumn(format="%.1f"),
         },
     )
-    st.warning("미국 종목의 RSI·MACD·정식 당일 VWAP·모바일 한눈에 카드는 다음 단계에서 붙입니다.")
+    if us_meta.get("errors"):
+        st.caption("일부 묶음은 재시도 후 제외됐습니다. 표시된 종목은 정상 응답입니다.")
+    st.warning("이 표는 후보 압축용이며 매수 신호가 아닙니다. RSI·MACD는 선택 종목 정밀검사에서 확인하세요.")
 
 
 if has_current_scan and is_domestic:
