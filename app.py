@@ -25,28 +25,36 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("📡 한·미 당일 단타 스캐너")
-st.caption("📱 모바일 V13 · 실시간 신선도·삼중순위·눌림 재돌파·고정 청산계획")
+st.markdown(
+    '<div class="app-title">📡 단타 스캐너</div>'
+    '<div class="app-sub">V13 · 실시간 카드</div>',
+    unsafe_allow_html=True,
+)
 
 st.markdown(
     """
     <style>
-    .block-container {padding-top: 1rem; padding-bottom: 2rem; max-width: 760px;}
-    h1 {font-size: clamp(1.65rem, 7vw, 2.35rem) !important; line-height: 1.15 !important;}
+    header[data-testid="stHeader"] {height:0; min-height:0; background:transparent;}
+    .block-container {padding-top:.7rem; padding-bottom:1.2rem; max-width:520px;}
+    .app-title {font-size:1.55rem; line-height:1.15; font-weight:950; color:#171b24; white-space:nowrap;}
+    .app-sub {font-size:.72rem; color:#8b93a3; margin:.2rem 0 .75rem;}
+    h1 {font-size:1.55rem !important; line-height:1.15 !important;}
     h2, h3 {font-size: 1.15rem !important;}
-    div[data-testid="stButton"] > button {width: 100%; min-height: 3rem; font-weight: 800;}
+    div[data-testid="stButton"] > button {width:100%; min-height:2.65rem; font-weight:850;}
     div[data-testid="stSelectbox"] {margin-bottom: .2rem;}
+    div[data-testid="stAlert"] {padding:.55rem .7rem; font-size:.78rem; margin:.3rem 0;}
+    div[data-testid="stRadio"] label {font-size:.84rem;}
     .stock-card {
         background: #11151d;
         color: #e7ebf3;
         border: 1px solid #293142;
         border-radius: 18px;
-        padding: 16px;
-        margin: 10px 0;
+        padding:14px;
+        margin:8px 0;
         box-shadow: 0 8px 24px rgba(0,0,0,.18);
     }
     .card-head {display:flex; justify-content:space-between; gap:12px; align-items:flex-start;}
-    .stock-name {font-size:1.3rem; font-weight:900; line-height:1.2;}
+    .stock-name {font-size:1.18rem; font-weight:900; line-height:1.2;}
     .ticker {color:#8b95a8; font-size:.82rem; margin-top:4px;}
     .price {font-size:1.35rem; font-weight:900; color:#f4f7fb; text-align:right; white-space:nowrap;}
     .change-up {color:#57cf78; font-size:.86rem; text-align:right;}
@@ -58,7 +66,7 @@ st.markdown(
     .v-gray {background:#242a34; color:#c6cedb; border:1px solid #3a4250;}
     .warning-box {background:#321b1e; color:#ff9b9f; border:1px solid #6d3037; border-radius:10px; padding:9px 11px; margin:8px 0 12px; font-size:.88rem;}
     .grid2 {display:grid; grid-template-columns:1fr 1fr; gap:0 14px;}
-    .data-row {display:flex; justify-content:space-between; gap:8px; padding:9px 0; border-bottom:1px solid #252c37; font-size:.88rem;}
+    .data-row {display:flex; justify-content:space-between; gap:6px; padding:7px 0; border-bottom:1px solid #252c37; font-size:.8rem;}
     .data-label {color:#8993a5; white-space:nowrap;}
     .data-value {font-weight:800; text-align:right;}
     .tf-grid {display:grid; grid-template-columns:repeat(4,1fr); gap:7px; margin:12px 0;}
@@ -72,11 +80,23 @@ st.markdown(
     .level b {font-size:1rem;}
     .entry {color:#f4f7fb;} .stop {color:#ff7278;} .target {color:#62dc88;}
     .footnote {color:#7f899b; font-size:.72rem; margin-top:12px; line-height:1.45;}
+    .signal-badge {display:inline-block;padding:5px 11px;border-radius:9px;background:#3c3213;color:#ffd45d;border:1px solid #8a6e16;font-weight:900;font-size:.8rem;margin:8px 0;}
+    .risk-line {padding:8px 10px;border-radius:9px;background:#351d20;color:#ff9b9f;border:1px solid #743038;font-size:.76rem;font-weight:750;margin:4px 0 8px;}
+    .metric-grid {display:grid;grid-template-columns:1fr 1fr;gap:0 14px;margin-top:4px;}
+    .metric {display:flex;justify-content:space-between;gap:6px;padding:7px 0;border-bottom:1px solid #252c37;font-size:.77rem;}
+    .metric span {color:#8993a5;}.metric b {color:#eef2f8;text-align:right;}
+    .trade-title {font-size:.78rem;color:#aeb7c6;font-weight:900;margin:12px 0 6px;border-top:1px dashed #313846;padding-top:10px;}
+    .trade-grid {display:grid;grid-template-columns:repeat(3,1fr);gap:7px;}
+    .trade-box {background:#1b202a;border-radius:9px;padding:8px 7px;min-height:50px;}
+    .trade-box span {display:block;color:#8993a5;font-size:.65rem;margin-bottom:3px;}.trade-box b {font-size:.9rem;}
     @media (max-width: 520px) {
-        .block-container {padding-left:.75rem; padding-right:.75rem;}
-        .stock-card {padding:14px 12px; border-radius:14px;}
-        .grid2 {grid-template-columns:1fr 1fr; gap:0 10px;}
-        .data-row {font-size:.78rem;}
+        .block-container {padding:.55rem .55rem 1rem;}
+        .stock-card {padding:12px 11px; border-radius:14px;}
+        .grid2 {grid-template-columns:1fr 1fr; gap:0 8px;}
+        .data-row {font-size:.74rem; padding:6px 0;}
+        .data-label {white-space:normal;}
+        .metric-grid {gap:0 9px;}.metric {font-size:.7rem;padding:6px 0;}
+        .trade-grid {gap:5px;}.trade-box {padding:7px 6px;}.trade-box b {font-size:.82rem;}
         .tf {font-size:.68rem;}
     }
     </style>
@@ -102,6 +122,7 @@ APP_KEY = load_secret("KIS_APP_KEY")
 APP_SECRET = load_secret("KIS_APP_SECRET")
 BASE_URL = "https://openapi.koreainvestment.com:9443"
 SEOUL = ZoneInfo("Asia/Seoul")
+MOBILE_SIMPLE_UI = True
 
 
 @st.cache_resource(show_spinner=False)
@@ -3248,10 +3269,12 @@ def forecast_us_position_flow(minute, quote_row, position):
 
 
 def analyze_us_penny_candidates(token, table, session_mode, limit=3, pages=3):
-    """삼중교집합 종목만 분봉을 동시 조회해 눌림 재돌파를 검사한다."""
+    """삼중교집합을 우선하되 카드가 비지 않도록 상위 관찰주까지 분석한다."""
     eligible = table.copy()
     if "삼중교집합" in eligible.columns:
-        eligible = eligible[eligible["삼중교집합"]]
+        exact = eligible[eligible["삼중교집합"].astype(bool)]
+        watch = eligible[~eligible["삼중교집합"].astype(bool)]
+        eligible = pd.concat([exact, watch], ignore_index=True)
     targets = [row.to_dict() for _, row in eligible.head(limit).iterrows()]
 
     def inspect(row):
@@ -3293,6 +3316,182 @@ def analyze_us_penny_candidates(token, table, session_mode, limit=3, pages=3):
         -float((item.get("analysis") or {}).get("score", 0)),
     ))
     return results
+
+
+def format_compact_number(value, money=False):
+    value = float(value or 0)
+    prefix = "$" if money else ""
+    absolute = abs(value)
+    if absolute >= 1_000_000_000:
+        return f"{prefix}{value / 1_000_000_000:.1f}B"
+    if absolute >= 1_000_000:
+        return f"{prefix}{value / 1_000_000:.1f}M"
+    if absolute >= 1_000:
+        return f"{prefix}{value / 1_000:.1f}K"
+    return f"{prefix}{value:,.0f}"
+
+
+def render_us_reference_card(item):
+    """사용자가 제시한 모바일 예시와 같은 한 장짜리 숫자 카드."""
+    row = item.get("row") or {}
+    analysis = item.get("analysis")
+    name = html.escape(str(row.get("종목명") or row.get("종목코드") or "종목"))
+    ticker = html.escape(str(row.get("종목코드") or "-"))
+    market = html.escape(str(row.get("시장") or row.get("거래소코드") or "US"))
+    price = float(row.get("현재가($)", 0) or 0)
+    rate = float(row.get("등락률(%)", 0) or 0)
+    volume = int(float(row.get("오늘거래량", 0) or 0))
+    volume_ratio_pct = float(row.get("전일대비거래량(%)", 0) or 0)
+    volume_multiple = volume_ratio_pct / 100 if volume_ratio_pct > 0 else 0
+    amount_million = float(row.get("오늘거래대금(백만$)", 0) or 0)
+    vwap = float(row.get("VWAP($)", 0) or 0)
+    vwap_gap = float(row.get("VWAP위치(%)", 0) or 0)
+    strength = float(row.get("체결강도", 0) or 0)
+    spread = float(row.get("스프레드(%)", 0) or 0)
+    market_cap = float(row.get("시가총액(API)", 0) or 0)
+    overlap = int(float(row.get("교집합수", 0) or 0))
+    filter_score = int(float(row.get("1차필터점수", 0) or 0))
+    session = html.escape(str(row.get("세션") or "미국장"))
+    received_at = float(row.get("수신타임스탬프", 0) or 0)
+    quote_age = max(0.0, time.time() - received_at) if received_at > 0 else 999.0
+
+    if analysis:
+        verdict = str(analysis.get("verdict", "⚪ 대기"))
+        entry = float(analysis.get("entry", 0) or 0)
+        stop = float(analysis.get("stop", 0) or 0)
+        target1 = float(analysis.get("target1", 0) or 0)
+        target2 = float(analysis.get("target2", 0) or 0)
+        support = float(analysis.get("support", 0) or 0)
+        resistance = float(analysis.get("resistance", 0) or 0)
+        rsi = f"{analysis.get('rsi_1', 0):.0f}/{analysis.get('rsi_3', 0):.0f}/{analysis.get('rsi_5', 0):.0f}"
+        macd = "상승" if analysis.get("bullish_macd") else "약화"
+        trend = "/".join("상" if analysis.get(f"trend_{m}") else "하" for m in (1, 3, 5, 15))
+        replay = float(analysis.get("validation_win_rate", 0) or 0)
+        missing = [label for label, ok in analysis.get("checks", {}).items() if not ok]
+        warning = " · ".join(missing[:2]) if missing else "조건 유지 확인"
+    else:
+        verdict = str(row.get("현재판정") or "⚪ 차트 계산 대기")
+        entry = stop = target1 = target2 = support = resistance = 0.0
+        rsi = "-/-/-"
+        macd = "대기"
+        trend = "-/-/-/-"
+        replay = 0.0
+        warning = item.get("error") or "분봉 계산 대기"
+
+    if quote_age > 3:
+        verdict = "🔴 시세 갱신 필요"
+    badge = "🟢 검토" if verdict.startswith("🟢") else "🔴 금지" if verdict.startswith("🔴") else "🟡 대기"
+    verdict_color = "#61df88" if verdict.startswith("🟢") else "#ff858b" if verdict.startswith("🔴") else "#ffd45d"
+    price_text = f"${price:.4f}" if price < 1 else f"${price:,.2f}"
+    cap_text = format_compact_number(market_cap, money=True) if market_cap > 0 else "-"
+    amount_text = f"${amount_million:.1f}M"
+    today = datetime.now(SEOUL).strftime("%Y-%m-%d")
+
+    def usd(value):
+        if value <= 0:
+            return "-"
+        return f"${value:.4f}" if value < 1 else f"${value:,.2f}"
+
+    render_compact_html(
+        f'''<div class="stock-card">
+        <div class="card-head"><div><div class="stock-name">{name} <small style="color:#7f899b">{ticker} {market}</small></div>
+        <div class="ticker">{session} · {today}</div></div>
+        <div><div class="price">{price_text}</div><div class="{'change-up' if rate >= 0 else 'change-down'}">{rate:+.2f}%</div></div></div>
+        <div class="signal-badge">{badge}</div>
+        <div class="risk-line">{html.escape(verdict)} · {html.escape(str(warning))}</div>
+        <div class="metric-grid">
+          <div class="metric"><span>전일대비 거래량</span><b style="color:#ffd45d">×{volume_multiple:.2f}</b></div>
+          <div class="metric"><span>당일 거래량</span><b>{volume:,}</b></div>
+          <div class="metric"><span>등락률</span><b style="color:{'#61df88' if rate >= 0 else '#ff777d'}">{rate:+.2f}%</b></div>
+          <div class="metric"><span>체결강도</span><b style="color:#61df88">{strength:.0f}</b></div>
+          <div class="metric"><span>VWAP</span><b>{usd(vwap)}</b></div>
+          <div class="metric"><span>VWAP 위치</span><b>{vwap_gap:+.2f}%</b></div>
+          <div class="metric"><span>거래대금</span><b>{amount_text}</b></div>
+          <div class="metric"><span>시총(API)</span><b>{cap_text}</b></div>
+          <div class="metric"><span>호가 차이</span><b>{spread:.2f}%</b></div>
+          <div class="metric"><span>순위 교집합</span><b>{overlap}/3</b></div>
+          <div class="metric"><span>RSI 1/3/5</span><b>{rsi}</b></div>
+          <div class="metric"><span>MACD / 추세</span><b>{macd} · {trend}</b></div>
+          <div class="metric"><span>1차 필터</span><b>{filter_score}/100</b></div>
+          <div class="metric"><span>분봉 재생률</span><b>{replay:.1f}%</b></div>
+        </div>
+        <div class="trade-title">매매 레벨 · 녹색 검토일 때만 사용</div>
+        <div class="trade-grid">
+          <div class="trade-box"><span>진입가 상한</span><b class="entry">{usd(entry)}</b></div>
+          <div class="trade-box"><span>1차 매도가</span><b class="target">{usd(target1)}</b></div>
+          <div class="trade-box"><span>2차 매도가</span><b class="target">{usd(target2)}</b></div>
+          <div class="trade-box"><span>지지선</span><b style="color:#ffd45d">{usd(support)}</b></div>
+          <div class="trade-box"><span>손절가</span><b class="stop">{usd(stop)}</b></div>
+          <div class="trade-box"><span>저항선</span><b>{usd(resistance)}</b></div>
+        </div>
+        <div class="footnote">갱신 {quote_age:.1f}초 · 자동주문 없음</div>
+        </div>'''
+    )
+
+
+def render_us_entry_lock_controls(item, scanner_type):
+    """녹색 카드에서만 실제 체결가를 고정한다."""
+    row = item.get("row") or {}
+    analysis = item.get("analysis")
+    if not analysis or not str(analysis.get("verdict", "")).startswith("🟢"):
+        return
+    if not analysis.get("validation_ok"):
+        return
+    received_at = float(row.get("수신타임스탬프", 0) or 0)
+    quote_age = max(0.0, time.time() - received_at) if received_at > 0 else 999.0
+    if quote_age > 3:
+        return
+
+    ticker = str(row.get("종목코드", ""))
+    planned_entry = float(analysis["entry"])
+    actual_entry = st.number_input(
+        "실제 체결가",
+        min_value=0.0001,
+        value=planned_entry,
+        step=max(planned_entry * 0.001, 0.0001),
+        format="%.4f",
+        key=f"simple_actual_entry_{scanner_type}_{ticker}",
+        label_visibility="collapsed",
+    )
+    if not st.button(
+        f"🔒 {ticker} 진입가·청산계획 고정",
+        use_container_width=True,
+        key=f"simple_lock_{scanner_type}_{ticker}",
+    ):
+        return
+
+    deviation = abs(float(actual_entry) / planned_entry - 1) * 100 if planned_entry > 0 else 999
+    spread = float(row.get("스프레드(%)", 0) or 0)
+    allowed = max(0.5, min(1.0, spread * 1.5))
+    if deviation > allowed:
+        st.error("계획가에서 너무 벗어나 진입을 기록하지 않았습니다.")
+        return
+    stop, target1, target2, support, resistance, details = calculate_us_multiframe_levels(
+        analysis["frames"], float(actual_entry)
+    )
+    risk = float(actual_entry) - float(stop)
+    rr = (float(target1) - float(actual_entry)) / risk if risk > 0 else 0
+    if risk <= 0 or rr < 1.5:
+        st.error("손익비가 1.5 미만이라 진입을 기록하지 않았습니다.")
+        return
+    st.session_state["active_us_position"] = {
+        "티커": ticker,
+        "종목명": str(row.get("종목명") or ticker),
+        "거래소코드": str(row.get("거래소코드", "")),
+        "진입가": round(float(actual_entry), 4),
+        "손절가": round(float(stop), 4),
+        "1차목표": round(float(target1), 4),
+        "2차목표": round(float(target2), 4),
+        "지지선": round(float(support), 4),
+        "저항선": round(float(resistance), 4),
+        "레벨분석": details,
+        "진입시각": datetime.now(SEOUL).strftime("%Y-%m-%d %H:%M:%S"),
+        "계획가이탈(%)": round(deviation, 2),
+        "최고가": round(float(actual_entry), 4),
+        "실행손절가": round(float(stop), 4),
+    }
+    st.session_state.pop("active_us_forecast", None)
+    st.rerun()
 
 
 def render_compact_card(saved):
@@ -3505,9 +3704,9 @@ if not APP_KEY or not APP_SECRET:
     st.error("한국투자증권 API 키가 설정되지 않았습니다.")
     st.stop()
 
-st.caption("✅ 한국투자증권 국내 통합시장·미국 시세 API 연결 준비")
+st.sidebar.caption("✅ API 연결 준비")
 
-market_label = st.radio(
+market_label = st.sidebar.radio(
     "시장 선택",
     ["🇰🇷 국내주식", "🇺🇸 미국주식"],
     horizontal=True,
@@ -3517,7 +3716,7 @@ market_code = "kr" if market_label.startswith("🇰🇷") else "us"
 strategy_options = ["🏦 우량주 단타", "🔥 급등주 단타"]
 if market_code == "us":
     strategy_options.append("🪙 동전주 급등")
-strategy_label = st.radio(
+strategy_label = st.sidebar.radio(
     "검색 방식",
     strategy_options,
     horizontal=True,
@@ -3543,29 +3742,17 @@ scan_button_labels = {
 
 us_session_choice = "자동(현재 장)"
 if not is_domestic:
-    st.info(
-        "미국 V13은 한투 공식 상승률 상위·당일 누적거래량 상위·매수체결강도 상위를 "
-        "동시에 받은 뒤 세 순위의 교집합만 차트검사합니다. "
-        "교집합 검색은 후보 압축이며 매수신호가 아닙니다."
-    )
-    us_session_choice = st.selectbox(
+    us_session_choice = st.sidebar.selectbox(
         "미국장 시세 선택",
         ["자동(현재 장)", "주간거래", "프리·정규·애프터"],
         help="자동은 한국시간에 따라 주간거래 코드와 미국 정규거래소 코드를 바꾸어 조회합니다.",
     )
     if strategy_code in ("momentum", "penny"):
-        st.caption(
-            "① 삼중순위 교집합 → ② ETF·ETN·SPAC 제외 → "
-            "③ VWAP 눌림 → ④ EMA9 재돌파·MACD 회복·저점상승 확인"
-        )
+        st.sidebar.caption("순위 → 거래량 → VWAP → 재돌파")
 elif strategy_code == "momentum":
-    st.info(
-        "국내 V13은 한투 공식 등락률 상위·당일 절대거래량 상위·"
-        "매수체결강도 상위를 동시에 받아 3개 순위의 교집합만 차트를 검사합니다. "
-        "한투 순위 API가 한 번에 제공하는 상위 목록 범위를 사용합니다."
-    )
+    st.sidebar.caption("상승률·거래량·체결강도 교집합")
 
-if st.button(scan_button_labels[scanner_type], type="primary"):
+if st.sidebar.button(scan_button_labels[scanner_type], type="primary"):
     try:
         token = issue_access_token(APP_KEY, APP_SECRET)
         price_errors = []
@@ -3710,13 +3897,14 @@ if has_current_scan and not is_domestic:
         )
     us_meta = st.session_state.get("us_scan_meta", {})
     us_kind = "우량주" if strategy_code == "quality" else "동전주 급등" if strategy_code == "penny" else "급등주"
-    st.success(f"미국 {us_kind} 후보 {len(table)}종목을 받았습니다.")
-    st.caption(
-        f"세션: {us_meta.get('session', '-')} · "
-        f"갱신: {us_meta.get('time', '-')} KST · "
-        f"후보: {us_meta.get('source', '-')}. "
-        f"웹소켓 실체결: {st.session_state.get('us_live_count', 0)}종목."
-    )
+    if not MOBILE_SIMPLE_UI:
+        st.success(f"미국 {us_kind} 후보 {len(table)}종목을 받았습니다.")
+        st.caption(
+            f"세션: {us_meta.get('session', '-')} · "
+            f"갱신: {us_meta.get('time', '-')} KST · "
+            f"후보: {us_meta.get('source', '-')}. "
+            f"웹소켓 실체결: {st.session_state.get('us_live_count', 0)}종목."
+        )
 
     active_position = st.session_state.get("active_us_position")
     if active_position:
@@ -3857,8 +4045,9 @@ if has_current_scan and not is_domestic:
             st.session_state.pop("active_us_forecast", None)
             st.rerun()
 
+    simple_card_slot = st.empty() if MOBILE_SIMPLE_UI else None
     quick_col, signal_col = st.columns(2)
-    if quick_col.button("⚡ 실시간 빠른 갱신", use_container_width=True):
+    if quick_col.button("⚡ 새로고침", use_container_width=True):
         try:
             session_mode, session_detail, scan_time = resolve_us_session(us_session_choice)
             pairs = list(zip(table["거래소코드"], table["종목코드"]))
@@ -3920,7 +4109,7 @@ if has_current_scan and not is_domestic:
             st.warning(str(error))
 
     if strategy_code in ("penny", "momentum") and signal_col.button(
-        "🎯 상위 3종목 차트·재생률 검증",
+        "🎯 차트검사",
         use_container_width=True,
     ):
         try:
@@ -3934,7 +4123,33 @@ if has_current_scan and not is_domestic:
         except Exception as error:
             st.warning(str(error))
 
-    if strategy_code in ("penny", "momentum"):
+    if MOBILE_SIMPLE_UI:
+        signal_items = [
+            item for item in st.session_state.get("us_penny_signals", [])
+            if item.get("row")
+        ]
+        if not signal_items:
+            signal_items = [
+                {"row": row.to_dict(), "analysis": None, "error": "차트 계산 대기"}
+                for _, row in table.head(3).iterrows()
+            ]
+        labels = {
+            f"{item['row'].get('종목명') or item['row'].get('종목코드')} · "
+            f"{item['row'].get('종목코드')}": index
+            for index, item in enumerate(signal_items[:3])
+        }
+        with simple_card_slot.container():
+            selected_label = st.selectbox(
+                "카드 종목",
+                list(labels.keys()),
+                label_visibility="collapsed",
+                key=f"simple_card_{scanner_type}",
+            )
+            selected_item = signal_items[labels[selected_label]]
+            render_us_reference_card(selected_item)
+            render_us_entry_lock_controls(selected_item, scanner_type)
+
+    if not MOBILE_SIMPLE_UI and strategy_code in ("penny", "momentum"):
         st.subheader("⚡ 삼중순위 교집합 후보")
         direct = table.copy()
         if "삼중교집합" in direct.columns:
@@ -3980,7 +4195,7 @@ if has_current_scan and not is_domestic:
             "아직 매수신호가 아니며, 바로 아래 눌림 재돌파 카드가 녹색일 때만 검토합니다."
         )
 
-    if strategy_code in ("penny", "momentum"):
+    if not MOBILE_SIMPLE_UI and strategy_code in ("penny", "momentum"):
         source_counts = st.session_state.get("us_source_counts", {})
         if source_counts:
             working_sources = sum(1 for count in source_counts.values() if count > 0)
@@ -4136,29 +4351,30 @@ if has_current_scan and not is_domestic:
         "시세시간(KST)", "시세나이(초)", "시세출처", "현재판정",
     ]
 
-    st.dataframe(
-        table[us_columns],
-        use_container_width=True,
-        hide_index=True,
-        height=500,
-        column_config={
-            "현재가($)": st.column_config.NumberColumn(format="$%.2f"),
-            "등락률(%)": st.column_config.NumberColumn(format="%.2f%%"),
-            "오늘거래량": st.column_config.NumberColumn(format="%d주"),
-            "전일대비거래량(%)": st.column_config.NumberColumn(format="%.1f%%"),
-            "오늘거래대금(백만$)": st.column_config.NumberColumn(format="$%.2fM"),
-            "VWAP($)": st.column_config.NumberColumn(format="$%.2f"),
-            "VWAP위치(%)": st.column_config.NumberColumn(format="%.2f%%"),
-            "스프레드(%)": st.column_config.NumberColumn(format="%.2f%%"),
-            "체결강도": st.column_config.NumberColumn(format="%.1f"),
-            "1차필터점수": st.column_config.NumberColumn(format="%d점"),
-            "시세나이(초)": st.column_config.NumberColumn(format="%.2f초"),
-        },
-    )
-    if us_meta.get("errors"):
-        st.caption("일부 묶음은 재시도 후 제외됐습니다. 표시된 종목은 정상 응답입니다.")
-    if strategy_code not in ("penny", "momentum"):
-        st.warning("이 표는 후보 압축용이며 매수 신호가 아닙니다. RSI·MACD는 선택 종목 정밀검사에서 확인하세요.")
+    if not MOBILE_SIMPLE_UI:
+        st.dataframe(
+            table[us_columns],
+            use_container_width=True,
+            hide_index=True,
+            height=500,
+            column_config={
+                "현재가($)": st.column_config.NumberColumn(format="$%.2f"),
+                "등락률(%)": st.column_config.NumberColumn(format="%.2f%%"),
+                "오늘거래량": st.column_config.NumberColumn(format="%d주"),
+                "전일대비거래량(%)": st.column_config.NumberColumn(format="%.1f%%"),
+                "오늘거래대금(백만$)": st.column_config.NumberColumn(format="$%.2fM"),
+                "VWAP($)": st.column_config.NumberColumn(format="$%.2f"),
+                "VWAP위치(%)": st.column_config.NumberColumn(format="%.2f%%"),
+                "스프레드(%)": st.column_config.NumberColumn(format="%.2f%%"),
+                "체결강도": st.column_config.NumberColumn(format="%.1f"),
+                "1차필터점수": st.column_config.NumberColumn(format="%d점"),
+                "시세나이(초)": st.column_config.NumberColumn(format="%.2f초"),
+            },
+        )
+        if us_meta.get("errors"):
+            st.caption("일부 묶음은 재시도 후 제외됐습니다. 표시된 종목은 정상 응답입니다.")
+        if strategy_code not in ("penny", "momentum"):
+            st.warning("이 표는 후보 압축용이며 매수 신호가 아닙니다. RSI·MACD는 선택 종목 정밀검사에서 확인하세요.")
 
 
 if has_current_scan and is_domestic:
