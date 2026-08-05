@@ -647,17 +647,16 @@ def _us_rank_key(row):
     return exchange, ticker
 
 
-def build_us_triple_rank_rows(updown_rows, volume_rows, power_rows, session_mode, penny_only):
-    """상승률·절대 당일거래량·매수체결강도 상위의 정확한 교집합을 만든다.
+def build_us_triple_rank_rows(updown_rows, volume_rows, power_rows, session_mode, penny_only, surge_rows=None):
+    """미국 급등 후보를 교집합이 아닌 순위 합집합으로 만든다.
 
-    API가 돌려준 목록 전체를 미국 3개 거래소 기준으로 다시 정렬한다.
-    3개 순위에 모두 든 종목만 삼중교집합이며, 2개만 겹친 종목은
-    데이터 확인용 관찰 후보로만 남긴다.
+    상승률·당일거래량·거래량급증·체결강도 중 하나에만 들어와도 후보로 보존한다.
+    교집합 수는 신뢰도 가중치로만 사용하며 후보 삭제 조건으로 사용하지 않는다.
     """
     merged = {}
 
     def absorb(rows, source):
-        for raw in rows:
+        for raw in rows or []:
             row = dict(raw)
             exchange, ticker = _us_rank_key(row)
             name = us_stock_name(row)
@@ -669,25 +668,14 @@ def build_us_triple_rank_rows(updown_rows, volume_rows, power_rows, session_mode
                 continue
             key = (exchange, ticker)
             item = merged.setdefault(key, {
-                "_base_exchange": exchange,
-                "_session_mode": session_mode,
-                "symb": ticker,
-                "excd": exchange,
-                "knam": name or ticker,
+                "_base_exchange": exchange, "_session_mode": session_mode,
+                "symb": ticker, "excd": exchange, "knam": name or ticker,
                 "enam": str(row.get("enam") or row.get("ename") or "").strip(),
-                "last": 0,
-                "base": 0,
-                "rate": 0,
-                "tvol": 0,
-                "tamt": 0,
-                "pvol": 0,
-                "pask": 0,
-                "pbid": 0,
-                "powx": 0,
-                "tpow": 0,
-                "_gain_member": False,
-                "_volume_member": False,
-                "_power_member": False,
+                "last": 0, "base": 0, "rate": 0, "tvol": 0, "tamt": 0,
+                "pvol": 0, "pask": 0, "pbid": 0, "powx": 0, "tpow": 0,
+                "n_rate": 0,
+                "_gain_member": False, "_volume_member": False,
+                "_surge_member": False, "_power_member": False,
             })
             if name and item.get("knam") in ("", ticker):
                 item["knam"] = name
@@ -697,99 +685,102 @@ def build_us_triple_rank_rows(updown_rows, volume_rows, power_rows, session_mode
             if source == "gain":
                 item["_gain_member"] = True
                 item["rate"] = row.get("rate")
-                if to_int(row.get("tvol")) > to_int(item.get("tvol")):
-                    item["tvol"] = row.get("tvol")
             elif source == "volume":
                 item["_volume_member"] = True
                 item["tvol"] = row.get("tvol")
                 item["tamt"] = row.get("tamt")
                 item["pvol"] = row.get("pvol")
+            elif source == "surge":
+                item["_surge_member"] = True
+                item["n_rate"] = row.get("n_rate")
+                if to_int(row.get("tvol")) > to_int(item.get("tvol")):
+                    item["tvol"] = row.get("tvol")
                 if to_float(item.get("rate")) == 0:
                     item["rate"] = row.get("rate")
             else:
                 item["_power_member"] = True
                 item["powx"] = row.get("powx")
                 item["tpow"] = row.get("tpow")
-                if to_float(item.get("rate")) == 0:
-                    item["rate"] = row.get("rate")
-                if to_int(row.get("tvol")) > to_int(item.get("tvol")):
-                    item["tvol"] = row.get("tvol")
+            if to_float(item.get("rate")) == 0:
+                item["rate"] = row.get("rate")
+            if to_int(row.get("tvol")) > to_int(item.get("tvol")):
+                item["tvol"] = row.get("tvol")
+            if to_float(row.get("tamt")) > to_float(item.get("tamt")):
+                item["tamt"] = row.get("tamt")
 
     absorb(updown_rows, "gain")
     absorb(volume_rows, "volume")
+    absorb(surge_rows, "surge")
     absorb(power_rows, "power")
 
     items = list(merged.values())
     if penny_only:
         items = [item for item in items if 0.01 <= to_float(item.get("last")) <= 10]
 
-    gain_items = sorted(
-        [item for item in items if item["_gain_member"]],
-        key=lambda item: to_float(item.get("rate")),
-        reverse=True,
-    )[:100]
-    volume_items = sorted(
-        [item for item in items if item["_volume_member"]],
-        key=lambda item: to_int(item.get("tvol")),
-        reverse=True,
-    )[:100]
-    power_items = sorted(
-        [item for item in items if item["_power_member"]],
-        key=lambda item: max(to_float(item.get("tpow")), to_float(item.get("powx"))),
-        reverse=True,
-    )[:100]
+    def ranked(member, value_fn):
+        selected = sorted([x for x in items if x[member]], key=value_fn, reverse=True)[:100]
+        return {_us_rank_key(x): i for i, x in enumerate(selected, 1)}
 
-    gain_rank = {_us_rank_key(item): index for index, item in enumerate(gain_items, 1)}
-    volume_rank = {_us_rank_key(item): index for index, item in enumerate(volume_items, 1)}
-    power_rank = {_us_rank_key(item): index for index, item in enumerate(power_items, 1)}
+    gain_rank = ranked("_gain_member", lambda x: to_float(x.get("rate")))
+    volume_rank = ranked("_volume_member", lambda x: to_int(x.get("tvol")))
+    surge_rank = ranked("_surge_member", lambda x: to_float(x.get("n_rate")))
+    power_rank = ranked("_power_member", lambda x: max(to_float(x.get("tpow")), to_float(x.get("powx"))))
 
     output = []
     for item in items:
         key = _us_rank_key(item)
         item["_gain_rank"] = gain_rank.get(key, 0)
         item["_volume_rank"] = volume_rank.get(key, 0)
+        item["_surge_rank"] = surge_rank.get(key, 0)
         item["_power_rank"] = power_rank.get(key, 0)
         overlap = sum(rank > 0 for rank in (
-            item["_gain_rank"], item["_volume_rank"], item["_power_rank"]
+            item["_gain_rank"], item["_volume_rank"], item["_surge_rank"], item["_power_rank"]
         ))
         item["_overlap_count"] = overlap
-        item["_triple_intersection"] = overlap == 3
-        # 체결강도 API의 당일값을 화면의 기본 체결강도로 사용한다.
+        item["_triple_intersection"] = overlap >= 3
         item["powx"] = max(to_float(item.get("tpow")), to_float(item.get("powx")))
-        if overlap >= 2:
-            output.append(item)
+        rate = to_float(item.get("rate"))
+        volume = to_int(item.get("tvol"))
+        amount = to_float(item.get("tamt")) or to_float(item.get("last")) * volume
+        surge = to_float(item.get("n_rate"))
+        # 이미 폭등한 종목도 숨기지 않되, 조기포착 후보가 위로 오도록 정렬 점수를 분리한다.
+        early_bonus = 45 if 5 <= rate <= 35 else 20 if 2 <= rate < 5 else 0
+        overheat_penalty = max(rate - 80, 0) * 1.2
+        item["_discovery_score"] = (
+            early_bonus + min(rate, 120) * 1.1 + min(max(surge, 0), 2000) / 35
+            + min(math.log10(max(volume, 1)), 9) * 5
+            + min(math.log10(max(amount, 1)), 12) * 3
+            + overlap * 12 - overheat_penalty
+        )
+        output.append(item)
 
     output.sort(key=lambda item: (
-        not item["_triple_intersection"],
+        -to_float(item.get("_discovery_score")),
         -item["_overlap_count"],
         item["_gain_rank"] or 999,
-        item["_volume_rank"] or 999,
-        item["_power_rank"] or 999,
     ))
-    pairs = [(_us_rank_key(item)) for item in output[:30]]
-    return output[:30], pairs
+    output = output[:60]
+    pairs = [_us_rank_key(item) for item in output]
+    return output, pairs
 
 
 @st.cache_data(ttl=3, show_spinner=False)
 def get_us_triple_rank_rows(token, penny_only):
-    """미국 3개 거래소×3개 공식 순위를 동시에 받아 교집합을 만든다."""
+    """미국 3개 거래소의 4개 급등 관련 순위를 동시에 수집한다."""
     exchanges = ("NAS", "NYS", "AMS")
     calls = {
         "상승률": get_us_updown_rows,
-        "당일거래량": lambda value, exchange: get_us_trade_volume_rows(
-            value, exchange, penny_only
-        ),
+        "당일거래량": lambda value, exchange: get_us_trade_volume_rows(value, exchange, penny_only),
+        "거래량급증": get_us_volume_surge_rows,
         "체결강도": get_us_volume_power_rows,
     }
-    grouped = {"상승률": [], "당일거래량": [], "체결강도": []}
-    counts = {}
-    errors = []
-    with ThreadPoolExecutor(max_workers=9) as executor:
+    grouped = {name: [] for name in calls}
+    counts, errors = {}, []
+    with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {}
         for label, function in calls.items():
             for exchange in exchanges:
-                future = executor.submit(function, token, exchange)
-                futures[future] = (label, exchange)
+                futures[executor.submit(function, token, exchange)] = (label, exchange)
         for future in as_completed(futures):
             label, exchange = futures[future]
             key = f"한투-{exchange}-{label}"
@@ -1680,13 +1671,20 @@ def build_us_fast_table(rows, candidates, strategy):
                 - max(vwap_gap - 6, 0) * 4
             )
         elif strategy == "momentum":
+            surge_rate = to_float(row.get("n_rate"))
             passed = rate >= 2 and volume >= 10_000 and amount >= 100_000
-            if rate >= 25 or vwap_gap >= 10:
-                status = "🔴 추격주의"
-            elif passed and price >= vwap:
-                status = "🟢 급등 정밀검사"
-            elif rate >= 1 or volume_ratio >= 120:
-                status = "🟡 거래량 확대 감시"
+            if rate >= 100:
+                status = "🟣 폭등 발견·신규진입 금지"
+            elif rate >= 60 or vwap_gap >= 12:
+                status = "🔴 초급등·눌림 확인"
+            elif 20 <= rate < 60:
+                status = "🟠 가속구간·분봉검사"
+            elif passed and 5 <= rate < 20 and price >= vwap:
+                status = "🟢 조기포착·분봉검사"
+            elif passed and (surge_rate >= 100 or volume_ratio >= 120):
+                status = "🟡 거래량 폭발 감시"
+            elif rate >= 1:
+                status = "⚪ 초기감시"
             else:
                 status = "⚪ 조건대기"
         else:
@@ -1723,6 +1721,8 @@ def build_us_fast_table(rows, candidates, strategy):
             "상승률순위": to_int(row.get("_gain_rank")),
             "당일거래량순위": to_int(row.get("_volume_rank")),
             "체결강도순위": to_int(row.get("_power_rank")),
+            "거래량급증순위": to_int(row.get("_surge_rank")),
+            "발견점수": round(to_float(row.get("_discovery_score")), 2),
             "교집합수": to_int(row.get("_overlap_count")),
             "삼중교집합": bool(row.get("_triple_intersection", False)),
             "고속점수": round(score, 2),
@@ -1751,15 +1751,12 @@ def build_us_fast_table(rows, candidates, strategy):
             ascending=[False, False, False, False],
         ).head(30).reset_index(drop=True)
     if strategy == "momentum":
-        table.loc[~table["삼중교집합"], "현재판정"] = "🟡 2/3 관찰만·진입금지"
-        table.loc[
-            table["삼중교집합"] & table["조건통과"],
-            "현재판정",
-        ] = "🟢 삼중순위 차트검사"
+        # 합집합 후보를 모두 보존하고, 조기포착 구간과 발견점수로 정렬한다.
+        table["조기포착"] = table["등락률(%)"].between(5, 35, inclusive="both")
         return table.sort_values(
-            ["삼중교집합", "교집합수", "오늘거래량", "고속점수"],
+            ["조기포착", "발견점수", "교집합수", "오늘거래량"],
             ascending=[False, False, False, False],
-        ).head(30).reset_index(drop=True)
+        ).head(40).reset_index(drop=True)
     return table.sort_values(
         ["시가총액(API)", "오늘거래대금(백만$)"], ascending=False
     ).head(30).reset_index(drop=True)
@@ -1911,14 +1908,8 @@ def apply_us_live_snapshots(table, snapshots, strategy):
                 status = "🟡 매수세 확인 대기"
             else:
                 status = "⚪ 유동성 관찰"
-        if strategy in ("penny", "momentum"):
-            if not triple_intersection:
-                status = "🟡 2/3 관찰만·진입금지"
-                passed = False
-                signal_score = min(signal_score, 74)
-                result.at[index, "1차필터점수"] = signal_score
-            elif passed and signal_score >= 75:
-                status = "🟢 삼중순위·눌림검사 대상"
+        if strategy in ("penny", "momentum") and passed and signal_score >= 75:
+            status = "🟢 조기포착·눌림검사 대상"
         result.at[index, "조건통과"] = passed
         result.at[index, "현재판정"] = status
 
@@ -1934,7 +1925,7 @@ def apply_us_live_snapshots(table, snapshots, strategy):
     rest = result[~result["시세출처"].str.startswith("한투 WS")].copy()
     if strategy in ("penny", "momentum"):
         sort_columns = [
-            column for column in ("삼중교집합", "교집합수", "오늘거래량")
+            column for column in ("1차필터점수", "발견점수", "교집합수", "오늘거래량")
             if column in live.columns
         ]
         ascending = [False] * len(sort_columns)
@@ -2728,7 +2719,7 @@ def analyze_us_penny_stock(minute, quote_row):
         "눌림 후 재상승": -6 <= pullback_pct <= 0 and reclaim,
         "1·5분 실체결 방향 확인": tick_confirmed,
         "1차 손익비 1.5 이상": reward_risk1 >= 1.5,
-        "상승률·거래량·체결강도 교집합": triple_ok,
+        "상승률·거래량·급증·체결강도 합집합": triple_ok,
     }
     score = sum(checks.values())
     overheated = change_pct >= 50 or vwap_gap > 8 or rsi_1 >= 84 or spread_pct > maximum_spread * 2
@@ -2747,7 +2738,7 @@ def analyze_us_penny_stock(minute, quote_row):
         and checks["눌림 후 재상승"]
         and checks["1·5분 실체결 방향 확인"]
         and checks["1차 손익비 1.5 이상"]
-        and checks["상승률·거래량·체결강도 교집합"]
+        and checks["상승률·거래량·급증·체결강도 합집합"]
     )
 
     validation_store = st.session_state.setdefault("us_validation_cache", {})
@@ -3850,7 +3841,7 @@ scan_button_labels = {
     "kr_quality": "국내 우량주 통합시장 검사",
     "kr_momentum": "국내 급등주 삼중순위 교집합 검사",
     "us_quality": "미국 우량주 10종목씩 고속 검사",
-    "us_momentum": "미국 급등주 삼중순위 교집합 검색",
+    "us_momentum": "미국 급등주 조기포착 합집합 검색",
     "us_penny": "미국 동전주 삼중순위 교집합 검색",
 }
 
@@ -3864,7 +3855,7 @@ if not is_domestic:
     if strategy_code in ("momentum", "penny"):
         st.sidebar.caption("순위 → 거래량 → VWAP → 재돌파")
 elif strategy_code == "momentum":
-    st.sidebar.caption("상승률·거래량·체결강도 교집합")
+    st.sidebar.caption("상승률·거래량·급증·체결강도 합집합")
 
 if st.sidebar.button(scan_button_labels[scanner_type], type="primary"):
     try:
@@ -3916,7 +3907,7 @@ if st.sidebar.button(scan_button_labels[scanner_type], type="primary"):
 
         else:
             scan_name = "동전주 급등" if strategy_code == "penny" else "급등주"
-            with st.spinner(f"미국 {scan_name} 상승률·거래량·체결강도 순위를 동시에 받는 중입니다..."):
+            with st.spinner(f"미국 {scan_name} 상승률·거래량·거래량급증·체결강도 순위를 동시에 받는 중입니다..."):
                 session_mode, session_detail, scan_time = resolve_us_session(us_session_choice)
                 grouped, source_counts, rank_errors = get_us_triple_rank_rows(
                     token,
@@ -3928,15 +3919,16 @@ if st.sidebar.button(scan_button_labels[scanner_type], type="primary"):
                     grouped["체결강도"],
                     session_mode,
                     penny_only=strategy_code == "penny",
+                    surge_rows=grouped.get("거래량급증", []),
                 )
                 table = build_us_fast_table(
                     market_rows, us_candidates, strategy=strategy_code
                 )
-                table["시세출처"] = "한투 공식 삼중순위"
-                exact_count = int(table["삼중교집합"].sum()) if not table.empty else 0
+                table["시세출처"] = "한투 공식 급등순위 합집합"
+                early_count = int(table["등락률(%)"].between(5, 35).sum()) if not table.empty else 0
                 us_source_note = (
-                    f"상승률·당일거래량·체결강도 삼중교집합 {exact_count}개 "
-                    f"(2/3 관찰 포함 {len(us_candidates)}개)"
+                    f"상승률·당일거래량·거래량급증·체결강도 합집합 {len(us_candidates)}개 "
+                    f"(조기포착 +5~35% {early_count}개)"
                 )
                 price_errors = list(rank_errors)
                 st.session_state["us_source_counts"] = source_counts
@@ -3966,7 +3958,7 @@ if st.sidebar.button(scan_button_labels[scanner_type], type="primary"):
                 raise RuntimeError("\n".join(price_errors[:5]))
             raise RuntimeError("현재 조건에 맞는 종목을 받지 못했습니다. 미국 장 운영 시간에 다시 확인해 주세요.")
 
-        # 삼중교집합 중 상위 3종목만 분봉을 재생해 눌림·재돌파와 레벨을 계산한다.
+        # 조기포착 점수가 높은 상위 종목의 분봉을 재생해 눌림·재돌파와 레벨을 계산한다.
         st.session_state.pop("us_penny_signals", None)
         if not is_domestic and strategy_code in ("penny", "momentum"):
             with st.spinner("상위 3종목의 차트·적중률을 동시 검증하는 중..."):
