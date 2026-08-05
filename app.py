@@ -2891,38 +2891,72 @@ def analyze_us_penny_stock(minute, quote_row, strategy="momentum"):
         premium_setup = quality_entry
         aggressive_setup = quality_wait
     else:
-        # 급등주는 첫 눌림 뒤 EMA9/VWAP 재돌파와 거래량 재유입을 확인한다.
-        execution_ok = liquidity_ok and 0 < spread_pct <= maximum_spread * 1.35
-        momentum_ok = trend_1 and (bullish_macd or macd_improving(one)) and close_rising
-        location_ok = -1.0 <= vwap_gap <= 6.0 and -9.0 <= pullback_pct <= 0.5
-        strength_ok = strength == 0 or strength >= 105
-        volume_live = volume_speed >= 0.8 or day_amount_million >= 3.0
-        aggressive_setup = fresh_ok and execution_ok and momentum_ok and location_ok and strength_ok and volume_live
-        first_pullback_ready = (
-            aggressive_setup
-            and reclaim
-            and -7.0 <= pullback_pct <= -0.4
-            and trend_3
-            and volume_speed >= 1.0
-            and spread_pct <= maximum_spread
+        # 급등주는 첫 눌림 후 직전 1분봉 고가 재돌파를 실제 진입 트리거로 사용한다.
+        execution_ok = liquidity_ok and 0 < spread_pct <= maximum_spread * 1.60
+        strength_ok = strength == 0 or strength >= 100
+        volume_live = volume_speed >= 0.65 or day_amount_million >= 2.0
+        location_ok = -2.0 <= vwap_gap <= 8.0 and -12.0 <= pullback_pct <= 1.0
+
+        prev_high = float(one["고가"].iloc[-2]) if len(one) >= 2 else price
+        prev_close = float(one["종가"].iloc[-2]) if len(one) >= 2 else price
+        last_close = float(one["종가"].iloc[-1]) if len(one) else price
+        last_volume = float(one["거래량"].iloc[-1]) if len(one) else 0.0
+        prev_volume = float(one["거래량"].iloc[-2]) if len(one) >= 2 else 0.0
+        trigger_price = max(prev_high, safe_last(one["EMA9"]), vwap)
+
+        # 첫 눌림은 최근 고점 대비 -1%~-12% 또는 EMA9/VWAP 접촉으로 인정한다.
+        pullback_seen = (
+            (-12.0 <= pullback_pct <= -1.0)
+            or touched_ema
+            or touched_vwap
         )
-        premium_setup = first_pullback_ready
-        hard_overheat = change_pct >= 150 or vwap_gap > 15 or rsi_1 >= 92 or spread_pct > maximum_spread * 2.2
+        breakout_now = (
+            price >= trigger_price * 0.999
+            and last_close >= prev_high * 0.999
+            and last_close >= prev_close
+        )
+        volume_reentry = (
+            last_volume >= prev_volume * 0.85
+            or volume_speed >= 0.75
+            or strength >= 115
+        )
+        momentum_ok = trend_1 and close_rising and (macd_improving(one) or bullish_macd or trend_3)
+
+        aggressive_setup = (
+            fresh_ok and execution_ok and strength_ok and volume_live and location_ok
+            and pullback_seen and (trend_1 or price >= safe_last(one["EMA9"]) * 0.997)
+        )
+        premium_setup = (
+            aggressive_setup and breakout_now and volume_reentry and momentum_ok
+            and spread_pct <= maximum_spread * 1.20
+        )
+
+        # 상승률만 높다는 이유로 무조건 회피하지 않는다. 실제 급락·호가위험일 때만 빨간색이다.
+        hard_overheat = (
+            vwap_gap > 18
+            or rsi_1 >= 94
+            or spread_pct > maximum_spread * 2.5
+            or (pullback_pct < -15 and not trend_1)
+        )
         signal_confirmed, confirmation_hits = confirm_us_signal(
             quote_row.get("종목코드", ""), premium_setup, planned_entry
         )
         if hard_overheat:
-            verdict = "🔴 과열·급락위험"
+            verdict = "🔴 급락·호가위험"
         elif premium_setup and signal_confirmed:
-            verdict = "🟢 재돌파 확인·지금 진입"
+            verdict = "🟢 지금 진입·재돌파 확인"
         elif premium_setup:
-            verdict = "🟢 재돌파 진입 가능"
+            verdict = "🟢 진입 준비·1회 더 확인"
+        elif aggressive_setup and price < trigger_price:
+            verdict = f"🟡 눌림완료·{trigger_price:.4f} 돌파대기"
         elif aggressive_setup:
-            verdict = "🟡 눌림대기·재돌파 감시"
-        elif fresh_ok and execution_ok and (trend_1 or bullish_macd):
-            verdict = "🟡 재돌파 확인대기"
+            verdict = "🟡 재돌파 거래량 확인대기"
+        elif fresh_ok and execution_ok and pullback_seen:
+            verdict = f"🟡 {trigger_price:.4f} 재돌파 감시"
+        elif fresh_ok and execution_ok:
+            verdict = "🟡 첫 눌림 기다리는 중"
         else:
-            verdict = "⚪ 조건 미달"
+            verdict = "⚪ 유동성·호가 조건 미달"
 
     # 매수는 마지막 체결가가 아닌 실제 매도 1호가를 기준으로 계획한다.
     entry = planned_entry
@@ -3554,6 +3588,8 @@ def analyze_us_penny_candidates(token, table, session_mode, limit=12, pages=3, s
                 results.append({"row": {}, "analysis": None, "error": str(error)})
 
     verdict_order = {
+        "🟢 지금 진입·재돌파 확인": 0,
+        "🟢 진입 준비·1회 더 확인": 1,
         "🟢 재돌파 확인·지금 진입": 0,
         "🟢 재돌파 진입 가능": 1,
         "🟢 우량주 눌림 진입": 0,
