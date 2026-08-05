@@ -1,4 +1,5 @@
 import html
+import math
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -9,13 +10,13 @@ import streamlit as st
 
 
 st.set_page_config(
-    page_title="국내 단타 스캐너",
+    page_title="한·미 단타 스캐너",
     page_icon="📡",
     layout="wide",
 )
 
-st.title("📡 국내 당일 단타 스캐너")
-st.caption("📱 모바일 V5 · 분봉 자동 재시도 버전")
+st.title("📡 한·미 당일 단타 스캐너")
+st.caption("📱 모바일 V6 · 미국 우량주/급등주 1차 연결 검증")
 
 st.markdown(
     """
@@ -204,6 +205,235 @@ def get_volume_rank(token, sort_code):
     if data.get("rt_cd") != "0":
         raise RuntimeError(data.get("msg1", "거래량 순위를 받지 못했습니다."))
     return data.get("output", [])
+
+
+def get_us_ranking(token, endpoint, tr_id, params):
+    response = None
+    for attempt in range(3):
+        response = requests.get(
+            f"{BASE_URL}{endpoint}",
+            headers=make_headers(token, tr_id),
+            params=params,
+            timeout=20,
+        )
+        if response.status_code == 200:
+            break
+        if response.status_code >= 500 and attempt < 2:
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        break
+
+    if response is None or response.status_code != 200:
+        status = response.status_code if response is not None else "응답 없음"
+        raise RuntimeError(f"미국주식 순위 조회 실패: HTTP {status}")
+
+    data = response.json()
+    if data.get("rt_cd") != "0":
+        raise RuntimeError(data.get("msg1", "미국주식 순위를 받지 못했습니다."))
+    return data.get("output2") or []
+
+
+def get_us_market_cap_rows(token, exchange):
+    rows = get_us_ranking(
+        token,
+        "/uapi/overseas-stock/v1/ranking/market-cap",
+        "HHDFS76350100",
+        {
+            "EXCD": exchange,
+            "VOL_RANG": "3",
+            "KEYB": "",
+            "AUTH": "",
+        },
+    )
+    return [dict(row, _exchange=exchange) for row in rows]
+
+
+def get_us_price_fluct_rows(token, exchange):
+    rows = get_us_ranking(
+        token,
+        "/uapi/overseas-stock/v1/ranking/price-fluct",
+        "HHDFS76260000",
+        {
+            "EXCD": exchange,
+            "GUBN": "1",
+            "MINX": "5",
+            "VOL_RANG": "3",
+            "KEYB": "",
+            "AUTH": "",
+        },
+    )
+    return [dict(row, _exchange=exchange) for row in rows]
+
+
+def get_us_volume_surge_rows(token, exchange):
+    rows = get_us_ranking(
+        token,
+        "/uapi/overseas-stock/v1/ranking/volume-surge",
+        "HHDFS76270000",
+        {
+            "EXCD": exchange,
+            "MINX": "5",
+            "VOL_RANG": "3",
+            "KEYB": "",
+            "AUTH": "",
+        },
+    )
+    return [dict(row, _exchange=exchange) for row in rows]
+
+
+US_EXCHANGE_NAMES = {
+    "NAS": "NASDAQ",
+    "NYS": "NYSE",
+    "AMS": "AMEX",
+}
+
+
+def is_excluded_us_product(name, ticker):
+    upper_name = str(name).upper()
+    upper_ticker = str(ticker).upper()
+    excluded_words = (
+        "ETF", "ETN", "PROSHARES", "DIREXION", "ULTRAPRO", "ULTRASHORT",
+        "2X", "3X", "BEAR", "SHORT", "WARRANT", "RIGHT", "UNIT",
+        "ACQUISITION", "SPAC",
+    )
+    if any(word in upper_name for word in excluded_words):
+        return True
+    return upper_ticker.endswith((".WS", ".W", ".U"))
+
+
+def us_stock_name(row):
+    return str(
+        row.get("name")
+        or row.get("enam")
+        or row.get("ename")
+        or row.get("knam")
+        or row.get("symb")
+        or ""
+    ).strip()
+
+
+def build_us_quality_table(rows):
+    records = []
+    for row in rows:
+        ticker = str(row.get("symb", "")).strip().upper()
+        name = us_stock_name(row)
+        if not ticker or not name or is_excluded_us_product(name, ticker):
+            continue
+        price = to_float(row.get("last"))
+        change_pct = to_float(row.get("rate"))
+        volume = to_int(row.get("tvol"))
+        trading_value = to_float(row.get("tamt"))
+        market_cap = to_float(row.get("mcap") or row.get("tomv"))
+        if price <= 0 or volume < 10_000:
+            continue
+        vwap = trading_value / volume if trading_value > 0 and volume > 0 else 0
+        vwap_gap = ((price / vwap) - 1) * 100 if vwap > 0 else 0
+
+        if change_pct >= 10 or vwap_gap > 4:
+            status = "🔴 추격주의"
+        elif change_pct <= -3 or (vwap > 0 and price < vwap):
+            status = "⚪ 약세·대기"
+        elif 0.5 <= change_pct <= 7 and trading_value >= 20_000_000:
+            status = "🟢 미국 기술지표 예정"
+        else:
+            status = "🟡 유동성 관찰"
+
+        exchange = str(row.get("_exchange") or row.get("excd") or "").strip()
+        records.append({
+            "시장": US_EXCHANGE_NAMES.get(exchange, exchange),
+            "거래소코드": exchange,
+            "시총순위": to_int(row.get("rank")),
+            "종목코드": ticker,
+            "종목명": name,
+            "현재가($)": round(price, 4),
+            "등락률(%)": round(change_pct, 2),
+            "오늘거래량": volume,
+            "오늘거래대금($)": round(trading_value, 2),
+            "오늘거래대금(백만$)": round(trading_value / 1_000_000, 2),
+            "VWAP근사($)": round(vwap, 4),
+            "VWAP위치(%)": round(vwap_gap, 2),
+            "시가총액(API)": market_cap,
+            "현재판정": status,
+        })
+
+    table = pd.DataFrame(records)
+    if table.empty:
+        return table
+    return table.sort_values(
+        ["시가총액(API)", "오늘거래대금($)"], ascending=False
+    ).head(30).reset_index(drop=True)
+
+
+def build_us_momentum_table(price_rows, surge_rows):
+    records = {}
+
+    def update_row(row, source):
+        exchange = str(row.get("_exchange") or row.get("excd") or "").strip()
+        ticker = str(row.get("symb", "")).strip().upper()
+        name = us_stock_name(row)
+        if not ticker or not name or is_excluded_us_product(name, ticker):
+            return
+        key = f"{exchange}:{ticker}"
+        item = records.setdefault(key, {
+            "시장": US_EXCHANGE_NAMES.get(exchange, exchange),
+            "거래소코드": exchange,
+            "종목코드": ticker,
+            "종목명": name,
+            "현재가($)": 0.0,
+            "등락률(%)": 0.0,
+            "15분등락률(%)": 0.0,
+            "거래량증가율(%)": 0.0,
+            "오늘거래량": 0,
+            "오늘거래대금($)": 0.0,
+        })
+        item["현재가($)"] = max(item["현재가($)"], to_float(row.get("last")))
+        item["등락률(%)"] = max(item["등락률(%)"], to_float(row.get("rate")))
+        item["오늘거래량"] = max(item["오늘거래량"], to_int(row.get("tvol")))
+        item["오늘거래대금($)"] = max(item["오늘거래대금($)"], to_float(row.get("tamt")))
+        if source == "price":
+            item["15분등락률(%)"] = max(item["15분등락률(%)"], to_float(row.get("n_rate")))
+        else:
+            item["거래량증가율(%)"] = max(item["거래량증가율(%)"], to_float(row.get("n_rate")))
+
+    for row in price_rows:
+        update_row(row, "price")
+    for row in surge_rows:
+        update_row(row, "surge")
+
+    clean = []
+    for item in records.values():
+        price = item["현재가($)"]
+        daily_rate = item["등락률(%)"]
+        volume = item["오늘거래량"]
+        amount = item["오늘거래대금($)"]
+        if price < 1 or daily_rate < 3 or volume < 10_000 or amount < 100_000:
+            continue
+        vwap = amount / volume if volume > 0 else 0
+        vwap_gap = ((price / vwap) - 1) * 100 if vwap > 0 else 0
+        short_rate = item["15분등락률(%)"]
+        volume_growth = item["거래량증가율(%)"]
+        if daily_rate >= 25 or short_rate >= 15 or vwap_gap > 10:
+            status = "🔴 추격금지·과열"
+        elif 5 <= daily_rate <= 20 and amount >= 2_000_000 and price >= vwap:
+            status = "🟢 미국 급등 정밀검사 예정"
+        else:
+            status = "🟡 거래량 확대 감시"
+        item["VWAP근사($)"] = round(vwap, 4)
+        item["VWAP위치(%)"] = round(vwap_gap, 2)
+        item["오늘거래대금(백만$)"] = round(amount / 1_000_000, 2)
+        item["현재판정"] = status
+        item["급등점수"] = round(
+            min(daily_rate, 100) + 2 * min(max(short_rate, 0), 30)
+            + min(max(volume_growth, 0) / 100, 30)
+            + math.log10(max(amount, 1)),
+            2,
+        )
+        clean.append(item)
+
+    table = pd.DataFrame(clean)
+    if table.empty:
+        return table
+    return table.sort_values("급등점수", ascending=False).head(30).reset_index(drop=True)
 
 
 def is_excluded_product(name):
@@ -607,7 +837,7 @@ def render_compact_card(saved):
     stock_name = html.escape(str(quote["종목명"]))
     ticker = html.escape(str(quote["종목코드"]))
     market = html.escape(str(quote["시장"]))
-    scan_name = "급등주" if saved.get("scan_type") == "momentum" else "우량주"
+    scan_name = "급등주" if str(saved.get("scan_type", "")).endswith("momentum") else "우량주"
     change_pct = float(quote["등락률(%)"])
     change_class = "change-up" if change_pct >= 0 else "change-down"
 
@@ -663,7 +893,7 @@ def render_compact_card(saved):
     updated_at = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%m/%d %H:%M")
     extra_left = ""
     extra_right = ""
-    if saved.get("scan_type") == "momentum":
+    if str(saved.get("scan_type", "")).endswith("momentum"):
         extra_left = (
             '<div class="data-row"><span class="data-label">거래량 증가율</span>'
             f'<span class="data-value">{float(quote.get("거래량증가율(%)", 0)):,.1f}%</span></div>'
@@ -793,66 +1023,152 @@ if not APP_KEY or not APP_SECRET:
     st.error("한국투자증권 API 키가 설정되지 않았습니다.")
     st.stop()
 
-st.caption("✅ 한국투자증권 통합시장(UN) 연결 준비")
+st.caption("✅ 한국투자증권 국내 통합시장·미국 시세 API 연결 준비")
 
-scanner_label = st.radio(
+market_label = st.radio(
+    "시장 선택",
+    ["🇰🇷 국내주식", "🇺🇸 미국주식"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
+strategy_label = st.radio(
     "검색 방식",
     ["🏦 우량주 단타", "🔥 급등주 단타"],
     horizontal=True,
     label_visibility="collapsed",
 )
-scanner_type = "quality" if scanner_label.startswith("🏦") else "momentum"
-scan_button_label = "우량주 통합시장 검사" if scanner_type == "quality" else "급등주 거래량 검사"
 
-if st.button(scan_button_label, type="primary"):
+market_code = "kr" if market_label.startswith("🇰🇷") else "us"
+strategy_code = "quality" if strategy_label.startswith("🏦") else "momentum"
+scanner_type = f"{market_code}_{strategy_code}"
+is_domestic = market_code == "kr"
+
+scan_button_labels = {
+    "kr_quality": "국내 우량주 통합시장 검사",
+    "kr_momentum": "국내 급등주 거래량 검사",
+    "us_quality": "미국 우량주 순위·가격 검사",
+    "us_momentum": "미국 급등주 거래량 검사",
+}
+
+if not is_domestic:
+    st.info(
+        "미국 V6는 NASDAQ·NYSE·AMEX 후보와 달러 가격·거래량을 먼저 검증합니다. "
+        "아직 RSI·MACD 매수 판정 단계가 아닙니다."
+    )
+
+if st.button(scan_button_labels[scanner_type], type="primary"):
     try:
         token = issue_access_token(APP_KEY, APP_SECRET)
-        if scanner_type == "quality":
-            with st.spinner("시가총액 상위 종목을 선정하는 중입니다..."):
+        price_errors = []
+
+        if scanner_type == "kr_quality":
+            with st.spinner("국내 시가총액 상위 종목을 선정하는 중입니다..."):
                 kospi_rows = get_market_cap_ranking(token, "0001")
                 kosdaq_rows = get_market_cap_ranking(token, "1001")
                 universe = build_universe(kospi_rows, kosdaq_rows)
                 targets = universe.nlargest(30, "1차거래대금근사")["종목코드"].tolist()
-        else:
-            with st.spinner("거래증가율·거래금액 상위 급등주를 선정하는 중입니다..."):
+            if universe.empty:
+                raise RuntimeError("조건에 맞는 국내 우량주 후보를 받지 못했습니다.")
+            with st.spinner("국내 통합시장 현재가를 조회하는 중입니다..."):
+                prices, price_errors = collect_integrated_prices(token, targets)
+                table = merge_realtime(universe, prices, scanner_type="quality")
+
+        elif scanner_type == "kr_momentum":
+            with st.spinner("국내 거래증가율·거래금액 상위 종목을 선정하는 중입니다..."):
                 growth_rows = get_volume_rank(token, "1")
                 amount_rows = get_volume_rank(token, "3")
                 universe = build_momentum_universe(growth_rows + amount_rows)
                 targets = choose_momentum_targets(universe)
+            if universe.empty:
+                raise RuntimeError("조건에 맞는 국내 급등주 후보를 받지 못했습니다.")
+            with st.spinner("국내 통합시장 현재가를 조회하는 중입니다..."):
+                prices, price_errors = collect_integrated_prices(token, targets)
+                table = merge_realtime(universe, prices, scanner_type="momentum")
 
-        if universe.empty:
-            st.warning("조건에 맞는 1차 후보를 받지 못했습니다.")
-            st.stop()
+        elif scanner_type == "us_quality":
+            with st.spinner("NASDAQ·NYSE 시가총액 상위 우량주를 조회하는 중입니다..."):
+                market_rows = []
+                for exchange in ("NAS", "NYS"):
+                    market_rows.extend(get_us_market_cap_rows(token, exchange))
+                    time.sleep(0.15)
+                table = build_us_quality_table(market_rows)
 
-        with st.spinner("통합시장 현재가를 순서대로 조회하는 중입니다..."):
-            prices, price_errors = collect_integrated_prices(token, targets)
-            table = merge_realtime(universe, prices, scanner_type=scanner_type)
+        else:
+            with st.spinner("NASDAQ·NYSE·AMEX 가격급등·거래량급증 종목을 조회하는 중입니다..."):
+                price_rows = []
+                surge_rows = []
+                for exchange in ("NAS", "NYS", "AMS"):
+                    price_rows.extend(get_us_price_fluct_rows(token, exchange))
+                    time.sleep(0.15)
+                    surge_rows.extend(get_us_volume_surge_rows(token, exchange))
+                    time.sleep(0.15)
+                table = build_us_momentum_table(price_rows, surge_rows)
 
         if table.empty:
-            st.error("통합시장 현재가를 받지 못했습니다.")
             if price_errors:
-                st.code("\n".join(price_errors[:3]))
-            st.warning("KRX 가격으로 임의 대체하지 않았습니다.")
-            st.stop()
+                raise RuntimeError("\n".join(price_errors[:3]))
+            raise RuntimeError("현재 조건에 맞는 종목을 받지 못했습니다. 미국 장 운영 시간에 다시 확인해 주세요.")
 
         st.session_state["scan_table"] = table
         st.session_state["scan_type"] = scanner_type
         st.session_state.pop("last_analysis", None)
-        kind_text = "우량주" if scanner_type == "quality" else "급등주"
-        st.toast(f"{kind_text} 통합시장 {len(table)}종목 갱신 완료")
+        market_text = "국내" if is_domestic else "미국"
+        kind_text = "우량주" if strategy_code == "quality" else "급등주"
+        st.toast(f"{market_text} {kind_text} {len(table)}종목 갱신 완료")
     except Exception as error:
         st.error("종목 검사에 실패했습니다.")
         st.code(str(error))
 
 
-if "scan_table" in st.session_state and st.session_state.get("scan_type") == scanner_type:
+has_current_scan = (
+    "scan_table" in st.session_state
+    and st.session_state.get("scan_type") == scanner_type
+)
+
+if has_current_scan and not is_domestic:
+    table = st.session_state["scan_table"]
+    st.success(f"미국 {('우량주' if strategy_code == 'quality' else '급등주')} 후보 {len(table)}종목을 받았습니다.")
+    st.caption("가격은 미국 달러(USD) 기준입니다. 이 표는 1차 연결 검증용이며 아직 진입 신호가 아닙니다.")
+
+    if strategy_code == "quality":
+        us_columns = [
+            "시장", "시총순위", "종목코드", "종목명", "현재가($)", "등락률(%)",
+            "오늘거래량", "오늘거래대금(백만$)", "VWAP근사($)", "VWAP위치(%)", "현재판정",
+        ]
+    else:
+        us_columns = [
+            "시장", "종목코드", "종목명", "현재가($)", "등락률(%)", "15분등락률(%)",
+            "거래량증가율(%)", "오늘거래량", "오늘거래대금(백만$)",
+            "VWAP근사($)", "VWAP위치(%)", "현재판정",
+        ]
+
+    st.dataframe(
+        table[us_columns],
+        use_container_width=True,
+        hide_index=True,
+        height=500,
+        column_config={
+            "현재가($)": st.column_config.NumberColumn(format="$%.2f"),
+            "등락률(%)": st.column_config.NumberColumn(format="%.2f%%"),
+            "15분등락률(%)": st.column_config.NumberColumn(format="%.2f%%"),
+            "거래량증가율(%)": st.column_config.NumberColumn(format="%.1f%%"),
+            "오늘거래량": st.column_config.NumberColumn(format="%d주"),
+            "오늘거래대금(백만$)": st.column_config.NumberColumn(format="$%.2fM"),
+            "VWAP근사($)": st.column_config.NumberColumn(format="$%.2f"),
+            "VWAP위치(%)": st.column_config.NumberColumn(format="%.2f%%"),
+        },
+    )
+    st.warning("미국 종목의 RSI·MACD·정식 당일 VWAP·모바일 한눈에 카드는 다음 단계에서 붙입니다.")
+
+
+if has_current_scan and is_domestic:
     table = st.session_state["scan_table"]
     display_columns = [
         "시장", "시총순위", "종목코드", "종목명", "시세기준", "현재가", "등락률(%)",
         "VWAP", "VWAP위치(%)", "오늘누적거래량", "전일대비거래량(%)",
         "오늘거래대금(억원)", "현재판정",
     ]
-    if scanner_type == "momentum":
+    if strategy_code == "momentum":
         display_columns[1] = "급등순위"
         display_columns[10:10] = ["거래량증가율(%)", "거래량회전율(%)"]
         preferred_statuses = ["🟢 급등 정밀검사", "🟡 거래량 확대 감시"]
@@ -899,7 +1215,8 @@ if "scan_table" in st.session_state and st.session_state.get("scan_type") == sca
             st.code(str(error))
 
 if (
-    "last_analysis" in st.session_state
+    is_domestic
+    and "last_analysis" in st.session_state
     and st.session_state["last_analysis"].get("scan_type") == scanner_type
 ):
     saved = st.session_state["last_analysis"]
@@ -934,7 +1251,7 @@ if (
                 st.bar_chart(frame[["거래량"]], use_container_width=True, height=170)
 
 
-if "scan_table" in st.session_state and st.session_state.get("scan_type") == scanner_type:
+if has_current_scan and is_domestic:
     table = st.session_state["scan_table"]
     with st.expander(f"전체 {len(table)}종목 표 보기"):
         st.caption("현재가·VWAP·거래량·거래대금은 한국투자증권 통합시장(UN) 값입니다.")
