@@ -1917,7 +1917,7 @@ def analyze_us_penny_stock(minute, quote_row):
     validation = backtest_us_entry_condition(minute)
     validation_ok = (
         validation["samples"] >= 8
-        and validation["win_rate"] >= 75
+        and validation["full_success_rate"] >= 75
     )
 
     if overheated:
@@ -1927,13 +1927,16 @@ def analyze_us_penny_stock(minute, quote_row):
     elif score >= 6 and mandatory and validation["samples"] < 8:
         verdict = "🟡 검증표본 대기"
     elif score >= 6 and mandatory:
-        verdict = "🟡 최근 적중률 75% 미만"
+        verdict = "🟡 전체 매매성공률 75% 미만"
     elif score >= 3:
         verdict = "🟡 눌림대기"
     else:
         verdict = "⚪ 진입금지"
 
-    entry = price
+    # 현재가를 무조건 추격하지 않고 EMA9·당일 VWAP 눌림 구간을 진입가로 제시한다.
+    ema_entry = safe_last(one["EMA9"], price)
+    reference_entry = max(ema_entry, vwap) if vwap > 0 else ema_entry
+    entry = min(price, reference_entry) if reference_entry > 0 else price
     stop, target1, target2, support, resistance = calculate_us_chart_levels(
         one,
         len(one) - 1,
@@ -1951,9 +1954,13 @@ def analyze_us_penny_stock(minute, quote_row):
         "volume_speed": volume_speed,
         "vwap_gap": vwap_gap,
         "pullback_pct": pullback_pct,
-        "validation_wins": validation["wins"],
+        "validation_entry_hits": validation["entry_hits"],
+        "validation_entry_rate": validation["entry_hit_rate"],
+        "validation_wins": validation["target1_wins"],
         "validation_samples": validation["samples"],
-        "validation_win_rate": validation["win_rate"],
+        "validation_win_rate": validation["full_success_rate"],
+        "validation_target2_wins": validation["target2_wins"],
+        "validation_target2_rate": validation["target2_success_rate"],
         "validation_ok": validation_ok,
         "support": round(support, 4),
         "resistance": round(resistance, 4),
@@ -2002,72 +2009,275 @@ def calculate_us_chart_levels(bars, position, entry):
     return stop, target1, target2, support, resistance
 
 
-def backtest_us_entry_condition(minute, horizon=20):
-    """최근 1분봉을 시점별로 재생해 같은 기술조건의 적중률을 계산한다.
+def backtest_us_entry_condition(minute, entry_window=10, holding_window=20):
+    """제시한 진입가와 동적 익절가가 실제로 순서대로 도달했는지 재생한다.
 
-    신호 다음 분봉 시가를 진입가로 사용하며, 같은 분봉에 목표가와
-    손절가가 모두 닿으면 손절을 먼저 처리한다. 목표가와 손절가 모두
-    닿지 않은 경우도 실패로 처리해 적중률을 보수적으로 계산한다.
+    모든 기술신호를 분모에 포함한다. 신호 후 entry_window 분 안에
+    제시한 진입가가 체결되지 않으면 실패다. 체결된 뒤 holding_window 분
+    안에 손절보다 1차 익절에 먼저 도달해야 전체 매매 성공으로 계산한다.
+    같은 분봉에서 손절과 익절이 모두 출현하면 손절로 계산한다.
     """
     bars = add_indicators(resample_bars(minute, 1)).copy()
-    if len(bars) < 45:
-        return {"wins": 0, "samples": 0, "win_rate": 0.0}
+    empty_result = {
+        "samples": 0,
+        "entry_hits": 0,
+        "entry_hit_rate": 0.0,
+        "target1_wins": 0,
+        "full_success_rate": 0.0,
+        "target2_wins": 0,
+        "target2_success_rate": 0.0,
+    }
+    if len(bars) < 55:
+        return empty_result
 
     recent_volume = bars["거래량"].rolling(3).mean()
     prior_volume = bars["거래량"].shift(3).rolling(20).mean()
     bars["거래량속도"] = recent_volume / prior_volume.replace(0, float("nan"))
+
+    typical = (bars["고가"] + bars["저가"] + bars["종가"]) / 3
+    cumulative_value = (typical * bars["거래량"]).cumsum()
+    cumulative_volume = bars["거래량"].cumsum().replace(0, float("nan"))
+    bars["분봉VWAP"] = cumulative_value / cumulative_volume
     bars["기술신호"] = (
         (bars["종가"] >= bars["EMA9"])
+        & (bars["종가"] >= bars["분봉VWAP"])
         & bars["RSI"].between(45, 70)
         & (bars["MACD"] > bars["MACD시그널"])
         & (bars["MACD히스토그램"] >= bars["MACD히스토그램"].shift(1))
         & (bars["거래량속도"] >= 1.2)
     )
 
-    wins = 0
     samples = 0
+    entry_hits = 0
+    target1_wins = 0
+    target2_wins = 0
     index = 26
-    last_signal = len(bars) - horizon - 1
+    future_needed = entry_window + holding_window
+    last_signal = len(bars) - future_needed - 1
+
     while index <= last_signal:
         if not bool(bars["기술신호"].iloc[index]):
             index += 1
             continue
 
-        entry = float(bars["시가"].iloc[index + 1])
-        if entry <= 0:
-            index += 1
-            continue
-        stop, target, _, _, _ = calculate_us_chart_levels(
+        signal_close = float(bars["종가"].iloc[index])
+        ema_value = float(bars["EMA9"].iloc[index])
+        vwap_value = float(bars["분봉VWAP"].iloc[index])
+        proposed_entry = min(signal_close, max(ema_value, vwap_value))
+        stop, target1, target2, _, _ = calculate_us_chart_levels(
             bars,
             index,
-            entry,
+            proposed_entry,
         )
-        if stop <= 0 or target <= entry or stop >= entry:
+        if (
+            proposed_entry <= 0
+            or stop <= 0
+            or stop >= proposed_entry
+            or target1 <= proposed_entry
+            or target2 <= target1
+        ):
             index += 1
             continue
-        outcome = "loss"
-        future = bars.iloc[index + 1:index + 1 + horizon]
-        for _, candle in future.iterrows():
-            stop_hit = float(candle["저가"]) <= stop
-            target_hit = float(candle["고가"]) >= target
-            if stop_hit:
-                outcome = "loss"
-                break
-            if target_hit:
-                outcome = "win"
-                break
 
         samples += 1
-        if outcome == "win":
-            wins += 1
+        entry_position = None
+        entry_slice = bars.iloc[index + 1:index + 1 + entry_window]
+        for offset, (_, candle) in enumerate(entry_slice.iterrows(), start=index + 1):
+            if float(candle["저가"]) <= proposed_entry <= float(candle["고가"]):
+                entry_position = offset
+                break
+
+        # 제시한 진입가가 오지 않은 신호도 전체 성공률의 실패에 포함한다.
+        if entry_position is None:
+            index += 5
+            continue
+        entry_hits += 1
+
+        target1_hit = False
+        target2_hit = False
+        holding = bars.iloc[entry_position:entry_position + holding_window]
+        for _, candle in holding.iterrows():
+            low = float(candle["저가"])
+            high = float(candle["고가"])
+            if low <= stop:
+                break
+            if high >= target1:
+                target1_hit = True
+            if high >= target2:
+                target2_hit = True
+                target1_hit = True
+                break
+
+        if target1_hit:
+            target1_wins += 1
+        if target2_hit:
+            target2_wins += 1
         # 거의 같은 분봉에서 발생한 중복 신호를 하나로 압축한다.
         index += 5
 
-    win_rate = (wins / samples * 100) if samples else 0.0
+    if samples == 0:
+        return empty_result
     return {
-        "wins": wins,
         "samples": samples,
-        "win_rate": round(win_rate, 1),
+        "entry_hits": entry_hits,
+        "entry_hit_rate": round(entry_hits / samples * 100, 1),
+        "target1_wins": target1_wins,
+        "full_success_rate": round(target1_wins / samples * 100, 1),
+        "target2_wins": target2_wins,
+        "target2_success_rate": round(target2_wins / samples * 100, 1),
+    }
+
+
+def forecast_us_position_flow(minute, quote_row, position):
+    """최근 분봉·VWAP·체결강도로 보유 종목의 반등/붕괴 흐름을 판정한다."""
+    one = add_indicators(resample_bars(minute, 1))
+    three = add_indicators(resample_bars(minute, 3))
+    if len(one) < 30 or len(three) < 8:
+        return {
+            "state": "⚪ 판정 분봉 부족",
+            "score": 0,
+            "eta": "계산 대기",
+            "recovery": "판정 대기",
+            "reason": "최소 30개의 1분봉이 필요합니다.",
+        }
+
+    current = float(quote_row.get("현재가($)", 0) or 0)
+    day_vwap = float(quote_row.get("VWAP($)", 0) or 0)
+    strength = float(quote_row.get("체결강도", 0) or 0)
+    spread = float(quote_row.get("스프레드(%)", 0) or 0)
+    entry = float(position["진입가"])
+    stop = float(position["손절가"])
+    target1 = float(position["1차목표"])
+
+    close = one["종가"]
+    ema = one["EMA9"]
+    ema_slope = (
+        (float(ema.iloc[-1]) / float(ema.iloc[-4]) - 1) * 100
+        if len(ema) >= 4 and float(ema.iloc[-4]) > 0
+        else 0.0
+    )
+    price_slope = (
+        (float(close.iloc[-1]) / float(close.iloc[-4]) - 1) * 100
+        if len(close) >= 4 and float(close.iloc[-4]) > 0
+        else 0.0
+    )
+    histogram = three["MACD히스토그램"].dropna()
+    macd_improving = (
+        len(histogram) >= 2
+        and float(histogram.iloc[-1]) > float(histogram.iloc[-2])
+    )
+    macd_positive = len(histogram) > 0 and float(histogram.iloc[-1]) > 0
+    rsi_1 = safe_last(one["RSI"])
+    rsi_3 = safe_last(three["RSI"])
+    recent_volume = float(one["거래량"].tail(3).mean())
+    prior_volume = float(one["거래량"].iloc[-23:-3].mean())
+    volume_speed = recent_volume / prior_volume if prior_volume > 0 else 0.0
+    recent_lows = one["저가"].tail(4)
+    higher_low = len(recent_lows) >= 4 and float(recent_lows.iloc[-1]) >= float(recent_lows.iloc[-3])
+    chart_support = float(one["저가"].tail(12).min())
+
+    score = 50
+    reasons = []
+    if day_vwap > 0 and current >= day_vwap:
+        score += 12
+        reasons.append("VWAP 위")
+    elif day_vwap > 0:
+        score -= 15
+        reasons.append("VWAP 아래")
+    if current >= safe_last(one["EMA9"], current):
+        score += 10
+        reasons.append("EMA9 위")
+    else:
+        score -= 10
+        reasons.append("EMA9 아래")
+    if ema_slope > 0 and price_slope > 0:
+        score += 12
+        reasons.append("단기 기울기 상승")
+    elif ema_slope < 0 and price_slope < 0:
+        score -= 14
+        reasons.append("단기 기울기 하락")
+    if macd_improving:
+        score += 10
+        reasons.append("MACD 회복")
+    else:
+        score -= 8
+        reasons.append("MACD 약화")
+    if macd_positive:
+        score += 5
+    if 48 <= rsi_3 <= 72 and rsi_1 < 80:
+        score += 8
+        reasons.append("RSI 상승 구간")
+    elif rsi_1 >= 82:
+        score -= 10
+        reasons.append("RSI 과열")
+    if volume_speed >= 1.1:
+        score += 8
+        reasons.append("거래량 재증가")
+    elif volume_speed < 0.7:
+        score -= 6
+        reasons.append("거래량 둔화")
+    if strength >= 115:
+        score += 10
+        reasons.append("매수체결 우위")
+    elif 0 < strength < 90:
+        score -= 12
+        reasons.append("매도체결 우위")
+    if higher_low:
+        score += 7
+        reasons.append("저점 높아짐")
+    if spread > 4:
+        score -= 12
+        reasons.append("호가 벌어짐")
+    if current <= stop or current < chart_support:
+        score = min(score, 20)
+        reasons.append("손절/지지선 이탈")
+
+    score = max(0, min(100, int(round(score))))
+    if current <= stop or current < chart_support:
+        state = "🔴 추세 붕괴·회복 기대 낮음"
+    elif score >= 72 and ema_slope > 0 and macd_improving:
+        state = "🟢 상승 재개 흐름"
+    elif current < entry and score >= 58 and current >= stop:
+        state = "🟡 정상 눌림·반등 확인 중"
+    elif score < 42:
+        state = "🔴 반등 실패 가능성 높음"
+    else:
+        state = "🟡 혼조·추가 3분 확인"
+
+    atr = safe_last(one["ATR"])
+    absolute_moves = close.diff().abs().tail(8)
+    median_move = float(absolute_moves.median()) if not absolute_moves.empty else 0.0
+    expected_move = max(median_move, atr * 0.25, current * 0.0005)
+    forecast_price = entry if current < entry else target1
+    if score >= 58 and forecast_price > current and expected_move > 0:
+        center = max(1, int(round((forecast_price - current) / expected_move)))
+        low_eta = max(1, int(round(center * 0.7)))
+        high_eta = min(60, max(low_eta + 1, int(round(center * 1.5))))
+        eta = f"약 {low_eta}~{high_eta}분"
+    else:
+        eta = "예상시간 보류"
+
+    if current < entry:
+        if score >= 65:
+            recovery = f"진입가 회복 흐름 우세 · {eta} 관찰"
+        elif score < 42:
+            recovery = "진입가 회복 흐림 약함"
+        else:
+            recovery = "3분 저점·매수체결 회복 필요"
+    else:
+        recovery = f"1차 목표 예상 구간: {eta}"
+
+    return {
+        "state": state,
+        "score": score,
+        "eta": eta,
+        "recovery": recovery,
+        "reason": " · ".join(reasons[:5]),
+        "ema_slope": ema_slope,
+        "price_slope": price_slope,
+        "rsi_1": rsi_1,
+        "rsi_3": rsi_3,
+        "volume_speed": volume_speed,
     }
 
 
@@ -2102,7 +2312,7 @@ def analyze_us_penny_candidates(token, table, session_mode, limit=8):
     verdict_order = {
         "🟢 75% 검증 진입검토": 0,
         "🟡 검증표본 대기": 1,
-        "🟡 최근 적중률 75% 미만": 2,
+        "🟡 전체 매매성공률 75% 미만": 2,
         "🟡 눌림대기": 3,
         "⚪ 진입금지": 4,
         "🔴 추격금지": 5,
@@ -2491,6 +2701,101 @@ if has_current_scan and not is_domestic:
         f"웹소켓 실체결: {st.session_state.get('us_live_count', 0)}종목."
     )
 
+    active_position = st.session_state.get("active_us_position")
+    if active_position:
+        active_ticker = str(active_position["티커"])
+        current_rows = table[
+            table["종목코드"].astype(str).str.upper() == active_ticker.upper()
+        ]
+        current_price = (
+            float(current_rows.iloc[0]["현재가($)"])
+            if not current_rows.empty
+            else 0.0
+        )
+        locked_entry = float(active_position["진입가"])
+        locked_stop = float(active_position["손절가"])
+        locked_target1 = float(active_position["1차목표"])
+        locked_target2 = float(active_position["2차목표"])
+        return_pct = (
+            (current_price / locked_entry - 1) * 100
+            if current_price > 0 and locked_entry > 0
+            else 0.0
+        )
+        if current_price > 0 and current_price <= locked_stop:
+            position_status = "🔴 손절 기준 도달"
+            position_color = "#ff7b81"
+        elif current_price >= locked_target2:
+            position_status = "🟢 2차 목표 도달"
+            position_color = "#61df88"
+        elif current_price >= locked_target1:
+            position_status = "🟢 1차 목표 도달·분할매도"
+            position_color = "#61df88"
+        else:
+            position_status = "🟡 보유 계획 유지"
+            position_color = "#ffd45d"
+
+        flow_forecast = st.session_state.get("active_us_forecast", {})
+        if flow_forecast.get("티커") != active_ticker:
+            flow_forecast = {}
+        flow_state = flow_forecast.get("state", "⚪ 흐름 재분석 필요")
+        flow_score = int(flow_forecast.get("score", 0) or 0)
+        flow_recovery = flow_forecast.get("recovery", "아래 흐름 재분석을 눌러 확인하세요.")
+        flow_reason = flow_forecast.get("reason", "-")
+
+        st.subheader("🔒 내 보유 포지션 · 매매계획 고정")
+        position_name = html.escape(str(active_position["종목명"]))
+        st.markdown(
+            f'''<div class="stock-card" style="border-color:{position_color}">
+            <div class="card-head"><div><div class="stock-name">{position_name}</div>
+            <div class="ticker">{html.escape(active_ticker)} · 진입 {locked_entry:.4f}달러</div></div>
+            <div style="color:{position_color};font-weight:900">{position_status}</div></div>
+            <div class="grid2" style="margin-top:10px">
+              <div class="data-row"><span class="data-label">현재가만 갱신</span><span class="data-value">${current_price:.4f}</span></div>
+              <div class="data-row"><span class="data-label">현재 수익률</span><span class="data-value">{return_pct:+.2f}%</span></div>
+              <div class="data-row"><span class="data-label">고정 손절가</span><span class="data-value bad">${locked_stop:.4f}</span></div>
+              <div class="data-row"><span class="data-label">고정 1차 매도가</span><span class="data-value ok">${locked_target1:.4f}</span></div>
+              <div class="data-row"><span class="data-label">고정 2차 매도가</span><span class="data-value ok">${locked_target2:.4f}</span></div>
+              <div class="data-row"><span class="data-label">진입 시각</span><span class="data-value">{html.escape(str(active_position['진입시각']))}</span></div>
+              <div class="data-row"><span class="data-label">현재 차트흐름</span><span class="data-value">{html.escape(str(flow_state))}</span></div>
+              <div class="data-row"><span class="data-label">상승흐름 점수</span><span class="data-value">{flow_score}/100</span></div>
+              <div class="data-row"><span class="data-label">회복/목표 예상</span><span class="data-value">{html.escape(str(flow_recovery))}</span></div>
+              <div class="data-row"><span class="data-label">판단 근거</span><span class="data-value">{html.escape(str(flow_reason))}</span></div>
+            </div></div>''',
+            unsafe_allow_html=True,
+        )
+        st.caption("스캐너를 다시 검색해도 이 진입가·손절가·1·2차 매도가는 바뀌지 않습니다.")
+        flow_col, close_col = st.columns(2)
+        if flow_col.button("📈 보유 종목 흐름 재분석", use_container_width=True):
+            try:
+                token = issue_access_token(APP_KEY, APP_SECRET)
+                session_mode, _, _ = resolve_us_session(us_session_choice)
+                if current_rows.empty:
+                    raise RuntimeError("현재 스캔 표에 보유 종목이 없습니다. 먼저 거래량 검사를 누르세요.")
+                active_quote = current_rows.iloc[0].to_dict()
+                with st.spinner("보유 종목의 최근 분봉 흐름을 읽는 중..."):
+                    active_minutes = get_us_recent_minutes(
+                        token,
+                        str(active_quote["거래소코드"]),
+                        active_ticker,
+                        session_mode,
+                    )
+                    forecast = forecast_us_position_flow(
+                        active_minutes,
+                        active_quote,
+                        active_position,
+                    )
+                st.session_state["active_us_forecast"] = {
+                    "티커": active_ticker,
+                    **forecast,
+                }
+                st.rerun()
+            except Exception as error:
+                st.warning(str(error))
+        if close_col.button("✅ 매도 완료·포지션 종료", use_container_width=True):
+            st.session_state.pop("active_us_position", None)
+            st.session_state.pop("active_us_forecast", None)
+            st.rerun()
+
     quick_col, signal_col = st.columns(2)
     if quick_col.button("⚡ 현재 종목 1초 갱신", use_container_width=True):
         try:
@@ -2514,7 +2819,31 @@ if has_current_scan and not is_domestic:
                 "time": scan_time,
                 "errors": live_errors,
             }
+            active_position = st.session_state.get("active_us_position")
+            if active_position:
+                active_ticker = str(active_position["티커"])
+                active_rows = table[
+                    table["종목코드"].astype(str).str.upper() == active_ticker.upper()
+                ]
+                if not active_rows.empty:
+                    active_quote = active_rows.iloc[0].to_dict()
+                    token = issue_access_token(APP_KEY, APP_SECRET)
+                    active_minutes = get_us_recent_minutes(
+                        token,
+                        str(active_quote["거래소코드"]),
+                        active_ticker,
+                        session_mode,
+                    )
+                    st.session_state["active_us_forecast"] = {
+                        "티커": active_ticker,
+                        **forecast_us_position_flow(
+                            active_minutes,
+                            active_quote,
+                            active_position,
+                        ),
+                    }
             st.toast(f"실시간 체결 {len(snapshots)}종목 갱신 완료")
+            st.rerun()
         except Exception as error:
             st.warning(str(error))
 
@@ -2525,7 +2854,7 @@ if has_current_scan and not is_domestic:
         try:
             token = issue_access_token(APP_KEY, APP_SECRET)
             session_mode, _, _ = resolve_us_session(us_session_choice)
-            with st.spinner("상위 3종목의 지지·저항·ATR·최근 적중률을 검증하는 중..."):
+            with st.spinner("상위 3종목의 지지·저항·ATR·전체 매매성공률을 검증하는 중..."):
                 st.session_state["us_penny_signals"] = analyze_us_penny_candidates(
                     token, table, session_mode, limit=3
                 )
@@ -2602,7 +2931,7 @@ if has_current_scan and not is_domestic:
             if item["analysis"]["verdict"] in (
                 "🟢 75% 검증 진입검토",
                 "🟡 검증표본 대기",
-                "🟡 최근 적중률 75% 미만",
+                "🟡 전체 매매성공률 75% 미만",
                 "🟡 눌림대기",
             )
         ]
@@ -2617,8 +2946,10 @@ if has_current_scan and not is_domestic:
             analysis = item["analysis"]
             verdict = analysis["verdict"]
             color = "#61df88" if verdict.startswith("🟢") else "#ffd45d" if verdict.startswith("🟡") else "#ff7b81"
-            name = html.escape(str(row.get("종목명") or row.get("종목코드")))
-            ticker = html.escape(str(row.get("종목코드", "")))
+            raw_name = str(row.get("종목명") or row.get("종목코드"))
+            raw_ticker = str(row.get("종목코드", ""))
+            name = html.escape(raw_name)
+            ticker = html.escape(raw_ticker)
             st.markdown(
                 f'''<div class="stock-card" style="border-color:{color}">
                 <div class="card-head"><div><div class="stock-name">{name}</div>
@@ -2633,16 +2964,57 @@ if has_current_scan and not is_domestic:
                   <div class="data-row"><span class="data-label">3분 MACD</span><span class="data-value">{'상승' if analysis['bullish_macd'] else '약화'}</span></div>
                   <div class="data-row"><span class="data-label">VWAP 위치</span><span class="data-value">{analysis['vwap_gap']:+.1f}%</span></div>
                   <div class="data-row"><span class="data-label">최근 거래량</span><span class="data-value">{analysis['volume_speed']:.1f}배</span></div>
-                  <div class="data-row"><span class="data-label">최근 검증 적중률</span><span class="data-value">{analysis['validation_win_rate']:.1f}%</span></div>
-                  <div class="data-row"><span class="data-label">검증 표본</span><span class="data-value">{analysis['validation_wins']}/{analysis['validation_samples']}회</span></div>
+                  <div class="data-row"><span class="data-label">진입가 체결률</span><span class="data-value">{analysis['validation_entry_rate']:.1f}%</span></div>
+                  <div class="data-row"><span class="data-label">전체 매매성공률</span><span class="data-value">{analysis['validation_win_rate']:.1f}%</span></div>
+                  <div class="data-row"><span class="data-label">1차 익절 성공</span><span class="data-value">{analysis['validation_wins']}/{analysis['validation_samples']}회</span></div>
+                  <div class="data-row"><span class="data-label">2차 익절 도달률</span><span class="data-value">{analysis['validation_target2_rate']:.1f}%</span></div>
                   <div class="data-row"><span class="data-label">차트 지지선</span><span class="data-value">${analysis['support']:.4f}</span></div>
                   <div class="data-row"><span class="data-label">차트 저항선</span><span class="data-value">${analysis['resistance']:.4f}</span></div>
                 </div></div>''',
                 unsafe_allow_html=True,
             )
+            if verdict.startswith("🟢") and analysis.get("validation_ok"):
+                planned_entry = float(analysis["entry"])
+                actual_entry = st.number_input(
+                    f"{raw_ticker} 실제 체결가($)",
+                    min_value=0.0001,
+                    value=planned_entry,
+                    step=max(planned_entry * 0.001, 0.0001),
+                    format="%.4f",
+                    key=f"actual_entry_{scanner_type}_{raw_ticker}",
+                    help="메리츠 체결내역의 실제 매수가를 입력하세요.",
+                )
+                if st.button(
+                    f"🔒 {raw_ticker} 이 체결가로 진입 확정",
+                    use_container_width=True,
+                    key=f"lock_position_{scanner_type}_{raw_ticker}",
+                ):
+                    one_minute = analysis["frames"][1]
+                    stop, target1, target2, support, resistance = calculate_us_chart_levels(
+                        one_minute,
+                        len(one_minute) - 1,
+                        float(actual_entry),
+                    )
+                    deviation = abs(float(actual_entry) / planned_entry - 1) * 100 if planned_entry > 0 else 0
+                    st.session_state["active_us_position"] = {
+                        "티커": raw_ticker,
+                        "종목명": raw_name,
+                        "거래소코드": str(row.get("거래소코드", "")),
+                        "진입가": round(float(actual_entry), 4),
+                        "손절가": round(float(stop), 4),
+                        "1차목표": round(float(target1), 4),
+                        "2차목표": round(float(target2), 4),
+                        "지지선": round(float(support), 4),
+                        "저항선": round(float(resistance), 4),
+                        "진입시각": datetime.now(SEOUL).strftime("%Y-%m-%d %H:%M:%S"),
+                        "계획가이탈(%)": round(deviation, 2),
+                    }
+                    st.session_state.pop("active_us_forecast", None)
+                    st.rerun()
         st.caption(
-            "🟢는 최소 8회 재생 표본에서 동적 1차 목표가가 손절가보다 "
-            "먼저 도달한 비율이 75% 이상이고 현재 기술조건도 통과한 경우입니다. "
+            "🟢는 최소 8회 신호 중 제시한 진입가가 실제로 체결되고, 그 후 "
+            "손절보다 1차 익절에 먼저 도달한 전체 비율이 75% 이상이며 "
+            "현재 기술조건도 통과한 경우입니다. "
             "주문 직전에는 메리츠 주문창의 현재가·호가를 다시 확인하세요."
         )
 
