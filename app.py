@@ -18,7 +18,7 @@ st.set_page_config(
 )
 
 st.title("📡 한·미 당일 단타 스캐너")
-st.caption("📱 모바일 V8 · 미국 동전주 급등 발견 + 눌림 매수신호")
+st.caption("📱 모바일 V9 · 미국 전종목 동전주 발견 + 눌림 매수신호")
 
 st.markdown(
     """
@@ -280,6 +280,71 @@ def get_us_volume_surge_rows(token, exchange):
             "AUTH": "",
         },
     )
+    return [dict(row, _exchange=exchange) for row in rows]
+
+
+def get_us_penny_search_rows(token, exchange):
+    """한투 공식 해외주식 조건검색으로 $0.01~$10 종목을 찾는다."""
+    response = None
+    params = {
+        "AUTH": "",
+        "EXCD": exchange,
+        "CO_YN_PRICECUR": "1",
+        "CO_ST_PRICECUR": "0.01",
+        "CO_EN_PRICECUR": "10",
+        "CO_YN_RATE": "",
+        "CO_ST_RATE": "",
+        "CO_EN_RATE": "",
+        "CO_YN_VALX": "",
+        "CO_ST_VALX": "",
+        "CO_EN_VALX": "",
+        "CO_YN_SHAR": "",
+        "CO_ST_SHAR": "",
+        "CO_EN_SHAR": "",
+        "CO_YN_VOLUME": "1",
+        "CO_ST_VOLUME": "10000",
+        "CO_EN_VOLUME": "9999999999",
+        "CO_YN_AMT": "",
+        "CO_ST_AMT": "",
+        "CO_EN_AMT": "",
+        "CO_YN_EPS": "",
+        "CO_ST_EPS": "",
+        "CO_EN_EPS": "",
+        "CO_YN_PER": "",
+        "CO_ST_PER": "",
+        "CO_EN_PER": "",
+        "KEYB": "",
+    }
+
+    for attempt in range(3):
+        try:
+            response = requests.get(
+                f"{BASE_URL}/uapi/overseas-price/v1/quotations/inquire-search",
+                headers=make_headers(token, "HHDFS76410000"),
+                params=params,
+                timeout=15,
+            )
+            if response.status_code == 200:
+                break
+            if response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            break
+        except requests.RequestException:
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+
+    if response is None or response.status_code != 200:
+        status = response.status_code if response is not None else "응답 없음"
+        raise RuntimeError(f"한투 동전주 조건검색 HTTP {status}")
+
+    data = response.json()
+    if data.get("rt_cd") != "0":
+        raise RuntimeError(data.get("msg1") or "한투 동전주 조건검색 실패")
+
+    rows = data.get("output2") or data.get("output") or []
+    if isinstance(rows, dict):
+        rows = rows.get("output2") or rows.get("rows") or []
     return [dict(row, _exchange=exchange) for row in rows]
 
 
@@ -655,6 +720,153 @@ def get_yahoo_us_candidates(max_price=0):
     return result
 
 
+NASDAQ_SCREENER_EXCHANGES = {
+    "nasdaq": "NAS",
+    "nyse": "NYS",
+    "amex": "AMS",
+}
+
+
+def fetch_nasdaq_penny_candidates(exchange_name):
+    """Nasdaq 공개 스크리너에서 저가주 후보만 가져온다."""
+    response = requests.get(
+        "https://api.nasdaq.com/api/screener/stocks",
+        params={
+            "tableonly": "true",
+            "limit": "5000",
+            "offset": "0",
+            "exchange": exchange_name,
+            "download": "true",
+        },
+        headers={
+            "user-agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+            ),
+            "accept": "application/json, text/plain, */*",
+            "origin": "https://www.nasdaq.com",
+            "referer": "https://www.nasdaq.com/market-activity/stocks/screener",
+        },
+        timeout=8,
+    )
+    response.raise_for_status()
+    rows = (((response.json().get("data") or {}).get("table") or {}).get("rows") or [])
+    exchange = NASDAQ_SCREENER_EXCHANGES[exchange_name]
+    ranked = []
+    for row in rows:
+        ticker = str(row.get("symbol") or "").strip().upper()
+        price = to_float(str(row.get("lastsale") or "").replace("$", ""))
+        rate = to_float(str(row.get("pctchange") or "").replace("%", ""))
+        volume = to_int(row.get("volume"))
+        name = str(row.get("name") or "").strip()
+        if not re.fullmatch(r"[A-Z]{1,6}", ticker):
+            continue
+        if name and is_excluded_us_product(name, ticker):
+            continue
+        if 0.01 <= price <= 10 and rate >= 0.5 and volume >= 10_000:
+            ranked.append((rate, volume, exchange, ticker))
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [(exchange, ticker) for _, _, exchange, ticker in ranked[:120]]
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_external_penny_candidates():
+    """외부 소스는 종목 발견에만 사용하고 최종 수치는 한투로 다시 검증한다."""
+    pairs = []
+    counts = {}
+    errors = []
+    jobs = [("야후", get_yahoo_us_candidates, 10)] + [
+        (f"나스닥-{name}", fetch_nasdaq_penny_candidates, name)
+        for name in NASDAQ_SCREENER_EXCHANGES
+    ]
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(function, argument): label
+            for label, function, argument in jobs
+        }
+        for future in as_completed(futures):
+            label = futures[future]
+            try:
+                found = future.result()
+                counts[label] = len(found)
+                pairs.extend(found)
+            except Exception as error:
+                counts[label] = 0
+                errors.append(f"{label}: {error}")
+    return unique_us_pairs(pairs), counts, errors
+
+
+def pairs_from_us_rows(rows, exchange_hint=""):
+    pairs = []
+    for row in rows:
+        ticker = str(
+            row.get("symb")
+            or row.get("SYMB")
+            or row.get("ovrs_pdno")
+            or row.get("pdno")
+            or ""
+        ).strip().upper()
+        exchange = str(
+            row.get("_exchange")
+            or row.get("excd")
+            or row.get("EXCD")
+            or exchange_hint
+        ).strip().upper()
+        if re.fullmatch(r"[A-Z]{1,6}", ticker):
+            pairs.append((exchange, ticker))
+    return unique_us_pairs(pairs)
+
+
+def get_kis_penny_candidates(token):
+    """한투 조건검색·가격급등·거래량급증을 합쳐 후보 누락을 줄인다."""
+    all_pairs = []
+    counts = {}
+    errors = []
+
+    def scan_exchange(exchange):
+        found = []
+        local_counts = {}
+        local_errors = []
+        calls = (
+            ("저가주조건", get_us_penny_search_rows),
+            ("가격급등", get_us_price_fluct_rows),
+            ("거래량급증", get_us_volume_surge_rows),
+        )
+        for label, function in calls:
+            try:
+                rows = function(token, exchange)
+                pairs = pairs_from_us_rows(rows, exchange)
+                local_counts[f"한투-{exchange}-{label}"] = len(pairs)
+                found.extend(pairs)
+            except Exception as error:
+                local_counts[f"한투-{exchange}-{label}"] = 0
+                local_errors.append(f"한투-{exchange}-{label}: {error}")
+        return found, local_counts, local_errors
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(scan_exchange, exchange) for exchange in ("NAS", "NYS", "AMS")]
+        for future in as_completed(futures):
+            found, local_counts, local_errors = future.result()
+            all_pairs.extend(found)
+            counts.update(local_counts)
+            errors.extend(local_errors)
+
+    return unique_us_pairs(all_pairs), counts, errors
+
+
+def discover_us_penny_candidates(token, include_external=True):
+    kis_pairs, kis_counts, kis_errors = get_kis_penny_candidates(token)
+    pairs = list(kis_pairs)
+    counts = dict(kis_counts)
+    errors = list(kis_errors)
+    if include_external:
+        external_pairs, external_counts, external_errors = get_external_penny_candidates()
+        pairs.extend(external_pairs)
+        counts.update(external_counts)
+        errors.extend(external_errors)
+    return unique_us_pairs(pairs), counts, errors
+
+
 def build_us_fast_table(rows, candidates, strategy):
     order = {ticker: index + 1 for index, (_, ticker) in enumerate(candidates)}
     records = []
@@ -670,6 +882,8 @@ def build_us_fast_table(rows, candidates, strategy):
         volume = to_int(row.get("tvol"))
         previous_volume = to_int(row.get("pvol"))
         amount = to_float(row.get("tamt"))
+        if amount <= 0 and price > 0 and volume > 0:
+            amount = price * volume
         vwap = amount / volume if amount > 0 and volume > 0 else 0
         vwap_gap = (price / vwap - 1) * 100 if vwap > 0 else 0
         volume_ratio = volume / previous_volume * 100 if previous_volume > 0 else 0
@@ -690,10 +904,10 @@ def build_us_fast_table(rows, candidates, strategy):
         )
         if strategy == "penny":
             passed = (
-                0.05 <= price <= 10
-                and 3 <= rate <= 300
-                and volume >= 100_000
-                and amount >= 50_000
+                0.01 <= price <= 10
+                and rate >= 1
+                and volume >= 20_000
+                and amount >= 10_000
             )
             if rate >= 80 or vwap_gap >= 15:
                 status = "🔴 폭등·추격금지"
@@ -760,7 +974,19 @@ def build_us_fast_table(rows, candidates, strategy):
     table = pd.DataFrame(records)
     if table.empty:
         return table
-    if strategy in ("momentum", "penny"):
+    if strategy == "penny":
+        # 동전주 화면에는 $10 초과 종목이 절대로 섞이지 않게 한다.
+        table = table[
+            (table["현재가($)"] >= 0.01)
+            & (table["현재가($)"] <= 10)
+        ].copy()
+        if table.empty:
+            return table
+        passed = table[table["조건통과"]].copy()
+        if not passed.empty:
+            table = passed
+        return table.sort_values("고속점수", ascending=False).head(30).reset_index(drop=True)
+    if strategy == "momentum":
         passed = table[table["조건통과"]].copy()
         if not passed.empty:
             table = passed
@@ -1564,7 +1790,7 @@ us_session_choice = "자동(현재 장)"
 use_yahoo_candidates = False
 if not is_domestic:
     st.info(
-        "미국 V8은 한투 공식 복수종목 시세로 한 번에 10종목씩 조회합니다. "
+        "미국 V9은 한투 공식 조건검색·급등·거래량급증으로 후보를 찾고 10종목씩 재검증합니다. "
         "가격·거래량·판정은 한투 데이터만 사용합니다."
     )
     us_session_choice = st.selectbox(
@@ -1574,9 +1800,9 @@ if not is_domestic:
     )
     if strategy_code in ("momentum", "penny"):
         use_yahoo_candidates = st.checkbox(
-            "야후 급등종목을 후보목록에만 추가",
+            "외부 급등 후보도 함께 검색(야후·나스닥)",
             value=strategy_code == "penny",
-            help="야후는 후보 발견용입니다. 표시 가격과 최종 판정은 모두 한투 API로 다시 확인합니다.",
+            help="외부 자료는 종목 발견에만 사용합니다. 표시 가격과 최종 판정은 모두 한투 API로 다시 확인합니다.",
         )
 
 if st.button(scan_button_labels[scanner_type], type="primary"):
@@ -1624,34 +1850,45 @@ if st.button(scan_button_labels[scanner_type], type="primary"):
             scan_name = "동전주 급등" if strategy_code == "penny" else "급등주"
             with st.spinner(f"미국 {scan_name} 후보를 발견한 뒤 한투로 재검증하는 중입니다..."):
                 session_mode, session_detail, scan_time = resolve_us_session(us_session_choice)
-                us_candidates = list(US_MOMENTUM_SEED)
-                yahoo_count = 0
-                yahoo_error = ""
-                if use_yahoo_candidates:
-                    try:
-                        yahoo_pairs = get_yahoo_us_candidates(
-                            10 if strategy_code == "penny" else 0
-                        )
-                        yahoo_count = len(yahoo_pairs)
-                        us_candidates = yahoo_pairs + us_candidates
-                    except Exception as error:
-                        yahoo_error = str(error)
-                us_candidates = unique_us_pairs(us_candidates)[:100]
+                source_counts = {}
+                discovery_errors = []
+                if strategy_code == "penny":
+                    discovered, source_counts, discovery_errors = discover_us_penny_candidates(
+                        token, include_external=use_yahoo_candidates
+                    )
+                    us_candidates = discovered + list(US_MOMENTUM_SEED)
+                else:
+                    us_candidates = list(US_MOMENTUM_SEED)
+                    if use_yahoo_candidates:
+                        try:
+                            yahoo_pairs = get_yahoo_us_candidates(0)
+                            source_counts["야후"] = len(yahoo_pairs)
+                            us_candidates = yahoo_pairs + us_candidates
+                        except Exception as error:
+                            discovery_errors.append(f"야후: {error}")
+                us_candidates = unique_us_pairs(us_candidates)[:160]
                 market_rows, price_errors = get_us_multiple_prices(
                     token, us_candidates, session_mode
                 )
                 table = build_us_fast_table(
                     market_rows, us_candidates, strategy=strategy_code
                 )
-                us_source_note = (
-                    f"한투 검증 + 야후 후보 {yahoo_count}종목"
-                    if use_yahoo_candidates and not yahoo_error
-                    else "한투 급등 감시목록"
-                )
+                source_total = len(unique_us_pairs(us_candidates))
+                us_source_note = f"후보 {source_total}개를 한투 현재가로 재검증"
+                price_errors = discovery_errors + price_errors
+                st.session_state["us_source_counts"] = source_counts
 
         if table.empty:
+            if scanner_type == "us_penny":
+                message = (
+                    "$0.01~$10 범위 종목을 찾았지만 현재 세션에서 가격·거래량을 확인하지 못했습니다. "
+                    "미국장 선택을 '프리·정규·애프터'로 바꿔 한 번 더 확인해 주세요."
+                )
+                if price_errors:
+                    message += "\n일부 수집원 오류: " + " / ".join(price_errors[:3])
+                raise RuntimeError(message)
             if price_errors:
-                raise RuntimeError("\n".join(price_errors[:3]))
+                raise RuntimeError("\n".join(price_errors[:5]))
             raise RuntimeError("현재 조건에 맞는 종목을 받지 못했습니다. 미국 장 운영 시간에 다시 확인해 주세요.")
 
         if scanner_type == "us_penny":
@@ -1698,6 +1935,19 @@ if has_current_scan and not is_domestic:
     )
 
     if strategy_code == "penny":
+        source_counts = st.session_state.get("us_source_counts", {})
+        if source_counts:
+            working_sources = sum(1 for count in source_counts.values() if count > 0)
+            found_total = sum(source_counts.values())
+            st.caption(
+                f"후보 수집원 {working_sources}개 작동 · 중복 포함 {found_total}개 발견 · "
+                "화면에는 한투에서 $0.01~$10로 재확인된 종목만 표시"
+            )
+        if "조건통과" in table.columns and not table["조건통과"].any():
+            st.warning(
+                "동전주는 찾았지만 현재 등락률·거래량 조건을 모두 통과한 종목은 없습니다. "
+                "아래 종목은 감시 후보이며 매수 신호가 아닙니다."
+            )
         st.subheader("🎯 급등주 자동 매수타점")
         signal_items = [
             item for item in st.session_state.get("us_penny_signals", [])
