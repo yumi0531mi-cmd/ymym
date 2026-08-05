@@ -1762,6 +1762,71 @@ def build_us_fast_table(rows, candidates, strategy):
     ).head(30).reset_index(drop=True)
 
 
+
+def apply_us_rest_prices(table, rows, strategy):
+    """복수종목 REST 현재가로 기존 후보표의 가격·거래량·호가를 즉시 갱신한다.
+
+    웹소켓은 짧은 대기 시간에 신규 체결이 없으면 아무 값도 주지 않을 수 있으므로,
+    새로고침 시 REST를 기본값으로 적용하고 이후 WS 신규체결이 있으면 다시 덮어쓴다.
+    """
+    if table.empty or not rows:
+        return table
+
+    result = table.copy()
+    now_ts = time.time()
+    now_text = datetime.fromtimestamp(now_ts, SEOUL).strftime("%Y-%m-%d %H:%M:%S")
+    by_ticker = {}
+    for raw in rows:
+        row = dict(raw)
+        ticker = str(row.get("symb") or "").strip().upper()
+        if ticker:
+            by_ticker[ticker] = row
+
+    for index, old in result.iterrows():
+        ticker = str(old.get("종목코드") or "").strip().upper()
+        row = by_ticker.get(ticker)
+        if not row:
+            continue
+
+        price = to_float(row.get("last"))
+        if price <= 0:
+            continue
+        base = to_float(row.get("base"))
+        rate = to_float(row.get("rate"))
+        if rate == 0 and base > 0:
+            rate = (price / base - 1) * 100
+        volume = to_int(row.get("tvol"))
+        amount = to_float(row.get("tamt"))
+        if amount <= 0 and volume > 0:
+            amount = price * volume
+        bid = to_float(row.get("pbid"))
+        ask = to_float(row.get("pask"))
+        strength = max(to_float(row.get("tpow")), to_float(row.get("powx")))
+        vwap = amount / volume if amount > 0 and volume > 0 else 0
+        vwap_gap = (price / vwap - 1) * 100 if vwap > 0 else 0
+        spread = (ask - bid) / price * 100 if ask > 0 and bid > 0 else 0
+
+        updates = {
+            "현재가($)": round(price, 4),
+            "등락률(%)": round(rate, 2),
+            "오늘거래량": volume,
+            "오늘거래대금(백만$)": round(amount / 1_000_000, 2),
+            "VWAP($)": round(vwap, 4),
+            "VWAP위치(%)": round(vwap_gap, 2),
+            "매수호가($)": round(bid, 4),
+            "매도호가($)": round(ask, 4),
+            "스프레드(%)": round(spread, 2),
+            "체결강도": round(strength, 1),
+            "시세시간(KST)": now_text,
+            "시세나이(초)": 0.0,
+            "수신타임스탬프": now_ts,
+            "시세출처": "한투 REST 즉시조회",
+        }
+        for key, value in updates.items():
+            result.at[index, key] = value
+
+    return result
+
 def apply_us_live_snapshots(table, snapshots, strategy):
     """웹소켓으로 새 체결을 받은 종목만 표의 가격·거래량을 교체한다."""
     if table.empty:
@@ -4174,25 +4239,32 @@ if has_current_scan and not is_domestic:
     quick_col, signal_col = st.columns(2)
     if quick_col.button("⚡ 새로고침", use_container_width=True):
         try:
+            token = issue_access_token(APP_KEY, APP_SECRET)
             session_mode, session_detail, scan_time = resolve_us_session(us_session_choice)
-            pairs = list(zip(table["거래소코드"], table["종목코드"]))
-            with st.spinner("한투 미국 실시간 체결을 받는 중..."):
+            pairs = unique_us_pairs(list(zip(table["거래소코드"], table["종목코드"])))
+            with st.spinner("한투 현재가를 즉시 다시 조회하는 중..."):
+                rest_rows, rest_errors = get_us_multiple_prices(token, pairs, session_mode)
+                table = apply_us_rest_prices(table, rest_rows, strategy_code)
+
+                # REST는 매번 현재가를 갱신한다. 웹소켓 신규체결이 잡히면 더 최신 값으로 덮어쓴다.
                 snapshots, live_errors = get_us_live_snapshots(
-                    pairs, session_mode, wait_seconds=0.65, limit=18
+                    pairs, session_mode, wait_seconds=1.15, limit=min(30, len(pairs))
                 )
-            if not snapshots:
+                if snapshots:
+                    table = apply_us_live_snapshots(table, snapshots, strategy_code)
+
+            if not rest_rows and not snapshots:
                 raise RuntimeError(
-                    "1초 동안 새 체결을 받지 못했습니다. "
-                    "현재 장 선택과 거래 시간을 확인해 주세요."
+                    "한국투자증권에서 현재가를 받지 못했습니다. "
+                    "장 선택·거래시간 또는 API 호출 제한을 확인해 주세요."
                 )
-            table = apply_us_live_snapshots(table, snapshots, strategy_code)
             st.session_state["scan_table"] = table
             st.session_state["us_live_count"] = len(snapshots)
             st.session_state["us_scan_meta"] = {
                 **us_meta,
                 "session": session_detail,
                 "time": scan_time,
-                "errors": live_errors,
+                "errors": list(rest_errors) + list(live_errors),
             }
             active_position = st.session_state.get("active_us_position")
             if active_position:
@@ -4228,7 +4300,7 @@ if has_current_scan and not is_domestic:
                     limit=3,
                     pages=1,
                 )
-            st.toast(f"실시간 체결 {len(snapshots)}종목 갱신 완료")
+            st.toast(f"현재가 {len(rest_rows)}종목 · 실체결 {len(snapshots)}종목 갱신 완료")
             st.rerun()
         except Exception as error:
             st.warning(str(error))
