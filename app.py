@@ -2834,7 +2834,16 @@ def analyze_us_penny_stock(minute, quote_row):
     strength_ok = strength == 0 or strength >= 105
     volume_live = volume_speed >= 0.8 or day_amount_million >= 3.0
     aggressive_setup = fresh_ok and execution_ok and momentum_ok and location_ok and strength_ok and volume_live
-    premium_setup = aggressive_setup and trend_3 and volume_speed >= 1.1 and spread_pct <= maximum_spread
+    # 추격 진입 방지: 첫 눌림이 실제로 발생한 뒤 EMA9/VWAP을 다시 회복한 경우에만 녹색 진입.
+    first_pullback_ready = (
+        aggressive_setup
+        and reclaim
+        and -7.0 <= pullback_pct <= -0.4
+        and trend_3
+        and volume_speed >= 1.0
+        and spread_pct <= maximum_spread
+    )
+    premium_setup = first_pullback_ready
 
     # +150% 이상·VWAP 과도 이격·극단적인 호가 공백만 강제 회피한다.
     hard_overheat = change_pct >= 150 or vwap_gap > 15 or rsi_1 >= 92 or spread_pct > maximum_spread * 2.2
@@ -2846,11 +2855,11 @@ def analyze_us_penny_stock(minute, quote_row):
     if hard_overheat:
         verdict = "🔴 과열·급락위험"
     elif premium_setup and signal_confirmed:
-        verdict = "🟢 5분 스캘프 진입"
+        verdict = "🟢 첫 눌림 재상승 진입"
     elif premium_setup:
-        verdict = "🟢 공격형 진입 가능"
+        verdict = "🟢 첫 눌림 진입 가능"
     elif aggressive_setup:
-        verdict = "🟡 눌림 진입대기"
+        verdict = "🟡 첫 눌림 대기"
     elif fresh_ok and execution_ok and (trend_1 or bullish_macd):
         verdict = "🟡 돌파 확인대기"
     else:
@@ -2884,6 +2893,7 @@ def analyze_us_penny_stock(minute, quote_row):
         "vwap_gap": vwap_gap,
         "pullback_pct": pullback_pct,
         "pullback_reclaim": reclaim,
+        "first_pullback_ready": first_pullback_ready,
         "triple_intersection": triple_ok,
         "validation_entry_hits": validation["entry_hits"],
         "validation_entry_rate": validation["entry_hit_rate"],
@@ -3485,9 +3495,9 @@ def analyze_us_penny_candidates(token, table, session_mode, limit=12, pages=3):
                 results.append({"row": {}, "analysis": None, "error": str(error)})
 
     verdict_order = {
-        "🟢 5분 스캘프 진입": 0,
-        "🟢 공격형 진입 가능": 1,
-        "🟡 눌림 진입대기": 2,
+        "🟢 첫 눌림 재상승 진입": 0,
+        "🟢 첫 눌림 진입 가능": 1,
+        "🟡 첫 눌림 대기": 2,
         "🟡 돌파 확인대기": 3,
         "⚪ 조건 미달": 4,
         "🔴 과열·급락위험": 5,
@@ -3596,7 +3606,7 @@ def render_us_reference_card(item):
           <div class="metric"><span>1차 필터</span><b>{filter_score}/100</b></div>
           <div class="metric"><span>분봉 재생률</span><b>{replay:.1f}%</b></div>
         </div>
-        <div class="trade-title">5분 스캘프 레벨 · 녹색 진입 우선</div>
+        <div class="trade-title">첫 눌림 재상승 전용 · 녹색일 때만 진입 검토</div>
         <div class="trade-grid">
           <div class="trade-box"><span>진입가</span><b class="entry">{usd(entry)}</b></div>
           <div class="trade-box"><span>5분 1차 익절</span><b class="target">{usd(target1)}</b></div>
@@ -3616,11 +3626,11 @@ def render_us_entry_lock_controls(item, scanner_type):
     analysis = item.get("analysis")
     if not analysis or not str(analysis.get("verdict", "")).startswith("🟢"):
         return
-    if not analysis.get("validation_ok"):
+    if not analysis.get("first_pullback_ready"):
         return
     received_at = float(row.get("수신타임스탬프", 0) or 0)
     quote_age = max(0.0, time.time() - received_at) if received_at > 0 else 999.0
-    if quote_age > 3:
+    if quote_age > 8:
         return
 
     ticker = str(row.get("종목코드", ""))
@@ -4137,12 +4147,16 @@ if has_current_scan and not is_domestic:
             entered_at = datetime.strptime(
                 str(active_position["진입시각"]), "%Y-%m-%d %H:%M:%S"
             ).replace(tzinfo=SEOUL)
-            holding_minutes = max(
+            holding_seconds = max(
                 0,
-                int((datetime.now(SEOUL) - entered_at).total_seconds() // 60),
+                int((datetime.now(SEOUL) - entered_at).total_seconds()),
             )
+            holding_minutes = holding_seconds // 60
+            remaining_seconds = max(0, 300 - holding_seconds)
         except Exception:
+            holding_seconds = 0
             holding_minutes = 0
+            remaining_seconds = 300
 
         if not current_quote_fresh:
             position_status = "⚪ 시세 만료·즉시 갱신"
@@ -4175,13 +4189,38 @@ if has_current_scan and not is_domestic:
         flow_5 = flow_horizons.get("5분 후", {}).get("label", "⚪ 재분석 필요")
         flow_10 = flow_horizons.get("10분 후", {}).get("label", "⚪ 재분석 필요")
 
-        st.subheader("🔒 내 보유 포지션 · 매매계획 고정")
+        # 진입 후 5분 의사결정: 가격·시간·실시간 흐름을 함께 사용한다.
+        if not current_quote_fresh:
+            action_text = "⚪ 즉시 새로고침"
+            action_color = "#c6cedb"
+        elif current_price <= execution_stop:
+            action_text = "🔴 전량매도"
+            action_color = "#ff7b81"
+        elif current_price >= locked_target1:
+            action_text = "🟢 1차 익절·나머지 손절 본전"
+            action_color = "#61df88"
+        elif holding_seconds >= 300 and current_price < locked_entry:
+            action_text = "🔴 5분 시간손절"
+            action_color = "#ff7b81"
+        elif flow_score < 42 and current_price < locked_entry:
+            action_text = "🔴 약세·전량매도 검토"
+            action_color = "#ff7b81"
+        elif flow_score < 55 or str(flow_1).startswith("🔴"):
+            action_text = "🟡 절반매도·손절 축소"
+            action_color = "#ffd45d"
+        else:
+            action_text = "🟢 계속보유"
+            action_color = "#61df88"
+        countdown_text = f"{remaining_seconds // 60:02d}:{remaining_seconds % 60:02d}"
+
+        st.subheader("🔒 내 보유 포지션 · 5분 실시간 관리")
         position_name = html.escape(str(active_position["종목명"]))
         render_compact_html(
             f'''<div class="stock-card" style="border-color:{position_color}">
             <div class="card-head"><div><div class="stock-name">{position_name}</div>
             <div class="ticker">{html.escape(active_ticker)} · 진입 {locked_entry:.4f}달러</div></div>
-            <div style="color:{position_color};font-weight:900">{position_status}</div></div>
+            <div style="text-align:right"><div style="color:{action_color};font-weight:950;font-size:1.05rem">{action_text}</div>
+            <div style="color:{position_color};font-weight:800;font-size:.76rem">{position_status}</div></div></div>
             <div class="grid2" style="margin-top:10px">
               <div class="data-row"><span class="data-label">현재가만 갱신</span><span class="data-value">${current_price:.4f}</span></div>
               <div class="data-row"><span class="data-label">현재 시세 나이</span><span class="data-value">{current_quote_age:.2f}초</span></div>
@@ -4191,7 +4230,8 @@ if has_current_scan and not is_domestic:
               <div class="data-row"><span class="data-label">고정 5분 1차 익절</span><span class="data-value ok">${locked_target1:.4f}</span></div>
               <div class="data-row"><span class="data-label">고정 연장 2차 익절</span><span class="data-value ok">${locked_target2:.4f}</span></div>
               <div class="data-row"><span class="data-label">진입 시각</span><span class="data-value">{html.escape(str(active_position['진입시각']))}</span></div>
-              <div class="data-row"><span class="data-label">보유 시간</span><span class="data-value">{holding_minutes}분</span></div>
+              <div class="data-row"><span class="data-label">5분 남은시간</span><span class="data-value" style="color:{action_color}">{countdown_text}</span></div>
+              <div class="data-row"><span class="data-label">보유 시간</span><span class="data-value">{holding_minutes}분 {holding_seconds % 60}초</span></div>
               <div class="data-row"><span class="data-label">현재 차트흐름</span><span class="data-value">{html.escape(str(flow_state))}</span></div>
               <div class="data-row"><span class="data-label">상승흐름 점수</span><span class="data-value">{flow_score}/100</span></div>
               <div class="data-row"><span class="data-label">회복/목표 예상</span><span class="data-value">{html.escape(str(flow_recovery))}</span></div>
@@ -4201,7 +4241,7 @@ if has_current_scan and not is_domestic:
               <div class="data-row"><span class="data-label">10분 후 방향</span><span class="data-value">{html.escape(str(flow_10))}</span></div>
             </div></div>'''
         )
-        st.caption("스캐너를 다시 검색해도 이 진입가·손절가·1·연장 2차 익절는 바뀌지 않습니다.")
+        st.caption("진입 후에는 현재가와 흐름을 갱신해 계속보유·절반매도·전량매도를 판단합니다. 자동주문은 하지 않습니다.")
         flow_col, close_col = st.columns(2)
         if flow_col.button("📈 보유 종목 흐름 재분석", use_container_width=True):
             try:
@@ -4297,7 +4337,7 @@ if has_current_scan and not is_domestic:
                     issue_access_token(APP_KEY, APP_SECRET),
                     table,
                     session_mode,
-                    limit=3,
+                    limit=12,
                     pages=1,
                 )
             st.toast(f"현재가 {len(rest_rows)}종목 · 실체결 {len(snapshots)}종목 갱신 완료")
@@ -4312,7 +4352,7 @@ if has_current_scan and not is_domestic:
         try:
             token = issue_access_token(APP_KEY, APP_SECRET)
             session_mode, _, _ = resolve_us_session(us_session_choice)
-            with st.spinner("상위 12종목의 1·3·5분 모멘텀과 5분 스캘프 가격을 계산하는 중..."):
+            with st.spinner("상위 12종목의 첫 눌림·재상승과 5분 보유계획을 계산하는 중..."):
                 st.session_state["us_penny_signals"] = analyze_us_penny_candidates(
                     token, table, session_mode, limit=12, pages=3
                 )
