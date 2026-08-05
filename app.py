@@ -30,7 +30,7 @@ st.set_page_config(
 
 st.markdown(
     '<div class="app-title">📡 단타 스캐너</div>'
-    '<div class="app-sub">V13 · 실시간 카드</div>',
+    '<div class="app-sub">V14 · 우량주·급등주·런업 분리</div>',
     unsafe_allow_html=True,
 )
 
@@ -1052,6 +1052,34 @@ US_MOMENTUM_SEED = [
     ("NYS", "MP"), ("NYS", "OKLO"), ("NYS", "NU"),
     ("NYS", "SE"), ("NYS", "NET"), ("NYS", "HIMS"),
 ]
+
+# 런업 감시목록: 실제 FDA·임상·실적·계약 일정은 사용자가 별도로 확인해야 합니다.
+# st.secrets["RUNUP_WATCHLIST"]에 JSON 배열을 넣으면 이 기본목록을 덮어씁니다.
+DEFAULT_US_RUNUP_UNIVERSE = [
+    ("NAS", "ALLO"), ("NAS", "OTLK"), ("NAS", "HCWB"),
+    ("NAS", "SAVA"), ("NAS", "CRSP"), ("NAS", "NTLA"),
+    ("NAS", "BEAM"), ("NAS", "EDIT"), ("NAS", "RXRX"),
+    ("NAS", "VERV"), ("NAS", "IOVA"), ("NAS", "VKTX"),
+    ("NYS", "HIMS"), ("NYS", "NVO"), ("NYS", "LLY"),
+]
+
+def load_runup_universe():
+    raw = load_secret("RUNUP_WATCHLIST")
+    if not raw:
+        return unique_us_pairs(DEFAULT_US_RUNUP_UNIVERSE)
+    try:
+        data = json.loads(raw)
+        pairs = []
+        for item in data:
+            if isinstance(item, dict):
+                pairs.append((item.get("exchange", "NAS"), item.get("ticker", "")))
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                pairs.append((item[0], item[1]))
+            elif isinstance(item, str):
+                pairs.append(("NAS", item))
+        return unique_us_pairs(pairs) or unique_us_pairs(DEFAULT_US_RUNUP_UNIVERSE)
+    except Exception:
+        return unique_us_pairs(DEFAULT_US_RUNUP_UNIVERSE)
 
 US_DAY_EXCHANGE = {"NAS": "BAQ", "NYS": "BAY", "AMS": "BAA"}
 US_NORMAL_EXCHANGE = {value: key for key, value in US_DAY_EXCHANGE.items()}
@@ -2891,72 +2919,38 @@ def analyze_us_penny_stock(minute, quote_row, strategy="momentum"):
         premium_setup = quality_entry
         aggressive_setup = quality_wait
     else:
-        # 급등주는 첫 눌림 후 직전 1분봉 고가 재돌파를 실제 진입 트리거로 사용한다.
-        execution_ok = liquidity_ok and 0 < spread_pct <= maximum_spread * 1.60
-        strength_ok = strength == 0 or strength >= 100
-        volume_live = volume_speed >= 0.65 or day_amount_million >= 2.0
-        location_ok = -2.0 <= vwap_gap <= 8.0 and -12.0 <= pullback_pct <= 1.0
-
-        prev_high = float(one["고가"].iloc[-2]) if len(one) >= 2 else price
-        prev_close = float(one["종가"].iloc[-2]) if len(one) >= 2 else price
-        last_close = float(one["종가"].iloc[-1]) if len(one) else price
-        last_volume = float(one["거래량"].iloc[-1]) if len(one) else 0.0
-        prev_volume = float(one["거래량"].iloc[-2]) if len(one) >= 2 else 0.0
-        trigger_price = max(prev_high, safe_last(one["EMA9"]), vwap)
-
-        # 첫 눌림은 최근 고점 대비 -1%~-12% 또는 EMA9/VWAP 접촉으로 인정한다.
-        pullback_seen = (
-            (-12.0 <= pullback_pct <= -1.0)
-            or touched_ema
-            or touched_vwap
+        # 급등주는 첫 눌림 뒤 EMA9/VWAP 재돌파와 거래량 재유입을 확인한다.
+        execution_ok = liquidity_ok and 0 < spread_pct <= maximum_spread * 1.35
+        momentum_ok = trend_1 and (bullish_macd or macd_improving(one)) and close_rising
+        location_ok = -1.0 <= vwap_gap <= 6.0 and -9.0 <= pullback_pct <= 0.5
+        strength_ok = strength == 0 or strength >= 105
+        volume_live = volume_speed >= 0.8 or day_amount_million >= 3.0
+        aggressive_setup = fresh_ok and execution_ok and momentum_ok and location_ok and strength_ok and volume_live
+        first_pullback_ready = (
+            aggressive_setup
+            and reclaim
+            and -7.0 <= pullback_pct <= -0.4
+            and trend_3
+            and volume_speed >= 1.0
+            and spread_pct <= maximum_spread
         )
-        breakout_now = (
-            price >= trigger_price * 0.999
-            and last_close >= prev_high * 0.999
-            and last_close >= prev_close
-        )
-        volume_reentry = (
-            last_volume >= prev_volume * 0.85
-            or volume_speed >= 0.75
-            or strength >= 115
-        )
-        momentum_ok = trend_1 and close_rising and (macd_improving(one) or bullish_macd or trend_3)
-
-        aggressive_setup = (
-            fresh_ok and execution_ok and strength_ok and volume_live and location_ok
-            and pullback_seen and (trend_1 or price >= safe_last(one["EMA9"]) * 0.997)
-        )
-        premium_setup = (
-            aggressive_setup and breakout_now and volume_reentry and momentum_ok
-            and spread_pct <= maximum_spread * 1.20
-        )
-
-        # 상승률만 높다는 이유로 무조건 회피하지 않는다. 실제 급락·호가위험일 때만 빨간색이다.
-        hard_overheat = (
-            vwap_gap > 18
-            or rsi_1 >= 94
-            or spread_pct > maximum_spread * 2.5
-            or (pullback_pct < -15 and not trend_1)
-        )
+        premium_setup = first_pullback_ready
+        hard_overheat = change_pct >= 150 or vwap_gap > 15 or rsi_1 >= 92 or spread_pct > maximum_spread * 2.2
         signal_confirmed, confirmation_hits = confirm_us_signal(
             quote_row.get("종목코드", ""), premium_setup, planned_entry
         )
         if hard_overheat:
-            verdict = "🔴 급락·호가위험"
+            verdict = "🔴 과열·급락위험"
         elif premium_setup and signal_confirmed:
-            verdict = "🟢 지금 진입·재돌파 확인"
+            verdict = "🟢 재돌파 확인·지금 진입"
         elif premium_setup:
-            verdict = "🟢 진입 준비·1회 더 확인"
-        elif aggressive_setup and price < trigger_price:
-            verdict = f"🟡 눌림완료·{trigger_price:.4f} 돌파대기"
+            verdict = "🟢 재돌파 진입 가능"
         elif aggressive_setup:
-            verdict = "🟡 재돌파 거래량 확인대기"
-        elif fresh_ok and execution_ok and pullback_seen:
-            verdict = f"🟡 {trigger_price:.4f} 재돌파 감시"
-        elif fresh_ok and execution_ok:
-            verdict = "🟡 첫 눌림 기다리는 중"
+            verdict = "🟡 눌림대기·재돌파 감시"
+        elif fresh_ok and execution_ok and (trend_1 or bullish_macd):
+            verdict = "🟡 재돌파 확인대기"
         else:
-            verdict = "⚪ 유동성·호가 조건 미달"
+            verdict = "⚪ 조건 미달"
 
     # 매수는 마지막 체결가가 아닌 실제 매도 1호가를 기준으로 계획한다.
     entry = planned_entry
@@ -3588,8 +3582,6 @@ def analyze_us_penny_candidates(token, table, session_mode, limit=12, pages=3, s
                 results.append({"row": {}, "analysis": None, "error": str(error)})
 
     verdict_order = {
-        "🟢 지금 진입·재돌파 확인": 0,
-        "🟢 진입 준비·1회 더 확인": 1,
         "🟢 재돌파 확인·지금 진입": 0,
         "🟢 재돌파 진입 가능": 1,
         "🟢 우량주 눌림 진입": 0,
@@ -3757,7 +3749,7 @@ def refresh_one_us_signal_item(item, session_choice, scanner_type, deep_check=Fa
     if deep_check:
         minute = get_us_recent_minutes(token, exchange, ticker, session_mode, pages=1)
         if len(minute) >= 35:
-            analysis = analyze_us_penny_stock(minute, row, strategy="quality" if scanner_type == "quality" else "momentum")
+            analysis = analyze_us_penny_stock(minute, row, strategy="quality" if scanner_type in ("quality", "runup") else "momentum")
             error = ""
         else:
             error = f"분봉 {len(minute)}개(최소 35개 필요)"
@@ -4086,7 +4078,7 @@ market_label = st.sidebar.radio(
 market_code = "kr" if market_label.startswith("🇰🇷") else "us"
 strategy_options = ["🏦 우량주 단타", "🔥 급등주 단타"]
 if market_code == "us":
-    strategy_options.append("🪙 동전주 급등")
+    strategy_options.extend(["🚀 런업 후보", "🪙 동전주 급등"])
 strategy_label = st.sidebar.radio(
     "검색 방식",
     strategy_options,
@@ -4096,6 +4088,8 @@ strategy_label = st.sidebar.radio(
 
 if strategy_label.startswith("🏦"):
     strategy_code = "quality"
+elif strategy_label.startswith("🚀"):
+    strategy_code = "runup"
 elif strategy_label.startswith("🪙"):
     strategy_code = "penny"
 else:
@@ -4108,6 +4102,7 @@ scan_button_labels = {
     "kr_momentum": "국내 급등주 삼중순위 교집합 검사",
     "us_quality": "미국 우량주 10종목씩 고속 검사",
     "us_momentum": "미국 급등주 조기포착 합집합 검색",
+    "us_runup": "미국 런업 감시목록 추세 검사",
     "us_penny": "미국 동전주 삼중순위 교집합 검색",
 }
 
@@ -4120,6 +4115,9 @@ if not is_domestic:
     )
     if strategy_code in ("momentum", "penny"):
         st.sidebar.caption("순위 → 거래량 → VWAP → 재돌파")
+    elif strategy_code == "runup":
+        st.sidebar.caption("일정 후보목록 → 추세 → 눌림 → 재상승")
+        st.sidebar.warning("런업 일정은 자동 확정이 아닙니다. FDA·임상·실적 날짜는 반드시 공식 공시로 재확인하세요.")
 elif strategy_code == "momentum":
     st.sidebar.caption("상승률·거래량·급증·체결강도 합집합")
 
@@ -4171,6 +4169,26 @@ if st.sidebar.button(scan_button_labels[scanner_type], type="primary"):
                 )
                 us_source_note = "한투 공식 우량주 후보목록"
 
+        elif scanner_type == "us_runup":
+            with st.spinner("미국 런업 감시목록의 현재 추세를 검사하는 중입니다..."):
+                session_mode, session_detail, scan_time = resolve_us_session(us_session_choice)
+                us_candidates = load_runup_universe()
+                market_rows, price_errors = get_us_multiple_prices(
+                    token, us_candidates, session_mode
+                )
+                table = build_us_fast_table(
+                    market_rows, us_candidates, strategy="quality"
+                )
+                if not table.empty:
+                    table["현재판정"] = table["현재판정"].replace({
+                        "🟢 미국 기술지표 예정": "🚀 런업 추세검사 예정",
+                        "🟡 유동성 관찰": "🟡 런업 관찰",
+                        "🔴 추격주의": "🔴 런업 추격주의",
+                        "⚪ 약세·대기": "⚪ 런업 약세·대기",
+                    })
+                    table["시세출처"] = "한투 현재가·사용자 런업 감시목록"
+                us_source_note = f"런업 감시목록 {len(us_candidates)}개 · 일정은 공식공시 재확인 필요"
+
         else:
             scan_name = "동전주 급등" if strategy_code == "penny" else "급등주"
             with st.spinner(f"미국 {scan_name} 상승률·거래량·거래량급증·체결강도 순위를 동시에 받는 중입니다..."):
@@ -4207,7 +4225,7 @@ if st.sidebar.button(scan_button_labels[scanner_type], type="primary"):
                 wait_seconds=(0.85 if strategy_code in ("penny", "momentum") else 1.0),
                 limit=18,
             )
-            table = apply_us_live_snapshots(table, live_snapshots, strategy_code)
+            table = apply_us_live_snapshots(table, live_snapshots, "quality" if strategy_code == "runup" else strategy_code)
             price_errors.extend(live_errors)
             st.session_state["us_live_count"] = len(live_snapshots)
 
@@ -4226,7 +4244,7 @@ if st.sidebar.button(scan_button_labels[scanner_type], type="primary"):
 
         # 조기포착 점수가 높은 상위 종목의 분봉을 재생해 눌림·재돌파와 레벨을 계산한다.
         st.session_state.pop("us_penny_signals", None)
-        if not is_domestic and strategy_code in ("penny", "momentum"):
+        if not is_domestic and strategy_code in ("penny", "momentum", "runup"):
             with st.spinner("상위 3종목의 차트·적중률을 동시 검증하는 중..."):
                 st.session_state[f"us_signal_items_{scanner_type}"] = analyze_us_penny_candidates(
                     token,
@@ -4246,7 +4264,7 @@ if st.sidebar.button(scan_button_labels[scanner_type], type="primary"):
             }
         st.session_state.pop("last_analysis", None)
         market_text = "국내" if is_domestic else "미국"
-        kind_text = "우량주" if strategy_code == "quality" else "동전주" if strategy_code == "penny" else "급등주"
+        kind_text = "우량주" if strategy_code == "quality" else "런업" if strategy_code == "runup" else "동전주" if strategy_code == "penny" else "급등주"
         st.toast(f"{market_text} {kind_text} {len(table)}종목 갱신 완료")
     except Exception as error:
         st.error("종목 검사에 실패했습니다.")
@@ -4274,7 +4292,7 @@ if has_current_scan and not is_domestic:
 
         table["시세나이(초)"] = table["수신타임스탬프"].apply(_safe_quote_age)
     us_meta = st.session_state.get("us_scan_meta", {})
-    us_kind = "우량주" if strategy_code == "quality" else "동전주 급등" if strategy_code == "penny" else "급등주"
+    us_kind = "우량주" if strategy_code == "quality" else "런업 후보" if strategy_code == "runup" else "동전주 급등" if strategy_code == "penny" else "급등주"
     if not MOBILE_SIMPLE_UI:
         st.success(f"미국 {us_kind} 후보 {len(table)}종목을 받았습니다.")
         st.caption(
@@ -4462,7 +4480,7 @@ if has_current_scan and not is_domestic:
             pairs = unique_us_pairs(list(zip(table["거래소코드"], table["종목코드"])))
             with st.spinner("한투 현재가를 즉시 다시 조회하는 중..."):
                 rest_rows, rest_errors = get_us_multiple_prices(token, pairs, session_mode)
-                table = apply_us_rest_prices(table, rest_rows, strategy_code)
+                table = apply_us_rest_prices(table, rest_rows, "quality" if strategy_code == "runup" else strategy_code)
 
                 # REST는 매번 현재가를 갱신한다. 웹소켓 신규체결이 잡히면 더 최신 값으로 덮어쓴다.
                 snapshots, live_errors = get_us_live_snapshots(
@@ -4515,7 +4533,7 @@ if has_current_scan and not is_domestic:
         except Exception as error:
             st.warning(str(error))
 
-    if strategy_code in ("penny", "momentum") and signal_col.button(
+    if strategy_code in ("penny", "momentum", "runup") and signal_col.button(
         "🎯 차트검사",
         use_container_width=True,
     ):
@@ -4583,7 +4601,7 @@ if has_current_scan and not is_domestic:
                         "터미널에서 pip install -U streamlit 후 다시 실행하세요."
                     )
 
-    if not MOBILE_SIMPLE_UI and strategy_code in ("penny", "momentum"):
+    if not MOBILE_SIMPLE_UI and strategy_code in ("penny", "momentum", "runup"):
         st.subheader("⚡ 삼중순위 교집합 후보")
         direct = table.copy()
         if "삼중교집합" in direct.columns:
@@ -4629,7 +4647,7 @@ if has_current_scan and not is_domestic:
             "아직 매수신호가 아니며, 바로 아래 눌림 재돌파 카드가 녹색일 때만 검토합니다."
         )
 
-    if not MOBILE_SIMPLE_UI and strategy_code in ("penny", "momentum"):
+    if not MOBILE_SIMPLE_UI and strategy_code in ("penny", "momentum", "runup"):
         source_counts = st.session_state.get("us_source_counts", {})
         if source_counts:
             working_sources = sum(1 for count in source_counts.values() if count > 0)
@@ -4808,7 +4826,7 @@ if has_current_scan and not is_domestic:
         )
         if us_meta.get("errors"):
             st.caption("일부 묶음은 재시도 후 제외됐습니다. 표시된 종목은 정상 응답입니다.")
-        if strategy_code not in ("penny", "momentum"):
+        if strategy_code not in ("penny", "momentum", "runup"):
             st.warning("이 표는 후보 압축용이며 매수 신호가 아닙니다. RSI·MACD는 선택 종목 정밀검사에서 확인하세요.")
 
 
