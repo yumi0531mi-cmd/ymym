@@ -9,13 +9,13 @@ import streamlit as st
 
 
 st.set_page_config(
-    page_title="국내 우량주 단타 스캐너",
+    page_title="국내 단타 스캐너",
     page_icon="📡",
     layout="wide",
 )
 
-st.title("📡 국내 우량주 당일 단타 스캐너")
-st.caption("통합시장 현재가로 1차 선별한 뒤, 선택 종목의 RSI·MACD·VWAP·1·3·5·15분 추세를 검사합니다.")
+st.title("📡 국내 당일 단타 스캐너")
+st.caption("📱 모바일 V3 · 우량주/급등주 통합 버전")
 
 st.markdown(
     """
@@ -164,6 +164,46 @@ def get_market_cap_ranking(token, market_code):
     return data.get("output", [])
 
 
+def get_volume_rank(token, sort_code):
+    """sort_code: 1=거래증가율, 3=거래금액순"""
+    response = None
+    for attempt in range(3):
+        response = requests.get(
+            f"{BASE_URL}/uapi/domestic-stock/v1/quotations/volume-rank",
+            headers=make_headers(token, "FHPST01710000"),
+            params={
+                "FID_COND_MRKT_DIV_CODE": "UN",
+                "FID_COND_SCR_DIV_CODE": "20171",
+                "FID_INPUT_ISCD": "0000",
+                "FID_DIV_CLS_CODE": "0",
+                "FID_BLNG_CLS_CODE": str(sort_code),
+                # 한투 공식 실행 예제에서 사용하는 값을 그대로 적용합니다.
+                "FID_TRGT_CLS_CODE": "111111111",
+                "FID_TRGT_EXLS_CLS_CODE": "000000",
+                "FID_INPUT_PRICE_1": "1000",
+                "FID_INPUT_PRICE_2": "200000",
+                "FID_VOL_CNT": "100000",
+                "FID_INPUT_DATE_1": "",
+            },
+            timeout=20,
+        )
+        if response.status_code == 200:
+            break
+        if response.status_code >= 500 and attempt < 2:
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        break
+
+    if response is None or response.status_code != 200:
+        status = response.status_code if response is not None else "응답 없음"
+        raise RuntimeError(f"거래량 순위 조회 실패: HTTP {status}")
+
+    data = response.json()
+    if data.get("rt_cd") != "0":
+        raise RuntimeError(data.get("msg1", "거래량 순위를 받지 못했습니다."))
+    return data.get("output", [])
+
+
 def is_excluded_product(name):
     excluded_words = (
         "KODEX", "TIGER", "RISE", "ACE", "SOL ", "HANARO", "KOSEF",
@@ -199,6 +239,54 @@ def build_universe(kospi_rows, kosdaq_rows):
                 "시가총액(조원)": round((price * shares) / 1_000_000_000_000, 2),
             })
     return pd.DataFrame(records)
+
+
+def build_momentum_universe(rank_rows):
+    records = {}
+    for row in rank_rows:
+        ticker = str(row.get("mksc_shrn_iscd", "")).strip()
+        name = str(row.get("hts_kor_isnm", "")).strip()
+        if not ticker or not name or is_excluded_product(name):
+            continue
+
+        price = to_int(row.get("stck_prpr"))
+        volume = to_int(row.get("acml_vol"))
+        shares = to_int(row.get("lstn_stcn"))
+        trading_value = to_int(row.get("acml_tr_pbmn"))
+        if price < 1000 or price > 200000 or volume < 100000 or shares <= 0:
+            continue
+
+        item = {
+            "시장": "국내",
+            "시총순위": 0,
+            "급등순위": to_int(row.get("data_rank")),
+            "종목코드": ticker,
+            "종목명": name,
+            "KRX기준가": price,
+            "KRX등락률(%)": round(to_float(row.get("prdy_ctrt")), 2),
+            "KRX누적거래량": volume,
+            "1차거래대금근사": trading_value or price * volume,
+            "시가총액(조원)": round((price * shares) / 1_000_000_000_000, 2),
+            "거래량증가율(%)": round(to_float(row.get("vol_inrt")), 1),
+            "거래량회전율(%)": round(to_float(row.get("vol_tnrt")), 2),
+            "평균거래량": to_int(row.get("avrg_vol")),
+        }
+
+        previous = records.get(ticker)
+        if previous is None:
+            records[ticker] = item
+        else:
+            previous["거래량증가율(%)"] = max(
+                previous["거래량증가율(%)"], item["거래량증가율(%)"]
+            )
+            previous["거래량회전율(%)"] = max(
+                previous["거래량회전율(%)"], item["거래량회전율(%)"]
+            )
+            previous["1차거래대금근사"] = max(
+                previous["1차거래대금근사"], item["1차거래대금근사"]
+            )
+
+    return pd.DataFrame(records.values())
 
 
 def get_integrated_price(token, ticker):
@@ -489,6 +577,7 @@ def render_compact_card(saved):
     stock_name = html.escape(str(quote["종목명"]))
     ticker = html.escape(str(quote["종목코드"]))
     market = html.escape(str(quote["시장"]))
+    scan_name = "급등주" if saved.get("scan_type") == "momentum" else "우량주"
     change_pct = float(quote["등락률(%)"])
     change_class = "change-up" if change_pct >= 0 else "change-down"
 
@@ -515,6 +604,8 @@ def render_compact_card(saved):
         warnings.append("최근 거래량 속도 둔화")
     if not analysis["trend_15"]:
         warnings.append("15분 상승 추세 미확인")
+    if float(quote.get("거래량회전율(%)", 0)) >= 20:
+        warnings.append("거래량 회전율 과열")
     warning_text = " · ".join(warnings) if warnings else "핵심 경고 없음 — 호가와 체결 상태를 마지막으로 확인하세요."
 
     timeframe_cards = []
@@ -540,13 +631,24 @@ def render_compact_card(saved):
     macd_text = "상승" if analysis["bullish_macd"] else "약화"
     macd_class = "ok" if analysis["bullish_macd"] else "bad"
     updated_at = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%m/%d %H:%M")
+    extra_left = ""
+    extra_right = ""
+    if saved.get("scan_type") == "momentum":
+        extra_left = (
+            '<div class="data-row"><span class="data-label">거래량 증가율</span>'
+            f'<span class="data-value">{float(quote.get("거래량증가율(%)", 0)):,.1f}%</span></div>'
+        )
+        extra_right = (
+            '<div class="data-row"><span class="data-label">거래량 회전율</span>'
+            f'<span class="data-value">{float(quote.get("거래량회전율(%)", 0)):,.2f}%</span></div>'
+        )
 
     card_html = f"""
     <div class="stock-card">
       <div class="card-head">
         <div>
           <div class="stock-name">{stock_name}</div>
-          <div class="ticker">{market} · {ticker} · 통합(UN)</div>
+          <div class="ticker">{scan_name} · {market} · {ticker} · 통합(UN)</div>
         </div>
         <div>
           <div class="price">{int(quote['현재가']):,}원</div>
@@ -563,6 +665,7 @@ def render_compact_card(saved):
           <div class="data-row"><span class="data-label">RSI 1/3/5분</span><span class="data-value">{analysis['rsi_1']:.0f}/{analysis['rsi_3']:.0f}/{analysis['rsi_5']:.0f}</span></div>
           <div class="data-row"><span class="data-label">오늘 거래량</span><span class="data-value">{int(quote['오늘누적거래량']):,}주</span></div>
           <div class="data-row"><span class="data-label">전일 대비 거래량</span><span class="data-value">{float(quote['전일대비거래량(%)']):,.1f}%</span></div>
+          {extra_left}
         </div>
         <div>
           <div class="data-row"><span class="data-label">3분 MACD</span><span class="data-value {macd_class}">{macd_text}</span></div>
@@ -570,6 +673,7 @@ def render_compact_card(saved):
           <div class="data-row"><span class="data-label">거래대금</span><span class="data-value">{float(quote['오늘거래대금(억원)']):,.0f}억원</span></div>
           <div class="data-row"><span class="data-label">시가총액</span><span class="data-value">{float(quote['시가총액(조원)']):,.2f}조원</span></div>
           <div class="data-row"><span class="data-label">당일 고가/저가</span><span class="data-value">{int(quote['고가']):,}/{int(quote['저가']):,}</span></div>
+          {extra_right}
         </div>
       </div>
       <div class="levels-title">매매 레벨 · 조건 충족 시 참고</div>
@@ -601,14 +705,54 @@ def decide_status(row):
     return "⚪ 조건대기"
 
 
-def merge_realtime(universe, prices):
+def decide_momentum_status(row):
+    price = float(row["현재가"])
+    vwap = float(row["VWAP"])
+    change_pct = float(row["등락률(%)"])
+    trading_value = float(row["오늘누적거래대금"])
+    volume_ratio = float(row["전일대비거래량(%)"])
+    turnover = float(row.get("거래량회전율(%)", 0))
+    vwap_gap = ((price / vwap) - 1) * 100 if vwap > 0 else 0
+
+    if change_pct >= 18 or vwap_gap > 4 or turnover >= 30:
+        return "🔴 과열·추격금지"
+    if change_pct < 2 or (vwap > 0 and price < vwap):
+        return "⚪ 조건대기"
+    if (
+        3 <= change_pct <= 12
+        and trading_value >= 5_000_000_000
+        and volume_ratio >= 120
+    ):
+        return "🟢 급등 정밀검사"
+    if 2 <= change_pct <= 15 and trading_value >= 3_000_000_000:
+        return "🟡 거래량 확대 감시"
+    return "⚪ 조건대기"
+
+
+def choose_momentum_targets(universe):
+    if universe.empty:
+        return []
+    amount_codes = universe.nlargest(18, "1차거래대금근사")["종목코드"].tolist()
+    growth_codes = universe.nlargest(18, "거래량증가율(%)")["종목코드"].tolist()
+    return list(dict.fromkeys(amount_codes + growth_codes))[:30]
+
+
+def merge_realtime(universe, prices, scanner_type="quality"):
     realtime = pd.DataFrame(prices.values())
     if realtime.empty:
         return realtime
     result = universe.merge(realtime, on="종목코드", how="inner")
     result["VWAP위치(%)"] = ((result["현재가"] / result["VWAP"] - 1) * 100).replace([float("inf"), -float("inf")], 0).round(2)
     result["오늘거래대금(억원)"] = (result["오늘누적거래대금"] / 100_000_000).round(1)
-    result["현재판정"] = result.apply(decide_status, axis=1)
+    if scanner_type == "momentum":
+        result = result[
+            result["등락률(%)"].between(2, 20)
+            & (result["오늘누적거래량"] >= 100_000)
+            & (result["오늘누적거래대금"] >= 3_000_000_000)
+        ].copy()
+        result["현재판정"] = result.apply(decide_momentum_status, axis=1)
+    else:
+        result["현재판정"] = result.apply(decide_status, axis=1)
     return result.sort_values("오늘누적거래대금", ascending=False).reset_index(drop=True)
 
 
@@ -618,22 +762,38 @@ if not APP_KEY or not APP_SECRET:
 
 st.caption("✅ 한국투자증권 통합시장(UN) 연결 준비")
 
-if st.button("통합 현재가 우량주 검사", type="primary"):
+scanner_label = st.radio(
+    "검색 방식",
+    ["🏦 우량주 단타", "🔥 급등주 단타"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
+scanner_type = "quality" if scanner_label.startswith("🏦") else "momentum"
+scan_button_label = "우량주 통합시장 검사" if scanner_type == "quality" else "급등주 거래량 검사"
+
+if st.button(scan_button_label, type="primary"):
     try:
-        with st.spinner("시가총액 상위 종목을 선정하는 중입니다..."):
-            token = issue_access_token(APP_KEY, APP_SECRET)
-            kospi_rows = get_market_cap_ranking(token, "0001")
-            kosdaq_rows = get_market_cap_ranking(token, "1001")
-            universe = build_universe(kospi_rows, kosdaq_rows)
+        token = issue_access_token(APP_KEY, APP_SECRET)
+        if scanner_type == "quality":
+            with st.spinner("시가총액 상위 종목을 선정하는 중입니다..."):
+                kospi_rows = get_market_cap_ranking(token, "0001")
+                kosdaq_rows = get_market_cap_ranking(token, "1001")
+                universe = build_universe(kospi_rows, kosdaq_rows)
+                targets = universe.nlargest(30, "1차거래대금근사")["종목코드"].tolist()
+        else:
+            with st.spinner("거래증가율·거래금액 상위 급등주를 선정하는 중입니다..."):
+                growth_rows = get_volume_rank(token, "1")
+                amount_rows = get_volume_rank(token, "3")
+                universe = build_momentum_universe(growth_rows + amount_rows)
+                targets = choose_momentum_targets(universe)
 
         if universe.empty:
-            st.warning("시가총액 상위 종목을 받지 못했습니다.")
+            st.warning("조건에 맞는 1차 후보를 받지 못했습니다.")
             st.stop()
 
-        targets = universe.nlargest(30, "1차거래대금근사")["종목코드"].tolist()
         with st.spinner("통합시장 현재가를 순서대로 조회하는 중입니다..."):
             prices, price_errors = collect_integrated_prices(token, targets)
-            table = merge_realtime(universe, prices)
+            table = merge_realtime(universe, prices, scanner_type=scanner_type)
 
         if table.empty:
             st.error("통합시장 현재가를 받지 못했습니다.")
@@ -643,21 +803,29 @@ if st.button("통합 현재가 우량주 검사", type="primary"):
             st.stop()
 
         st.session_state["scan_table"] = table
+        st.session_state["scan_type"] = scanner_type
         st.session_state.pop("last_analysis", None)
-        st.toast(f"통합시장 현재가 {len(table)}종목 갱신 완료")
+        kind_text = "우량주" if scanner_type == "quality" else "급등주"
+        st.toast(f"{kind_text} 통합시장 {len(table)}종목 갱신 완료")
     except Exception as error:
-        st.error("통합시장 검사에 실패했습니다.")
+        st.error("종목 검사에 실패했습니다.")
         st.code(str(error))
 
 
-if "scan_table" in st.session_state:
+if "scan_table" in st.session_state and st.session_state.get("scan_type") == scanner_type:
     table = st.session_state["scan_table"]
     display_columns = [
         "시장", "시총순위", "종목코드", "종목명", "시세기준", "현재가", "등락률(%)",
         "VWAP", "VWAP위치(%)", "오늘누적거래량", "전일대비거래량(%)",
         "오늘거래대금(억원)", "현재판정",
     ]
-    preferred = table[table["현재판정"].isin(["🟢 기술지표검사 대상", "🟡 눌림대기"])].copy()
+    if scanner_type == "momentum":
+        display_columns[1] = "급등순위"
+        display_columns[10:10] = ["거래량증가율(%)", "거래량회전율(%)"]
+        preferred_statuses = ["🟢 급등 정밀검사", "🟡 거래량 확대 감시"]
+    else:
+        preferred_statuses = ["🟢 기술지표검사 대상", "🟡 눌림대기"]
+    preferred = table[table["현재판정"].isin(preferred_statuses)].copy()
     if preferred.empty:
         preferred = table.head(10).copy()
 
@@ -683,12 +851,16 @@ if "scan_table" in st.session_state:
                 "label": selected_label,
                 "row": selected_row.to_dict(),
                 "analysis": analysis,
+                "scan_type": scanner_type,
             }
         except Exception as error:
             st.error("기술지표 검사에 실패했습니다.")
             st.code(str(error))
 
-if "last_analysis" in st.session_state:
+if (
+    "last_analysis" in st.session_state
+    and st.session_state["last_analysis"].get("scan_type") == scanner_type
+):
     saved = st.session_state["last_analysis"]
     analysis = saved["analysis"]
     render_compact_card(saved)
@@ -721,7 +893,7 @@ if "last_analysis" in st.session_state:
                 st.bar_chart(frame[["거래량"]], use_container_width=True, height=170)
 
 
-if "scan_table" in st.session_state:
+if "scan_table" in st.session_state and st.session_state.get("scan_type") == scanner_type:
     table = st.session_state["scan_table"]
     with st.expander(f"전체 {len(table)}종목 표 보기"):
         st.caption("현재가·VWAP·거래량·거래대금은 한국투자증권 통합시장(UN) 값입니다.")
@@ -735,6 +907,8 @@ if "scan_table" in st.session_state:
                 "VWAP": st.column_config.NumberColumn(format="%.0f원"),
                 "VWAP위치(%)": st.column_config.NumberColumn(format="%.2f%%"),
                 "오늘누적거래량": st.column_config.NumberColumn(format="%d주"),
+                "거래량증가율(%)": st.column_config.NumberColumn(format="%.1f%%"),
+                "거래량회전율(%)": st.column_config.NumberColumn(format="%.2f%%"),
                 "전일대비거래량(%)": st.column_config.NumberColumn(format="%.1f%%"),
                 "오늘거래대금(억원)": st.column_config.NumberColumn(format="%.1f억원"),
             },
