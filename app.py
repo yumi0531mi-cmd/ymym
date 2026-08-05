@@ -1,4 +1,5 @@
 import html
+import json
 import math
 import re
 import time
@@ -10,6 +11,11 @@ import pandas as pd
 import requests
 import streamlit as st
 
+try:
+    import websocket
+except Exception:
+    websocket = None
+
 
 st.set_page_config(
     page_title="한·미 단타 스캐너",
@@ -18,7 +24,7 @@ st.set_page_config(
 )
 
 st.title("📡 한·미 당일 단타 스캐너")
-st.caption("📱 모바일 V9 · 미국 전종목 동전주 발견 + 눌림 매수신호")
+st.caption("📱 모바일 V11 · 미국 급등주 초고속 순위 + 최근 체결 갱신")
 
 st.markdown(
     """
@@ -132,6 +138,28 @@ def make_headers(token, tr_id):
         "tr_id": tr_id,
         "custtype": "P",
     }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def issue_ws_approval_key(app_key, app_secret):
+    """해외주식 실시간 체결 웹소켓 접속키를 1시간 재사용한다."""
+    response = requests.post(
+        f"{BASE_URL}/oauth2/Approval",
+        headers={"content-type": "application/json"},
+        data=json.dumps({
+            "grant_type": "client_credentials",
+            "appkey": app_key,
+            "secretkey": app_secret,
+        }),
+        timeout=10,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"실시간 접속키 발급 실패: HTTP {response.status_code}")
+    data = response.json()
+    approval_key = data.get("approval_key")
+    if not approval_key:
+        raise RuntimeError(data.get("msg1") or "실시간 접속키를 받지 못했습니다.")
+    return approval_key
 
 
 def get_market_cap_ranking(token, market_code):
@@ -278,6 +306,29 @@ def get_us_volume_surge_rows(token, exchange):
             "VOL_RANG": "3",
             "KEYB": "",
             "AUTH": "",
+        },
+    )
+    return [dict(row, _exchange=exchange) for row in rows]
+
+
+def get_us_trade_volume_rows(token, exchange, penny_only=False):
+    """한투 공식 미국 당일 누적 거래량 순위.
+
+    메르츠의 '거래량' 탭과 같은 절대 누적 거래량 기준이며,
+    volume-surge(평소 대비 증가율)와는 다른 API다.
+    """
+    rows = get_us_ranking(
+        token,
+        "/uapi/overseas-stock/v1/ranking/trade-vol",
+        "HHDFS76310010",
+        {
+            "EXCD": exchange,
+            "NDAY": "0",
+            "VOL_RANG": "0",
+            "KEYB": "",
+            "AUTH": "",
+            "PRC1": "0.01" if penny_only else "",
+            "PRC2": "10" if penny_only else "",
         },
     )
     return [dict(row, _exchange=exchange) for row in rows]
@@ -600,6 +651,157 @@ def session_exchange(exchange, session_mode):
     return normal
 
 
+def make_us_ws_key(exchange, ticker, session_mode):
+    """한투 미국 실시간 체결 구독키.
+
+    프리·정규·애프터: D + NAS/NYS/AMS + 티커
+    주간거래: R + BAQ/BAY/BAA + 티커
+    """
+    normal = US_NORMAL_EXCHANGE.get(str(exchange).upper(), str(exchange).upper())
+    ticker = str(ticker).strip().upper()
+    if session_mode == "day":
+        return f"R{US_DAY_EXCHANGE.get(normal, normal)}{ticker}"
+    return f"D{normal}{ticker}"
+
+
+def _match_ws_ticker(symbol_text, requested):
+    symbol_text = str(symbol_text).strip().upper()
+    for ticker in sorted(requested, key=len, reverse=True):
+        if symbol_text == ticker or symbol_text.endswith(ticker):
+            return ticker
+    return ""
+
+
+def _parse_us_ws_payload(payload, data_count, requested):
+    """한투 HDFSCNT0의 현재 25필드와 구 26필드 형식을 둘 다 처리한다."""
+    values = payload.split("^")
+    if data_count <= 0 or not values:
+        return []
+    width = len(values) // data_count
+    if width < 25:
+        return []
+
+    parsed = []
+    for index in range(data_count):
+        row = values[index * width:(index + 1) * width]
+        if len(row) < 25:
+            continue
+
+        # 구 샘플은 실시간코드·티커가 별도(26개),
+        # 현재 공식 샘플은 SYMB부터 시작(25개)한다.
+        if width >= 26:
+            ticker = _match_ws_ticker(row[1], requested) or _match_ws_ticker(row[0], requested)
+            pos = {
+                "date": 6, "time": 7, "open": 8, "high": 9, "low": 10,
+                "last": 11, "rate": 14, "bid": 15, "ask": 16,
+                "evol": 19, "tvol": 20, "tamt": 21, "buy": 23, "strength": 24,
+            }
+        else:
+            ticker = _match_ws_ticker(row[0], requested)
+            pos = {
+                "date": 5, "time": 6, "open": 7, "high": 8, "low": 9,
+                "last": 10, "rate": 13, "bid": 14, "ask": 15,
+                "evol": 18, "tvol": 19, "tamt": 20, "buy": 22, "strength": 23,
+            }
+        if not ticker:
+            continue
+        parsed.append({
+            "ticker": ticker,
+            "date": str(row[pos["date"]]).strip(),
+            "time": str(row[pos["time"]]).strip().zfill(6),
+            "open": to_float(row[pos["open"]]),
+            "high": to_float(row[pos["high"]]),
+            "low": to_float(row[pos["low"]]),
+            "last": to_float(row[pos["last"]]),
+            "rate": to_float(row[pos["rate"]]),
+            "bid": to_float(row[pos["bid"]]),
+            "ask": to_float(row[pos["ask"]]),
+            "evol": to_float(row[pos["evol"]]),
+            "tvol": to_float(row[pos["tvol"]]),
+            "tamt": to_float(row[pos["tamt"]]),
+            "buy_volume": to_float(row[pos["buy"]]),
+            "strength": to_float(row[pos["strength"]]),
+        })
+    return parsed
+
+
+def get_us_live_snapshots(pairs, session_mode, wait_seconds=2.2, limit=30):
+    """활발한 후보 최대 30종목을 한 웹소켓에서 받는다.
+
+    새 체결이 발생한 종목만 반환하므로, 거래가 없는 종목의
+    예전 가격을 '실시간'으로 잘못 표시하지 않는다.
+    """
+    if websocket is None:
+        return {}, ["websocket-client가 설치되지 않아 REST 가격을 사용했습니다."]
+
+    pairs = unique_us_pairs(pairs)[:limit]
+    if not pairs:
+        return {}, []
+
+    approval_key = issue_ws_approval_key(APP_KEY, APP_SECRET)
+    requested = {ticker for _, ticker in pairs}
+    snapshots = {}
+    errors = []
+    ws = None
+
+    try:
+        ws = websocket.create_connection(
+            "ws://ops.koreainvestment.com:21000",
+            timeout=2.5,
+            enable_multithread=False,
+        )
+        for exchange, ticker in pairs:
+            message = {
+                "header": {
+                    "approval_key": approval_key,
+                    "custtype": "P",
+                    "tr_type": "1",
+                    "content-type": "utf-8",
+                },
+                "body": {
+                    "input": {
+                        "tr_id": "HDFSCNT0",
+                        "tr_key": make_us_ws_key(exchange, ticker, session_mode),
+                    }
+                },
+            }
+            ws.send(json.dumps(message))
+            time.sleep(0.015)
+
+        deadline = time.monotonic() + wait_seconds
+        ws.settimeout(0.18)
+        while time.monotonic() < deadline and len(snapshots) < len(requested):
+            try:
+                raw = ws.recv()
+            except Exception:
+                continue
+            if not raw:
+                continue
+            if raw.startswith("0|"):
+                parts = raw.split("|", 3)
+                if len(parts) != 4 or parts[1] != "HDFSCNT0":
+                    continue
+                for item in _parse_us_ws_payload(parts[3], to_int(parts[2]), requested):
+                    if item["last"] > 0:
+                        snapshots[item["ticker"]] = item
+            elif raw.startswith("{"):
+                try:
+                    message = json.loads(raw)
+                    if (message.get("header") or {}).get("tr_id") == "PINGPONG":
+                        ws.send(raw)
+                except Exception:
+                    pass
+    except Exception as error:
+        errors.append(f"실시간 웹소켓: {error}")
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+    return snapshots, errors
+
+
 def chunks(items, size):
     for start in range(0, len(items), size):
         yield items[start:start + size]
@@ -817,6 +1019,7 @@ def pairs_from_us_rows(rows, exchange_hint=""):
     return unique_us_pairs(pairs)
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def get_kis_penny_candidates(token):
     """한투 조건검색·가격급등·거래량급증을 합쳐 후보 누락을 줄인다."""
     all_pairs = []
@@ -855,16 +1058,92 @@ def get_kis_penny_candidates(token):
 
 
 def discover_us_penny_candidates(token, include_external=True):
-    kis_pairs, kis_counts, kis_errors = get_kis_penny_candidates(token)
-    pairs = list(kis_pairs)
-    counts = dict(kis_counts)
-    errors = list(kis_errors)
-    if include_external:
-        external_pairs, external_counts, external_errors = get_external_penny_candidates()
-        pairs.extend(external_pairs)
-        counts.update(external_counts)
-        errors.extend(external_errors)
+    # 한투 후보와 외부 후보를 동시에 받습니다. 외부 사이트 하나가 늦어도
+    # 한투 조회가 끝난 뒤 다시 기다리지 않게 하여 최초 검색 시간을 줄입니다.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        kis_future = executor.submit(get_kis_penny_candidates, token)
+        external_future = (
+            executor.submit(get_external_penny_candidates)
+            if include_external
+            else None
+        )
+        kis_pairs, kis_counts, kis_errors = kis_future.result()
+        if external_future is not None:
+            external_pairs, external_counts, external_errors = external_future.result()
+        else:
+            external_pairs, external_counts, external_errors = [], {}, []
+
+    pairs = [*kis_pairs, *external_pairs]
+    counts = {**kis_counts, **external_counts}
+    errors = [*kis_errors, *external_errors]
     return unique_us_pairs(pairs), counts, errors
+
+
+@st.cache_data(ttl=3, show_spinner=False)
+def get_us_fast_rank_rows(token, penny_only):
+    """미국 3개 거래소의 당일 누적 거래량 순위를 동시에 받는다."""
+    volume_rows = []
+    counts = {}
+    errors = []
+    exchanges = ("NAS", "NYS", "AMS")
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(
+                get_us_trade_volume_rows,
+                token,
+                exchange,
+                penny_only,
+            ): exchange
+            for exchange in exchanges
+        }
+        for future in as_completed(futures):
+            exchange = futures[future]
+            key = f"한투-{exchange}-당일거래량"
+            try:
+                rows = future.result()
+                counts[key] = len(rows)
+                volume_rows.extend(rows)
+            except Exception as error:
+                counts[key] = 0
+                errors.append(f"{key}: {error}")
+
+    return volume_rows, counts, errors
+
+
+def merge_us_fast_rank_rows(price_rows, surge_rows, session_mode):
+    """두 순위표를 종목별 한 행으로 합쳐 기존 고속표 입력 형식으로 만든다."""
+    merged = {}
+    ordered_pairs = []
+    volume_fields = ("tvol", "tamt", "pvol")
+
+    for rows in (price_rows, surge_rows):
+        for source in rows:
+            row = dict(source)
+            ticker = str(row.get("symb") or "").strip().upper()
+            exchange = US_NORMAL_EXCHANGE.get(
+                str(row.get("_exchange") or row.get("excd") or "").strip().upper(),
+                str(row.get("_exchange") or row.get("excd") or "").strip().upper(),
+            )
+            if exchange not in US_EXCHANGE_NAMES or not re.fullmatch(r"[A-Z]{1,6}", ticker):
+                continue
+            key = (exchange, ticker)
+            if key not in merged:
+                row["_base_exchange"] = exchange
+                row["_session_mode"] = session_mode
+                merged[key] = row
+                ordered_pairs.append(key)
+                continue
+
+            target = merged[key]
+            for field, value in row.items():
+                if field in volume_fields:
+                    if to_float(value) > to_float(target.get(field)):
+                        target[field] = value
+                elif target.get(field) in (None, "", "0", 0, 0.0) and value not in (None, ""):
+                    target[field] = value
+
+    return list(merged.values()), ordered_pairs
 
 
 def build_us_fast_table(rows, candidates, strategy):
@@ -985,15 +1264,158 @@ def build_us_fast_table(rows, candidates, strategy):
         passed = table[table["조건통과"]].copy()
         if not passed.empty:
             table = passed
-        return table.sort_values("고속점수", ascending=False).head(30).reset_index(drop=True)
+        # 메리츠 '거래량' 탭처럼 당일 누적거래량 상위를 먼저 감시한다.
+        # 진입점수는 방금 들어온 웹소켓 체결로 다시 계산한다.
+        return table.sort_values(
+            ["오늘거래량", "고속점수"], ascending=[False, False]
+        ).head(30).reset_index(drop=True)
     if strategy == "momentum":
         passed = table[table["조건통과"]].copy()
         if not passed.empty:
             table = passed
-        return table.sort_values("고속점수", ascending=False).head(30).reset_index(drop=True)
+        return table.sort_values(
+            ["오늘거래량", "고속점수"], ascending=[False, False]
+        ).head(30).reset_index(drop=True)
     return table.sort_values(
         ["시가총액(API)", "오늘거래대금(백만$)"], ascending=False
     ).head(30).reset_index(drop=True)
+
+
+def apply_us_live_snapshots(table, snapshots, strategy):
+    """웹소켓으로 새 체결을 받은 종목만 표의 가격·거래량을 교체한다."""
+    if table.empty:
+        return table
+
+    result = table.copy()
+    if "시세출처" not in result.columns:
+        result["시세출처"] = "한투 REST(지연 가능)"
+    for column in ("진입검토가($)", "손절기준($)", "1차목표($)", "2차목표($)"):
+        if column not in result.columns:
+            result[column] = 0.0
+    if "진입점수" not in result.columns:
+        result["진입점수"] = 0
+    if "당일거래량순위" not in result.columns:
+        result["당일거래량순위"] = 0
+
+    for index, row in result.iterrows():
+        ticker = str(row["종목코드"]).upper()
+        snap = snapshots.get(ticker)
+        if not snap:
+            continue
+
+        price = float(snap["last"])
+        rate = float(snap["rate"])
+        volume = int(snap["tvol"])
+        amount = float(snap["tamt"])
+        bid = float(snap["bid"])
+        ask = float(snap["ask"])
+        strength = float(snap["strength"])
+        if amount <= 0 and price > 0 and volume > 0:
+            amount = price * volume
+        vwap = amount / volume if amount > 0 and volume > 0 else 0
+        vwap_gap = (price / vwap - 1) * 100 if vwap > 0 else 0
+        spread = (ask - bid) / price * 100 if ask > 0 and bid > 0 and price > 0 else 0
+
+        result.at[index, "현재가($)"] = round(price, 4)
+        result.at[index, "등락률(%)"] = round(rate, 2)
+        result.at[index, "오늘거래량"] = volume
+        result.at[index, "오늘거래대금(백만$)"] = round(amount / 1_000_000, 2)
+        result.at[index, "VWAP($)"] = round(vwap, 4)
+        result.at[index, "VWAP위치(%)"] = round(vwap_gap, 2)
+        result.at[index, "매수호가($)"] = round(bid, 4)
+        result.at[index, "매도호가($)"] = round(ask, 4)
+        result.at[index, "스프레드(%)"] = round(spread, 2)
+        result.at[index, "체결강도"] = round(strength, 1)
+        result.at[index, "시세시간(KST)"] = f"{snap['date']} {snap['time']}"
+        result.at[index, "시세출처"] = "한투 WS 실시간지연체결"
+
+        if strategy == "penny":
+            vwap_ok = 0.2 <= vwap_gap <= 3
+            strength_ok = strength >= 120
+            spread_ok = 0 < spread <= 2.5
+            rate_ok = 2 <= rate <= 40
+            liquidity_ok = volume >= 100_000 and amount >= 100_000
+            heat_ok = rate < 80 and vwap_gap < 12
+        else:
+            vwap_ok = 0.1 <= vwap_gap <= 3
+            strength_ok = strength >= 110
+            spread_ok = 0 < spread <= 2
+            rate_ok = 2 <= rate <= 20
+            liquidity_ok = volume >= 50_000 and amount >= 500_000
+            heat_ok = rate < 25 and vwap_gap < 10
+
+        signal_score = (
+            10  # 방금 웹소켓 체결
+            + (20 if strength_ok else 0)
+            + (20 if vwap_ok else 0)
+            + (15 if spread_ok else 0)
+            + (10 if rate_ok else 0)
+            + (15 if liquidity_ok else 0)
+            + (10 if heat_ok else 0)
+        )
+        result.at[index, "진입점수"] = signal_score
+
+        if strategy == "penny":
+            passed = 0.01 <= price <= 10 and rate >= 1 and volume >= 20_000 and amount >= 10_000
+            if rate >= 80 or vwap_gap >= 12 or spread > 5:
+                status = "🔴 폭등·추격금지"
+            elif passed and signal_score >= 75:
+                status = "🟢 75점 정밀검증 대상"
+            elif passed and strength < 120:
+                status = "🟡 매수세 증가 대기"
+            elif passed:
+                status = "🟡 VWAP 눌림대기"
+            else:
+                status = "⚪ 조건미달"
+        elif strategy == "momentum":
+            passed = rate >= 2 and volume >= 10_000 and amount >= 100_000
+            if rate >= 25 or vwap_gap >= 10 or spread > 5:
+                status = "🔴 추격주의"
+            elif passed and signal_score >= 75:
+                status = "🟢 75점 정밀검증 대상"
+            elif passed:
+                status = "🟡 VWAP 눌림대기"
+            else:
+                status = "⚪ 조건대기"
+        else:
+            passed = 0.2 <= rate <= 8 and amount >= 1_000_000
+            if rate >= 10 or vwap_gap >= 6:
+                status = "🔴 추격주의"
+            elif passed and vwap_gap >= 0 and strength >= 105:
+                status = "🟢 기술지표 후보"
+            elif passed:
+                status = "🟡 매수세 확인 대기"
+            else:
+                status = "⚪ 유동성 관찰"
+        result.at[index, "조건통과"] = passed
+        result.at[index, "현재판정"] = status
+
+        # 지지·저항·ATR을 읽지 않은 실시간 순위 단계에서는
+        # 진입가·손절가·목표가를 만들지 않는다. 아래 분봉 검증에서만 계산한다.
+        entry = stop = target1 = target2 = 0.0
+        result.at[index, "진입검토가($)"] = round(entry, 4)
+        result.at[index, "손절기준($)"] = round(stop, 4)
+        result.at[index, "1차목표($)"] = round(target1, 4)
+        result.at[index, "2차목표($)"] = round(target2, 4)
+
+    live = result[result["시세출처"].str.startswith("한투 WS")].copy()
+    rest = result[~result["시세출처"].str.startswith("한투 WS")].copy()
+    if strategy in ("penny", "momentum"):
+        live = live.sort_values("오늘거래량", ascending=False)
+        rest = rest.sort_values("오늘거래량", ascending=False)
+        live["당일거래량순위"] = range(1, len(live) + 1)
+        rest["당일거래량순위"] = range(len(live) + 1, len(live) + len(rest) + 1)
+    else:
+        sort_column = "고속점수" if "고속점수" in result.columns else "오늘거래대금(백만$)"
+        live = live.sort_values(sort_column, ascending=False)
+        rest = rest.sort_values(sort_column, ascending=False)
+
+    # 급등주·동전주는 방금 실제 체결을 받은 종목만 표시합니다.
+    # REST 잔존값을 섞으면 장 전환 시 오래된 가격이 급등 후보처럼 보일 수 있습니다.
+    if strategy in ("penny", "momentum") and not live.empty:
+        return live.reset_index(drop=True)
+
+    return pd.concat([live, rest], ignore_index=True)
 
 
 def is_excluded_product(name):
@@ -1449,6 +1871,7 @@ def analyze_us_penny_stock(minute, quote_row):
     vwap = float(quote_row["VWAP($)"])
     change_pct = float(quote_row["등락률(%)"])
     spread_pct = float(quote_row.get("스프레드(%)", 0) or 0)
+    strength = float(quote_row.get("체결강도", 0) or 0)
 
     rsi_1 = safe_last(one["RSI"])
     rsi_3 = safe_last(three["RSI"])
@@ -1478,26 +1901,44 @@ def analyze_us_penny_stock(minute, quote_row):
         "3분 MACD 상승": bullish_macd,
         "1·3분 EMA9 위": trend_1 and trend_3,
         "최근 거래량 1.2배": volume_speed >= 1.2,
+        "매수 체결강도 120 이상": strength >= 120,
         "스프레드 3% 이하": spread_pct == 0 or spread_pct <= 3,
         "눌림 후 재상승": -10 <= pullback_pct <= 0 and reclaim,
     }
     score = sum(checks.values())
     overheated = change_pct >= 80 or vwap_gap > 10 or rsi_1 >= 85 or spread_pct > 6
-    mandatory = checks["VWAP 위 0~5%"] and checks["3분 MACD 상승"] and checks["1·3분 EMA9 위"]
+    mandatory = (
+        checks["VWAP 위 0~5%"]
+        and checks["3분 MACD 상승"]
+        and checks["1·3분 EMA9 위"]
+        and checks["매수 체결강도 120 이상"]
+    )
+
+    validation = backtest_us_entry_condition(minute)
+    validation_ok = (
+        validation["samples"] >= 8
+        and validation["win_rate"] >= 75
+    )
 
     if overheated:
         verdict = "🔴 추격금지"
-    elif score >= 5 and mandatory:
-        verdict = "🟢 매수검토"
+    elif score >= 6 and mandatory and validation_ok:
+        verdict = "🟢 75% 검증 진입검토"
+    elif score >= 6 and mandatory and validation["samples"] < 8:
+        verdict = "🟡 검증표본 대기"
+    elif score >= 6 and mandatory:
+        verdict = "🟡 최근 적중률 75% 미만"
     elif score >= 3:
         verdict = "🟡 눌림대기"
     else:
         verdict = "⚪ 진입금지"
 
-    atr_1 = safe_last(one["ATR"])
-    risk = max(atr_1 * 1.2, price * 0.02)
-    entry = max(price, safe_last(one["EMA9"], price))
-    stop = max(recent_low, entry - risk, entry * 0.97)
+    entry = price
+    stop, target1, target2, support, resistance = calculate_us_chart_levels(
+        one,
+        len(one) - 1,
+        entry,
+    )
     return {
         "frames": frames,
         "verdict": verdict,
@@ -1510,10 +1951,123 @@ def analyze_us_penny_stock(minute, quote_row):
         "volume_speed": volume_speed,
         "vwap_gap": vwap_gap,
         "pullback_pct": pullback_pct,
+        "validation_wins": validation["wins"],
+        "validation_samples": validation["samples"],
+        "validation_win_rate": validation["win_rate"],
+        "validation_ok": validation_ok,
+        "support": round(support, 4),
+        "resistance": round(resistance, 4),
         "entry": round(entry, 4),
         "stop": round(stop, 4),
-        "target1": round(entry * 1.05, 4),
-        "target2": round(entry * 1.08, 4),
+        "target1": round(target1, 4),
+        "target2": round(target2, 4),
+    }
+
+
+def calculate_us_chart_levels(bars, position, entry):
+    """신호 시점까지의 차트만 사용해 지지·저항·ATR 매매 레벨을 만든다."""
+    history = bars.iloc[:position + 1].copy()
+    if history.empty or entry <= 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+    atr = safe_last(history["ATR"])
+    if atr <= 0:
+        recent_range = (history["고가"] - history["저가"]).tail(14).mean()
+        atr = float(recent_range) if pd.notna(recent_range) and recent_range > 0 else entry * 0.02
+    # 변동성이 지나치게 작게 잡혀 손절가가 현재가에 붙는 것을 방지한다.
+    atr = max(atr, entry * 0.008)
+
+    support_window = history["저가"].tail(12)
+    support = float(support_window.min()) if not support_window.empty else entry - atr
+
+    prior_highs = history["고가"].iloc[-31:-1] if len(history) > 1 else history["고가"]
+    resistance = float(prior_highs.max()) if not prior_highs.empty else entry + atr * 1.5
+
+    atr_stop = entry - atr * 1.2
+    stop = max(support, atr_stop)
+    if stop <= 0 or stop >= entry:
+        stop = entry - atr * 1.2
+
+    # 1차는 직전 저항선이 합리적인 범위에 있으면 그 가격을 사용한다.
+    minimum_target = entry + atr * 1.2
+    normal_target = entry + atr * 1.8
+    maximum_first = entry + atr * 3.0
+    if minimum_target <= resistance <= maximum_first:
+        target1 = resistance
+    else:
+        target1 = normal_target
+
+    # 2차는 1차 저항 돌파 후의 다음 ATR 확장 구간으로 잡는다.
+    target2 = max(target1 + atr * 1.2, entry + atr * 3.0)
+    return stop, target1, target2, support, resistance
+
+
+def backtest_us_entry_condition(minute, horizon=20):
+    """최근 1분봉을 시점별로 재생해 같은 기술조건의 적중률을 계산한다.
+
+    신호 다음 분봉 시가를 진입가로 사용하며, 같은 분봉에 목표가와
+    손절가가 모두 닿으면 손절을 먼저 처리한다. 목표가와 손절가 모두
+    닿지 않은 경우도 실패로 처리해 적중률을 보수적으로 계산한다.
+    """
+    bars = add_indicators(resample_bars(minute, 1)).copy()
+    if len(bars) < 45:
+        return {"wins": 0, "samples": 0, "win_rate": 0.0}
+
+    recent_volume = bars["거래량"].rolling(3).mean()
+    prior_volume = bars["거래량"].shift(3).rolling(20).mean()
+    bars["거래량속도"] = recent_volume / prior_volume.replace(0, float("nan"))
+    bars["기술신호"] = (
+        (bars["종가"] >= bars["EMA9"])
+        & bars["RSI"].between(45, 70)
+        & (bars["MACD"] > bars["MACD시그널"])
+        & (bars["MACD히스토그램"] >= bars["MACD히스토그램"].shift(1))
+        & (bars["거래량속도"] >= 1.2)
+    )
+
+    wins = 0
+    samples = 0
+    index = 26
+    last_signal = len(bars) - horizon - 1
+    while index <= last_signal:
+        if not bool(bars["기술신호"].iloc[index]):
+            index += 1
+            continue
+
+        entry = float(bars["시가"].iloc[index + 1])
+        if entry <= 0:
+            index += 1
+            continue
+        stop, target, _, _, _ = calculate_us_chart_levels(
+            bars,
+            index,
+            entry,
+        )
+        if stop <= 0 or target <= entry or stop >= entry:
+            index += 1
+            continue
+        outcome = "loss"
+        future = bars.iloc[index + 1:index + 1 + horizon]
+        for _, candle in future.iterrows():
+            stop_hit = float(candle["저가"]) <= stop
+            target_hit = float(candle["고가"]) >= target
+            if stop_hit:
+                outcome = "loss"
+                break
+            if target_hit:
+                outcome = "win"
+                break
+
+        samples += 1
+        if outcome == "win":
+            wins += 1
+        # 거의 같은 분봉에서 발생한 중복 신호를 하나로 압축한다.
+        index += 5
+
+    win_rate = (wins / samples * 100) if samples else 0.0
+    return {
+        "wins": wins,
+        "samples": samples,
+        "win_rate": round(win_rate, 1),
     }
 
 
@@ -1546,10 +2100,12 @@ def analyze_us_penny_candidates(token, table, session_mode, limit=8):
                 results.append({"row": {}, "analysis": None, "error": str(error)})
 
     verdict_order = {
-        "🟢 매수검토": 0,
-        "🟡 눌림대기": 1,
-        "⚪ 진입금지": 2,
-        "🔴 추격금지": 3,
+        "🟢 75% 검증 진입검토": 0,
+        "🟡 검증표본 대기": 1,
+        "🟡 최근 적중률 75% 미만": 2,
+        "🟡 눌림대기": 3,
+        "⚪ 진입금지": 4,
+        "🔴 추격금지": 5,
     }
     results.sort(key=lambda item: (
         verdict_order.get((item.get("analysis") or {}).get("verdict"), 9),
@@ -1782,16 +2338,16 @@ scan_button_labels = {
     "kr_quality": "국내 우량주 통합시장 검사",
     "kr_momentum": "국내 급등주 거래량 검사",
     "us_quality": "미국 우량주 10종목씩 고속 검사",
-    "us_momentum": "미국 급등주 10종목씩 고속 검사",
-    "us_penny": "미국 동전주 급등 실시간 발견",
+    "us_momentum": "미국 당일 거래량 급등주 즉시 검색",
+    "us_penny": "미국 동전주 당일 거래량 즉시 검색",
 }
 
 us_session_choice = "자동(현재 장)"
-use_yahoo_candidates = False
 if not is_domestic:
     st.info(
-        "미국 V9은 한투 공식 조건검색·급등·거래량급증으로 후보를 찾고 10종목씩 재검증합니다. "
-        "가격·거래량·판정은 한투 데이터만 사용합니다."
+        "미국 V11은 메르츠의 '거래량' 탭처럼 한투 당일 누적 거래량 순위를 먼저 받습니다. "
+        "외부 사이트와 종목별 REST 재조회는 기다리지 않으며, 최근 가격은 웹소켓 체결로 교체합니다. "
+        "메르츠 통합시세와는 시세 공급원 차이로 소수점 가격이 다를 수 있습니다."
     )
     us_session_choice = st.selectbox(
         "미국장 시세 선택",
@@ -1799,11 +2355,7 @@ if not is_domestic:
         help="자동은 한국시간에 따라 주간거래 코드와 미국 정규거래소 코드를 바꾸어 조회합니다.",
     )
     if strategy_code in ("momentum", "penny"):
-        use_yahoo_candidates = st.checkbox(
-            "외부 급등 후보도 함께 검색(야후·나스닥)",
-            value=strategy_code == "penny",
-            help="외부 자료는 종목 발견에만 사용합니다. 표시 가격과 최종 판정은 모두 한투 API로 다시 확인합니다.",
-        )
+        st.caption("⚡ 속도 우선: 야후·나스닥 웹페이지 수집과 80종목 REST 재조회는 사용하지 않습니다.")
 
 if st.button(scan_button_labels[scanner_type], type="primary"):
     try:
@@ -1848,35 +2400,36 @@ if st.button(scan_button_labels[scanner_type], type="primary"):
 
         else:
             scan_name = "동전주 급등" if strategy_code == "penny" else "급등주"
-            with st.spinner(f"미국 {scan_name} 후보를 발견한 뒤 한투로 재검증하는 중입니다..."):
+            with st.spinner(f"미국 {scan_name} 당일 누적 거래량 순위를 받는 중입니다..."):
                 session_mode, session_detail, scan_time = resolve_us_session(us_session_choice)
-                source_counts = {}
-                discovery_errors = []
-                if strategy_code == "penny":
-                    discovered, source_counts, discovery_errors = discover_us_penny_candidates(
-                        token, include_external=use_yahoo_candidates
-                    )
-                    us_candidates = discovered + list(US_MOMENTUM_SEED)
-                else:
-                    us_candidates = list(US_MOMENTUM_SEED)
-                    if use_yahoo_candidates:
-                        try:
-                            yahoo_pairs = get_yahoo_us_candidates(0)
-                            source_counts["야후"] = len(yahoo_pairs)
-                            us_candidates = yahoo_pairs + us_candidates
-                        except Exception as error:
-                            discovery_errors.append(f"야후: {error}")
-                us_candidates = unique_us_pairs(us_candidates)[:160]
-                market_rows, price_errors = get_us_multiple_prices(
-                    token, us_candidates, session_mode
+                volume_rows, source_counts, rank_errors = get_us_fast_rank_rows(
+                    token,
+                    penny_only=strategy_code == "penny",
+                )
+                market_rows, us_candidates = merge_us_fast_rank_rows(
+                    [],
+                    volume_rows,
+                    session_mode,
                 )
                 table = build_us_fast_table(
                     market_rows, us_candidates, strategy=strategy_code
                 )
-                source_total = len(unique_us_pairs(us_candidates))
-                us_source_note = f"후보 {source_total}개를 한투 현재가로 재검증"
-                price_errors = discovery_errors + price_errors
+                table["시세출처"] = "한투 당일 거래량순위"
+                us_source_note = f"한투 당일 누적 거래량 상위 {len(us_candidates)}개"
+                price_errors = list(rank_errors)
                 st.session_state["us_source_counts"] = source_counts
+
+        if not is_domestic and not table.empty:
+            live_pairs = list(zip(table["거래소코드"], table["종목코드"]))
+            live_snapshots, live_errors = get_us_live_snapshots(
+                live_pairs,
+                session_mode,
+                wait_seconds=(1.0 if strategy_code in ("penny", "momentum") else 2.2),
+                limit=30,
+            )
+            table = apply_us_live_snapshots(table, live_snapshots, strategy_code)
+            price_errors.extend(live_errors)
+            st.session_state["us_live_count"] = len(live_snapshots)
 
         if table.empty:
             if scanner_type == "us_penny":
@@ -1891,13 +2444,17 @@ if st.button(scan_button_labels[scanner_type], type="primary"):
                 raise RuntimeError("\n".join(price_errors[:5]))
             raise RuntimeError("현재 조건에 맞는 종목을 받지 못했습니다. 미국 장 운영 시간에 다시 확인해 주세요.")
 
-        if scanner_type == "us_penny":
-            with st.spinner("상위 동전주의 분봉을 다시 검사해 매수타점을 계산하는 중입니다..."):
+        # 거래량 순위는 빠르게 받고, 상위 3종목만 동시에 분봉을 재생해
+        # 지지·저항·ATR 레벨과 최근 검증 적중률을 즉시 계산한다.
+        st.session_state.pop("us_penny_signals", None)
+        if not is_domestic and strategy_code in ("penny", "momentum"):
+            with st.spinner("상위 3종목의 차트·적중률을 동시 검증하는 중..."):
                 st.session_state["us_penny_signals"] = analyze_us_penny_candidates(
-                    token, table, session_mode, limit=8
+                    token,
+                    table,
+                    session_mode,
+                    limit=3,
                 )
-        else:
-            st.session_state.pop("us_penny_signals", None)
 
         st.session_state["scan_table"] = table
         st.session_state["scan_type"] = scanner_type
@@ -1931,35 +2488,130 @@ if has_current_scan and not is_domestic:
         f"세션: {us_meta.get('session', '-')} · "
         f"갱신: {us_meta.get('time', '-')} KST · "
         f"후보: {us_meta.get('source', '-')}. "
-        "표시 가격과 판정은 한투 API 기준입니다."
+        f"웹소켓 실체결: {st.session_state.get('us_live_count', 0)}종목."
     )
 
-    if strategy_code == "penny":
+    quick_col, signal_col = st.columns(2)
+    if quick_col.button("⚡ 현재 종목 1초 갱신", use_container_width=True):
+        try:
+            session_mode, session_detail, scan_time = resolve_us_session(us_session_choice)
+            pairs = list(zip(table["거래소코드"], table["종목코드"]))
+            with st.spinner("한투 미국 실시간 체결을 받는 중..."):
+                snapshots, live_errors = get_us_live_snapshots(
+                    pairs, session_mode, wait_seconds=1.0, limit=30
+                )
+            if not snapshots:
+                raise RuntimeError(
+                    "1초 동안 새 체결을 받지 못했습니다. "
+                    "현재 장 선택과 거래 시간을 확인해 주세요."
+                )
+            table = apply_us_live_snapshots(table, snapshots, strategy_code)
+            st.session_state["scan_table"] = table
+            st.session_state["us_live_count"] = len(snapshots)
+            st.session_state["us_scan_meta"] = {
+                **us_meta,
+                "session": session_detail,
+                "time": scan_time,
+                "errors": live_errors,
+            }
+            st.toast(f"실시간 체결 {len(snapshots)}종목 갱신 완료")
+        except Exception as error:
+            st.warning(str(error))
+
+    if strategy_code in ("penny", "momentum") and signal_col.button(
+        "🎯 상위 3종목 차트·승률 재검증",
+        use_container_width=True,
+    ):
+        try:
+            token = issue_access_token(APP_KEY, APP_SECRET)
+            session_mode, _, _ = resolve_us_session(us_session_choice)
+            with st.spinner("상위 3종목의 지지·저항·ATR·최근 적중률을 검증하는 중..."):
+                st.session_state["us_penny_signals"] = analyze_us_penny_candidates(
+                    token, table, session_mode, limit=3
+                )
+            st.toast("매수타점 정밀검사 완료")
+        except Exception as error:
+            st.warning(str(error))
+
+    if strategy_code in ("penny", "momentum"):
+        st.subheader("⚡ 실시간 1차 조건 후보")
+        direct = table.copy()
+        if "시세출처" in direct.columns:
+            direct = direct[
+                direct["시세출처"].astype(str).str.startswith("한투 WS")
+            ]
+        if "진입점수" in direct.columns:
+            direct = direct[direct["진입점수"] >= 75]
+        else:
+            direct = direct.iloc[0:0]
+        if not direct.empty:
+            direct = direct.sort_values(
+                ["진입점수", "오늘거래량"],
+                ascending=[False, False],
+            ).head(3)
+
+        if direct.empty:
+            st.info(
+                "현재 75점 이상 진입 종목이 없습니다. "
+                "급등주 검색을 다시 누르면 당일 거래량 순위를 새로 받습니다."
+            )
+        else:
+            for _, row in direct.iterrows():
+                name = html.escape(str(row.get("종목명") or row.get("종목코드")))
+                ticker = html.escape(str(row.get("종목코드", "")))
+                st.markdown(
+                    f'''<div class="stock-card" style="border-color:#61df88">
+                    <div class="card-head"><div><div class="stock-name">{name}</div>
+                    <div class="ticker">{ticker} · ${float(row['현재가($)']):.4f} · {float(row['등락률(%)']):+.1f}%</div></div>
+                    <div style="color:#ffd45d;font-weight:900">🟡 차트검증 대상<br>
+                    <small>{int(row['진입점수'])}/100</small></div></div>
+                    <div class="grid2" style="margin-top:10px">
+                      <div class="data-row"><span class="data-label">매수 체결강도</span><span class="data-value">{float(row['체결강도']):.0f}</span></div>
+                      <div class="data-row"><span class="data-label">VWAP 위치</span><span class="data-value">{float(row['VWAP위치(%)']):+.1f}%</span></div>
+                      <div class="data-row"><span class="data-label">호가 차이</span><span class="data-value">{float(row['스프레드(%)']):.2f}%</span></div>
+                      <div class="data-row"><span class="data-label">당일 거래량</span><span class="data-value">{int(row['오늘거래량']):,}주</span></div>
+                    </div></div>''',
+                    unsafe_allow_html=True,
+                )
+        st.caption(
+            "이 카드는 거래량·체결강도·VWAP의 1차 조건점수입니다. "
+            "진입가·손절가·매도가는 바로 아래 75% 차트 검증 카드에서만 표시합니다."
+        )
+
+    if strategy_code in ("penny", "momentum"):
         source_counts = st.session_state.get("us_source_counts", {})
         if source_counts:
             working_sources = sum(1 for count in source_counts.values() if count > 0)
             found_total = sum(source_counts.values())
             st.caption(
-                f"후보 수집원 {working_sources}개 작동 · 중복 포함 {found_total}개 발견 · "
-                "화면에는 한투에서 $0.01~$10로 재확인된 종목만 표시"
+                f"거래소 거래량순위 {working_sources}/3개 작동 · 중복 포함 {found_total}개 · "
+                "화면에는 한투 웹소켓에서 방금 체결되고 $0.01~$10로 확인된 종목만 표시"
             )
         if "조건통과" in table.columns and not table["조건통과"].any():
             st.warning(
                 "동전주는 찾았지만 현재 등락률·거래량 조건을 모두 통과한 종목은 없습니다. "
                 "아래 종목은 감시 후보이며 매수 신호가 아닙니다."
             )
-        st.subheader("🎯 급등주 자동 매수타점")
+        st.subheader("🎯 실제 75% 차트 검증 진입카드")
         signal_items = [
             item for item in st.session_state.get("us_penny_signals", [])
             if item.get("analysis")
         ]
         actionable = [
             item for item in signal_items
-            if item["analysis"]["verdict"] in ("🟢 매수검토", "🟡 눌림대기")
+            if item["analysis"]["verdict"] in (
+                "🟢 75% 검증 진입검토",
+                "🟡 검증표본 대기",
+                "🟡 최근 적중률 75% 미만",
+                "🟡 눌림대기",
+            )
         ]
         shown = (actionable or signal_items)[:3]
         if not shown:
-            st.warning("현재 분봉이 충분한 동전주가 없습니다. 장이 열린 후 다시 조회하세요.")
+            st.info(
+                "상위 3종목의 분봉이 충분히 쌓이면 RSI·MACD·VWAP·ATR과 "
+                "최근 신호 적중률을 함께 검증합니다."
+            )
         for item in shown:
             row = item["row"]
             analysis = item["analysis"]
@@ -1971,7 +2623,7 @@ if has_current_scan and not is_domestic:
                 f'''<div class="stock-card" style="border-color:{color}">
                 <div class="card-head"><div><div class="stock-name">{name}</div>
                 <div class="ticker">{ticker} · ${row['현재가($)']:.4f} · {row['등락률(%)']:+.1f}%</div></div>
-                <div style="color:{color};font-weight:900">{verdict}<br><small>{analysis['score']}/7</small></div></div>
+                <div style="color:{color};font-weight:900">{verdict}<br><small>{analysis['score']}/8</small></div></div>
                 <div class="grid2" style="margin-top:10px">
                   <div class="data-row"><span class="data-label">매수검토가</span><span class="data-value">${analysis['entry']:.4f}</span></div>
                   <div class="data-row"><span class="data-label">손절가</span><span class="data-value bad">${analysis['stop']:.4f}</span></div>
@@ -1981,15 +2633,25 @@ if has_current_scan and not is_domestic:
                   <div class="data-row"><span class="data-label">3분 MACD</span><span class="data-value">{'상승' if analysis['bullish_macd'] else '약화'}</span></div>
                   <div class="data-row"><span class="data-label">VWAP 위치</span><span class="data-value">{analysis['vwap_gap']:+.1f}%</span></div>
                   <div class="data-row"><span class="data-label">최근 거래량</span><span class="data-value">{analysis['volume_speed']:.1f}배</span></div>
+                  <div class="data-row"><span class="data-label">최근 검증 적중률</span><span class="data-value">{analysis['validation_win_rate']:.1f}%</span></div>
+                  <div class="data-row"><span class="data-label">검증 표본</span><span class="data-value">{analysis['validation_wins']}/{analysis['validation_samples']}회</span></div>
+                  <div class="data-row"><span class="data-label">차트 지지선</span><span class="data-value">${analysis['support']:.4f}</span></div>
+                  <div class="data-row"><span class="data-label">차트 저항선</span><span class="data-value">${analysis['resistance']:.4f}</span></div>
                 </div></div>''',
                 unsafe_allow_html=True,
             )
-        st.caption("🟢는 자동매수가 아니라 수동 진입 검토 알림입니다. 표시가가 달라지면 다시 조회하세요.")
+        st.caption(
+            "🟢는 최소 8회 재생 표본에서 동적 1차 목표가가 손절가보다 "
+            "먼저 도달한 비율이 75% 이상이고 현재 기술조건도 통과한 경우입니다. "
+            "주문 직전에는 메리츠 주문창의 현재가·호가를 다시 확인하세요."
+        )
 
     us_columns = [
-        "종목코드", "종목명", "현재가($)", "등락률(%)", "오늘거래량",
+        "당일거래량순위", "종목코드", "종목명", "현재가($)", "등락률(%)", "오늘거래량",
         "전일대비거래량(%)", "오늘거래대금(백만$)", "VWAP($)",
-        "VWAP위치(%)", "스프레드(%)", "체결강도", "현재판정",
+        "VWAP위치(%)", "스프레드(%)", "체결강도", "진입점수",
+        "진입검토가($)", "손절기준($)", "1차목표($)", "2차목표($)",
+        "시세시간(KST)", "시세출처", "현재판정",
     ]
 
     st.dataframe(
@@ -2007,11 +2669,16 @@ if has_current_scan and not is_domestic:
             "VWAP위치(%)": st.column_config.NumberColumn(format="%.2f%%"),
             "스프레드(%)": st.column_config.NumberColumn(format="%.2f%%"),
             "체결강도": st.column_config.NumberColumn(format="%.1f"),
+            "진입점수": st.column_config.NumberColumn(format="%d점"),
+            "진입검토가($)": st.column_config.NumberColumn(format="$%.4f"),
+            "손절기준($)": st.column_config.NumberColumn(format="$%.4f"),
+            "1차목표($)": st.column_config.NumberColumn(format="$%.4f"),
+            "2차목표($)": st.column_config.NumberColumn(format="$%.4f"),
         },
     )
     if us_meta.get("errors"):
         st.caption("일부 묶음은 재시도 후 제외됐습니다. 표시된 종목은 정상 응답입니다.")
-    if strategy_code != "penny":
+    if strategy_code not in ("penny", "momentum"):
         st.warning("이 표는 후보 압축용이며 매수 신호가 아닙니다. RSI·MACD는 선택 종목 정밀검사에서 확인하세요.")
 
 
