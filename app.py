@@ -1,10 +1,8 @@
-import json
 import time
 
 import pandas as pd
 import requests
 import streamlit as st
-import websocket
 
 
 st.set_page_config(
@@ -14,7 +12,7 @@ st.set_page_config(
 )
 
 st.title("📡 국내 우량주 당일 단타 스캐너")
-st.caption("시가총액 상위 60종목 중 거래가 활발한 종목을 통합시장(KRX+NXT) 실시간 체결로 다시 검사합니다.")
+st.caption("시가총액 상위 60종목 중 거래가 활발한 종목을 통합시장(KRX+NXT) 현재가로 다시 검사합니다.")
 
 
 def load_secret(name):
@@ -27,8 +25,6 @@ def load_secret(name):
 APP_KEY = load_secret("KIS_APP_KEY")
 APP_SECRET = load_secret("KIS_APP_SECRET")
 BASE_URL = "https://openapi.koreainvestment.com:9443"
-WS_URL = "ws://ops.koreainvestment.com:21000/tryitout"
-TOTAL_TR_ID = "H0UNCNT0"
 
 
 def to_int(value):
@@ -65,26 +61,6 @@ def issue_access_token(app_key, app_secret):
     return token
 
 
-@st.cache_data(ttl=82800, show_spinner=False)
-def issue_ws_approval_key(app_key, app_secret):
-    response = requests.post(
-        f"{BASE_URL}/oauth2/Approval",
-        json={
-            "grant_type": "client_credentials",
-            "appkey": app_key,
-            "secretkey": app_secret,
-        },
-        timeout=20,
-    )
-    if response.status_code != 200:
-        raise RuntimeError(f"웹소켓 접속키 발급 실패: HTTP {response.status_code}")
-    data = response.json()
-    approval_key = data.get("approval_key")
-    if not approval_key:
-        raise RuntimeError(data.get("error_description") or data.get("msg1") or "웹소켓 접속키를 받지 못했습니다.")
-    return approval_key
-
-
 def make_headers(token, tr_id):
     return {
         "content-type": "application/json; charset=utf-8",
@@ -97,22 +73,30 @@ def make_headers(token, tr_id):
 
 
 def get_market_cap_ranking(token, market_code):
-    response = requests.get(
-        f"{BASE_URL}/uapi/domestic-stock/v1/ranking/market-cap",
-        headers=make_headers(token, "FHPST01740000"),
-        params={
-            "FID_COND_MRKT_DIV_CODE": "J",
-            "FID_COND_SCR_DIV_CODE": "20174",
-            "FID_DIV_CLS_CODE": "1",
-            "FID_INPUT_ISCD": market_code,
-            "FID_TRGT_CLS_CODE": "0",
-            "FID_TRGT_EXLS_CLS_CODE": "0",
-            "FID_INPUT_PRICE_1": "0",
-            "FID_INPUT_PRICE_2": "0",
-            "FID_VOL_CNT": "0",
-        },
-        timeout=20,
-    )
+    response = None
+    for attempt in range(3):
+        response = requests.get(
+            f"{BASE_URL}/uapi/domestic-stock/v1/ranking/market-cap",
+            headers=make_headers(token, "FHPST01740000"),
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_COND_SCR_DIV_CODE": "20174",
+                "FID_DIV_CLS_CODE": "1",
+                "FID_INPUT_ISCD": market_code,
+                "FID_TRGT_CLS_CODE": "0",
+                "FID_TRGT_EXLS_CLS_CODE": "0",
+                "FID_INPUT_PRICE_1": "0",
+                "FID_INPUT_PRICE_2": "0",
+                "FID_VOL_CNT": "0",
+            },
+            timeout=20,
+        )
+        if response.status_code == 200:
+            break
+        if response.status_code >= 500 and attempt < 2:
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        break
     if response.status_code != 200:
         raise RuntimeError(f"시가총액 조회 실패: HTTP {response.status_code}")
     data = response.json()
@@ -158,81 +142,56 @@ def build_universe(kospi_rows, kosdaq_rows):
     return pd.DataFrame(records)
 
 
-TOTAL_COLUMNS = [
-    "종목코드", "체결시각", "현재가", "전일대비부호", "전일대비", "등락률(%)",
-    "VWAP", "시가", "고가", "저가", "매도1호가", "매수1호가", "체결량",
-    "오늘누적거래량", "오늘누적거래대금", "매도체결건수", "매수체결건수",
-    "순매수체결건수", "체결강도",
-]
+def get_integrated_price(token, ticker):
+    response = requests.get(
+        f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price-2",
+        headers=make_headers(token, "FHPST01010000"),
+        params={
+            "FID_COND_MRKT_DIV_CODE": "UN",
+            "FID_INPUT_ISCD": ticker,
+        },
+        timeout=20,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"{ticker} 통합현재가 조회 실패: HTTP {response.status_code}")
+    data = response.json()
+    if data.get("rt_cd") != "0":
+        raise RuntimeError(f"{ticker}: {data.get('msg1', '통합현재가를 받지 못했습니다.')}")
 
-
-def parse_total_tick(payload):
-    values = payload.split("^")
-    if len(values) < 19:
+    row = data.get("output") or {}
+    price = to_int(row.get("stck_prpr"))
+    volume = to_int(row.get("acml_vol"))
+    trading_value = to_int(row.get("acml_tr_pbmn"))
+    if price <= 0:
         return None
-    row = dict(zip(TOTAL_COLUMNS, values[:19]))
+
     return {
-        "종목코드": row["종목코드"],
-        "체결시각": row["체결시각"],
-        "현재가": to_int(row["현재가"]),
-        "등락률(%)": round(to_float(row["등락률(%)"]), 2),
-        "VWAP": to_float(row["VWAP"]),
-        "시가": to_int(row["시가"]),
-        "고가": to_int(row["고가"]),
-        "저가": to_int(row["저가"]),
-        "매도1호가": to_int(row["매도1호가"]),
-        "매수1호가": to_int(row["매수1호가"]),
-        "오늘누적거래량": to_int(row["오늘누적거래량"]),
-        "오늘누적거래대금": to_int(row["오늘누적거래대금"]),
-        "체결강도": round(to_float(row["체결강도"]), 1),
+        "종목코드": ticker,
+        "현재가": price,
+        "등락률(%)": round(to_float(row.get("prdy_ctrt")), 2),
+        "VWAP": round(trading_value / volume, 2) if volume > 0 else 0,
+        "시가": to_int(row.get("stck_oprc")),
+        "고가": to_int(row.get("stck_hgpr")),
+        "저가": to_int(row.get("stck_lwpr")),
+        "오늘누적거래량": volume,
+        "오늘누적거래대금": trading_value,
+        "전일대비거래량(%)": round(to_float(row.get("prdy_vrss_vol_rate")), 1),
+        "시세기준": "통합(UN)",
     }
 
 
-def collect_integrated_ticks(approval_key, tickers, wait_seconds=7):
-    ws = websocket.create_connection(WS_URL, timeout=10)
-    ticks = {}
-    try:
-        for ticker in tickers:
-            request_data = {
-                "header": {
-                    "approval_key": approval_key,
-                    "custtype": "P",
-                    "tr_type": "1",
-                    "content-type": "utf-8",
-                },
-                "body": {"input": {"tr_id": TOTAL_TR_ID, "tr_key": ticker}},
-            }
-            ws.send(json.dumps(request_data))
-            time.sleep(0.06)
-
-        deadline = time.time() + wait_seconds
-        ws.settimeout(1)
-        while time.time() < deadline and len(ticks) < len(tickers):
-            try:
-                message = ws.recv()
-            except websocket.WebSocketTimeoutException:
-                continue
-
-            if not message:
-                continue
-
-            if message.startswith("0|"):
-                parts = message.split("|", 3)
-                if len(parts) == 4 and parts[1] == TOTAL_TR_ID:
-                    tick = parse_total_tick(parts[3])
-                    if tick and tick["현재가"] > 0:
-                        ticks[tick["종목코드"]] = tick
-                continue
-
-            try:
-                control = json.loads(message)
-                if control.get("header", {}).get("tr_id") == "PINGPONG":
-                    ws.send(message)
-            except Exception:
-                pass
-    finally:
-        ws.close()
-    return ticks
+def collect_integrated_prices(token, tickers):
+    prices = {}
+    errors = []
+    for ticker in tickers:
+        try:
+            item = get_integrated_price(token, ticker)
+            if item:
+                prices[ticker] = item
+        except Exception as error:
+            errors.append(str(error))
+        time.sleep(0.12)
+    return prices, errors
 
 
 def decide_status(row):
@@ -240,20 +199,19 @@ def decide_status(row):
     vwap = row["VWAP"]
     change_pct = row["등락률(%)"]
     trading_value = row["오늘누적거래대금"]
-    strength = row["체결강도"]
     if change_pct >= 12:
         return "🔴 추격금지"
     if change_pct <= -3 or (vwap > 0 and price < vwap):
         return "⚪ 진입금지"
-    if 1 <= change_pct <= 8 and trading_value >= 30_000_000_000 and strength >= 100 and price >= vwap:
+    if 1 <= change_pct <= 8 and trading_value >= 30_000_000_000 and price >= vwap:
         return "🟢 기술지표검사 대상"
     if 0 <= change_pct <= 8 and trading_value >= 20_000_000_000 and price >= vwap:
         return "🟡 눌림대기"
     return "⚪ 조건대기"
 
 
-def merge_realtime(universe, ticks):
-    realtime = pd.DataFrame(ticks.values())
+def merge_realtime(universe, prices):
+    realtime = pd.DataFrame(prices.values())
     if realtime.empty:
         return realtime
     result = universe.merge(realtime, on="종목코드", how="inner")
@@ -269,11 +227,11 @@ if not APP_KEY or not APP_SECRET:
 
 st.success("한국투자증권 API 연결 준비가 완료됐습니다.")
 st.info(
-    "시가총액 순위 선정에는 KRX 자료를 사용하지만, 아래 정밀검사 표의 현재가·VWAP·거래량·거래대금·체결강도는 "
-    "한국투자증권 통합 실시간 체결(H0UNCNT0)만 표시합니다. 통합 체결을 받지 못한 종목은 표에서 제외됩니다."
+    "시가총액 순위 선정에는 KRX 자료를 사용하지만, 아래 표의 현재가·VWAP·거래량·거래대금은 "
+    "한국투자증권 주식현재가 시세2의 통합시장(UN) 값만 표시합니다."
 )
 
-if st.button("통합 실시간 우량주 검사", type="primary"):
+if st.button("통합 현재가 우량주 검사", type="primary"):
     try:
         with st.spinner("시가총액 상위 종목을 선정하는 중입니다..."):
             token = issue_access_token(APP_KEY, APP_SECRET)
@@ -287,22 +245,24 @@ if st.button("통합 실시간 우량주 검사", type="primary"):
 
         targets = universe.nlargest(30, "1차거래대금근사")["종목코드"].tolist()
 
-        with st.spinner("통합시장 실시간 체결을 약 7초 동안 수신하는 중입니다..."):
-            approval_key = issue_ws_approval_key(APP_KEY, APP_SECRET)
-            ticks = collect_integrated_ticks(approval_key, targets)
-            table = merge_realtime(universe, ticks)
+        with st.spinner("통합시장 현재가를 순서대로 조회하는 중입니다..."):
+            prices, price_errors = collect_integrated_prices(token, targets)
+            table = merge_realtime(universe, prices)
 
         if table.empty:
-            st.error("통합 실시간 체결을 받지 못했습니다.")
-            st.warning("장 운영시간인지 확인하고 잠시 후 다시 눌러주세요. KRX 가격으로 임의 대체하지 않았습니다.")
+            st.error("통합시장 현재가를 받지 못했습니다.")
+            if price_errors:
+                st.code("\n".join(price_errors[:3]))
+            st.warning("KRX 가격으로 임의 대체하지 않았습니다.")
             st.stop()
 
-        st.success(f"통합 실시간 체결이 들어온 {len(table)}종목을 정확한 시세로 표시합니다.")
+        st.success(f"통합시장 현재가를 받은 {len(table)}종목을 표시합니다.")
         st.caption("현재가가 메리츠의 '통합' 현재가와 일치하는지 삼성전자 등 한 종목을 먼저 비교해 주세요.")
 
         display_columns = [
-            "시장", "시총순위", "종목코드", "종목명", "체결시각", "현재가", "등락률(%)",
-            "VWAP", "VWAP위치(%)", "오늘누적거래량", "오늘거래대금(억원)", "체결강도", "현재판정",
+            "시장", "시총순위", "종목코드", "종목명", "시세기준", "현재가", "등락률(%)",
+            "VWAP", "VWAP위치(%)", "오늘누적거래량", "전일대비거래량(%)",
+            "오늘거래대금(억원)", "현재판정",
         ]
         st.dataframe(
             table[display_columns],
@@ -314,8 +274,8 @@ if st.button("통합 실시간 우량주 검사", type="primary"):
                 "VWAP": st.column_config.NumberColumn(format="%.0f원"),
                 "VWAP위치(%)": st.column_config.NumberColumn(format="%.2f%%"),
                 "오늘누적거래량": st.column_config.NumberColumn(format="%d주"),
+                "전일대비거래량(%)": st.column_config.NumberColumn(format="%.1f%%"),
                 "오늘거래대금(억원)": st.column_config.NumberColumn(format="%.1f억원"),
-                "체결강도": st.column_config.NumberColumn(format="%.1f"),
             },
         )
 
