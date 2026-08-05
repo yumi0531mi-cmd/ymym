@@ -139,7 +139,7 @@ def build_table(rows):
             row.get("acml_tr_pbmn")
         )
 
-        trading_value_won = trading_value_million * 1_000_000
+        trading_value_won = trading_value_million
 
         if not ticker or not name or price <= 0:
             continue
