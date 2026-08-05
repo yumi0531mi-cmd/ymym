@@ -15,7 +15,7 @@ st.set_page_config(
 )
 
 st.title("📡 국내 당일 단타 스캐너")
-st.caption("📱 모바일 V4 · 우량주/급등주 통합 버전")
+st.caption("📱 모바일 V5 · 분봉 자동 재시도 버전")
 
 st.markdown(
     """
@@ -177,7 +177,7 @@ def get_volume_rank(token, sort_code):
                 "FID_COND_MRKT_DIV_CODE": "J",
                 "FID_COND_SCR_DIV_CODE": "20171",
                 "FID_INPUT_ISCD": "0000",
-                "FID_DIV_CLS_CODE": "0",
+                "FID_DIV_CLS_CODE": "1",
                 "FID_BLNG_CLS_CODE": str(sort_code),
                 # 한투 공식 실행 예제에서 사용하는 값을 그대로 적용합니다.
                 "FID_TRGT_CLS_CODE": "111111111",
@@ -351,12 +351,12 @@ def subtract_one_minute(hhmmss):
         return "000000"
 
 
-def get_minute_page(token, ticker, end_time):
+def get_minute_page(token, ticker, end_time, market_code="UN"):
     response = requests.get(
         f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
         headers=make_headers(token, "FHKST03010200"),
         params={
-            "FID_COND_MRKT_DIV_CODE": "UN",
+            "FID_COND_MRKT_DIV_CODE": market_code,
             "FID_INPUT_ISCD": ticker,
             "FID_INPUT_HOUR_1": end_time,
             "FID_PW_DATA_INCU_YN": "Y",
@@ -372,12 +372,24 @@ def get_minute_page(token, ticker, end_time):
     return data.get("output2") or []
 
 
-def get_recent_minutes(token, ticker, pages=4):
+def get_market_cursor(market_code):
+    now = datetime.now(ZoneInfo("Asia/Seoul"))
+    current = now.strftime("%H%M%S")
+    if market_code == "J":
+        if current < "090000":
+            return "090000"
+        return min(current, "153000")
+    if current < "080000":
+        return "080000"
+    return min(current, "200000")
+
+
+def get_recent_minutes_for_market(token, ticker, market_code, pages=4):
     all_rows = []
-    cursor = "235959"
+    cursor = get_market_cursor(market_code)
 
     for _ in range(pages):
-        rows = get_minute_page(token, ticker, cursor)
+        rows = get_minute_page(token, ticker, cursor, market_code=market_code)
         if not rows:
             break
         all_rows.extend(rows)
@@ -417,6 +429,22 @@ def get_recent_minutes(token, ticker, pages=4):
     minute = minute.drop_duplicates("시간").sort_values("시간").set_index("시간")
     minute = minute[(minute[["시가", "고가", "저가", "종가"]] > 0).all(axis=1)]
     return minute.tail(120)
+
+
+def get_recent_minutes(token, ticker, pages=4):
+    # 먼저 통합시장 분봉을 사용합니다.
+    try:
+        integrated = get_recent_minutes_for_market(token, ticker, "UN", pages=pages)
+    except Exception:
+        integrated = pd.DataFrame()
+    if len(integrated) >= 35:
+        return integrated
+
+    # 통합 분봉이 비었거나 부족하면 오늘 KRX 분봉으로 자동 재시도합니다.
+    krx = get_recent_minutes_for_market(token, ticker, "J", pages=pages)
+    if len(krx) > len(integrated):
+        return krx
+    return integrated
 
 
 def resample_bars(minute, minutes):
@@ -842,13 +870,21 @@ if "scan_table" in st.session_state and st.session_state.get("scan_type") == sca
 
     if st.button("선택 종목 한눈에 검사", type="secondary"):
         selected_row = table.loc[labels[selected_label]]
+        st.session_state.pop("last_analysis", None)
         try:
-            with st.spinner("통합시장 최근 분봉 120개를 불러와 기술지표를 계산하는 중입니다..."):
+            with st.spinner("통합·KRX 최근 분봉을 불러와 기술지표를 계산하는 중입니다..."):
                 token = issue_access_token(APP_KEY, APP_SECRET)
                 minute = get_recent_minutes(token, selected_row["종목코드"], pages=4)
 
             if len(minute) < 35:
-                st.warning(f"분봉이 {len(minute)}개뿐이라 RSI·MACD 판정을 만들지 않았습니다.")
+                now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+                if now_kst.strftime("%H%M%S") < "090000":
+                    st.warning("오늘 장이 시작되기 전입니다. 오전 9시 이후에 다시 검사해 주세요.")
+                else:
+                    st.warning(
+                        f"통합·KRX 오늘 분봉이 {len(minute)}개라 "
+                        "RSI·MACD 판정을 만들지 않았습니다. 다른 종목을 선택해 주세요."
+                    )
                 st.stop()
 
             analysis = analyze_selected_stock(minute, selected_row)
