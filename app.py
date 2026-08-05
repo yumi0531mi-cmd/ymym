@@ -490,7 +490,7 @@ def get_domestic_triple_rank_rows(token):
     }
     grouped = {name: [] for name in jobs}
     errors = []
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(job): name for name, job in jobs.items()}
         for future in as_completed(futures):
             name = futures[future]
@@ -2755,38 +2755,52 @@ def analyze_us_penny_stock(minute, quote_row):
                 "result": validation,
             }
     validation_ok = (
-        validation["samples"] >= 20
-        and validation["full_success_rate"] >= 75
-        and validation["recent_success_rate"] >= 70
-        and validation["wilson_lower_bound"] >= 55
+        validation["samples"] >= 8
+        and validation["full_success_rate"] >= 55
+        and validation["recent_success_rate"] >= 50
     )
 
-    green_score = max(12, len(checks) - 3)
-    raw_setup_ok = not overheated and score >= green_score and mandatory and validation_ok
+    # 급등주 5분 스캘프는 교집합·15분 추세·과거 75% 승률을 절대 잠금조건으로 쓰지 않는다.
+    # 실시간성, 유동성, 스프레드, VWAP, 1·3분 방향을 중심으로 공격형 진입을 판정한다.
+    fresh_ok = quote_age <= 8.0
+    execution_ok = liquidity_ok and 0 < spread_pct <= maximum_spread * 1.35
+    momentum_ok = trend_1 and (bullish_macd or macd_improving(one)) and close_rising
+    location_ok = -1.0 <= vwap_gap <= 6.0 and -9.0 <= pullback_pct <= 0.5
+    strength_ok = strength == 0 or strength >= 105
+    volume_live = volume_speed >= 0.8 or day_amount_million >= 3.0
+    aggressive_setup = fresh_ok and execution_ok and momentum_ok and location_ok and strength_ok and volume_live
+    premium_setup = aggressive_setup and trend_3 and volume_speed >= 1.1 and spread_pct <= maximum_spread
+
+    # +150% 이상·VWAP 과도 이격·극단적인 호가 공백만 강제 회피한다.
+    hard_overheat = change_pct >= 150 or vwap_gap > 15 or rsi_1 >= 92 or spread_pct > maximum_spread * 2.2
     signal_confirmed, confirmation_hits = confirm_us_signal(
         quote_row.get("종목코드", ""),
-        raw_setup_ok,
+        premium_setup,
         planned_entry,
     )
-    if overheated:
-        verdict = "🔴 추격금지"
-    elif raw_setup_ok and signal_confirmed:
-        verdict = "🟢 눌림 재돌파 확인"
-    elif raw_setup_ok:
-        verdict = "🟡 1차 확인·다음 갱신 필요"
-    elif score >= green_score and mandatory and validation["samples"] < 20:
-        verdict = "🟡 과거표본 부족·진입보류"
-    elif score >= green_score and mandatory:
-        verdict = "🟡 과거재생 75% 미만·보류"
-    elif not triple_ok:
-        verdict = "⚪ 삼중교집합 아님"
-    elif score >= 3:
-        verdict = "🟡 눌림대기"
+    if hard_overheat:
+        verdict = "🔴 과열·급락위험"
+    elif premium_setup and signal_confirmed:
+        verdict = "🟢 5분 스캘프 진입"
+    elif premium_setup:
+        verdict = "🟢 공격형 진입 가능"
+    elif aggressive_setup:
+        verdict = "🟡 눌림 진입대기"
+    elif fresh_ok and execution_ok and (trend_1 or bullish_macd):
+        verdict = "🟡 돌파 확인대기"
     else:
-        verdict = "⚪ 진입금지"
+        verdict = "⚪ 조건 미달"
 
     # 매수는 마지막 체결가가 아닌 실제 매도 1호가를 기준으로 계획한다.
     entry = planned_entry
+    # 5분 안에 체결 가능한 목표를 우선한다. ATR 목표가가 너무 멀거나 가까우면 범위를 제한한다.
+    scalp_target1 = entry * (1.018 if price >= 5 else 1.025 if price >= 1 else 1.035)
+    scalp_target2 = entry * (1.035 if price >= 5 else 1.05 if price >= 1 else 1.075)
+    target1 = max(entry * 1.012, min(target1, scalp_target1))
+    target2 = max(target1 * 1.008, min(target2, scalp_target2))
+    # 초단타 손절폭은 가격대별 최대 약 2.5~4.5%로 제한한다.
+    max_stop_pct = 0.025 if price >= 5 else 0.032 if price >= 1 else 0.045
+    stop = max(stop, entry * (1 - max_stop_pct))
     return {
         "frames": frames,
         "verdict": verdict,
@@ -3371,7 +3385,7 @@ def forecast_us_position_flow(minute, quote_row, position):
     }
 
 
-def analyze_us_penny_candidates(token, table, session_mode, limit=3, pages=3):
+def analyze_us_penny_candidates(token, table, session_mode, limit=12, pages=3):
     """삼중교집합을 우선하되 카드가 비지 않도록 상위 관찰주까지 분석한다."""
     eligible = table.copy()
     if "삼중교집합" in eligible.columns:
@@ -3406,13 +3420,12 @@ def analyze_us_penny_candidates(token, table, session_mode, limit=3, pages=3):
                 results.append({"row": {}, "analysis": None, "error": str(error)})
 
     verdict_order = {
-        "🟢 눌림 재돌파 확인": 0,
-        "🟡 과거표본 부족·진입보류": 1,
-        "🟡 과거재생 75% 미만·보류": 2,
-        "🟡 눌림대기": 3,
-        "⚪ 삼중교집합 아님": 4,
-        "⚪ 진입금지": 4,
-        "🔴 추격금지": 5,
+        "🟢 5분 스캘프 진입": 0,
+        "🟢 공격형 진입 가능": 1,
+        "🟡 눌림 진입대기": 2,
+        "🟡 돌파 확인대기": 3,
+        "⚪ 조건 미달": 4,
+        "🔴 과열·급락위험": 5,
     }
     results.sort(key=lambda item: (
         verdict_order.get((item.get("analysis") or {}).get("verdict"), 9),
@@ -3481,9 +3494,9 @@ def render_us_reference_card(item):
         replay = 0.0
         warning = item.get("error") or "분봉 계산 대기"
 
-    if quote_age > 3:
-        verdict = "🔴 시세 갱신 필요"
-    badge = "🟢 검토" if verdict.startswith("🟢") else "🔴 금지" if verdict.startswith("🔴") else "🟡 대기"
+    if quote_age > 8:
+        verdict = "🟡 시세 갱신 필요"
+    badge = "🟢 진입" if verdict.startswith("🟢") else "🔴 회피" if verdict.startswith("🔴") else "🟡 대기"
     verdict_color = "#61df88" if verdict.startswith("🟢") else "#ff858b" if verdict.startswith("🔴") else "#ffd45d"
     price_text = f"${price:.4f}" if price < 1 else f"${price:,.2f}"
     cap_text = format_compact_number(market_cap, money=True) if market_cap > 0 else "-"
@@ -3512,17 +3525,17 @@ def render_us_reference_card(item):
           <div class="metric"><span>거래대금</span><b>{amount_text}</b></div>
           <div class="metric"><span>시총(API)</span><b>{cap_text}</b></div>
           <div class="metric"><span>호가 차이</span><b>{spread:.2f}%</b></div>
-          <div class="metric"><span>순위 교집합</span><b>{overlap}/3</b></div>
+          <div class="metric"><span>순위 중첩</span><b>{overlap}/4</b></div>
           <div class="metric"><span>RSI 1/3/5</span><b>{rsi}</b></div>
           <div class="metric"><span>MACD / 추세</span><b>{macd} · {trend}</b></div>
           <div class="metric"><span>1차 필터</span><b>{filter_score}/100</b></div>
           <div class="metric"><span>분봉 재생률</span><b>{replay:.1f}%</b></div>
         </div>
-        <div class="trade-title">매매 레벨 · 녹색 검토일 때만 사용</div>
+        <div class="trade-title">5분 스캘프 레벨 · 녹색 진입 우선</div>
         <div class="trade-grid">
-          <div class="trade-box"><span>진입가 상한</span><b class="entry">{usd(entry)}</b></div>
-          <div class="trade-box"><span>1차 매도가</span><b class="target">{usd(target1)}</b></div>
-          <div class="trade-box"><span>2차 매도가</span><b class="target">{usd(target2)}</b></div>
+          <div class="trade-box"><span>진입가</span><b class="entry">{usd(entry)}</b></div>
+          <div class="trade-box"><span>5분 1차 익절</span><b class="target">{usd(target1)}</b></div>
+          <div class="trade-box"><span>연장 2차 익절</span><b class="target">{usd(target2)}</b></div>
           <div class="trade-box"><span>지지선</span><b style="color:#ffd45d">{usd(support)}</b></div>
           <div class="trade-box"><span>손절가</span><b class="stop">{usd(stop)}</b></div>
           <div class="trade-box"><span>저항선</span><b>{usd(resistance)}</b></div>
@@ -4110,8 +4123,8 @@ if has_current_scan and not is_domestic:
               <div class="data-row"><span class="data-label">현재 수익률</span><span class="data-value">{return_pct:+.2f}%</span></div>
               <div class="data-row"><span class="data-label">고정 손절가</span><span class="data-value bad">${locked_stop:.4f}</span></div>
               <div class="data-row"><span class="data-label">현재 실행 손절가</span><span class="data-value bad">${execution_stop:.4f}</span></div>
-              <div class="data-row"><span class="data-label">고정 1차 매도가</span><span class="data-value ok">${locked_target1:.4f}</span></div>
-              <div class="data-row"><span class="data-label">고정 2차 매도가</span><span class="data-value ok">${locked_target2:.4f}</span></div>
+              <div class="data-row"><span class="data-label">고정 5분 1차 익절</span><span class="data-value ok">${locked_target1:.4f}</span></div>
+              <div class="data-row"><span class="data-label">고정 연장 2차 익절</span><span class="data-value ok">${locked_target2:.4f}</span></div>
               <div class="data-row"><span class="data-label">진입 시각</span><span class="data-value">{html.escape(str(active_position['진입시각']))}</span></div>
               <div class="data-row"><span class="data-label">보유 시간</span><span class="data-value">{holding_minutes}분</span></div>
               <div class="data-row"><span class="data-label">현재 차트흐름</span><span class="data-value">{html.escape(str(flow_state))}</span></div>
@@ -4123,7 +4136,7 @@ if has_current_scan and not is_domestic:
               <div class="data-row"><span class="data-label">10분 후 방향</span><span class="data-value">{html.escape(str(flow_10))}</span></div>
             </div></div>'''
         )
-        st.caption("스캐너를 다시 검색해도 이 진입가·손절가·1·2차 매도가는 바뀌지 않습니다.")
+        st.caption("스캐너를 다시 검색해도 이 진입가·손절가·1·연장 2차 익절는 바뀌지 않습니다.")
         flow_col, close_col = st.columns(2)
         if flow_col.button("📈 보유 종목 흐름 재분석", use_container_width=True):
             try:
@@ -4227,9 +4240,9 @@ if has_current_scan and not is_domestic:
         try:
             token = issue_access_token(APP_KEY, APP_SECRET)
             session_mode, _, _ = resolve_us_session(us_session_choice)
-            with st.spinner("상위 3종목의 지지·저항·ATR·분봉조건 재생률을 검증하는 중..."):
+            with st.spinner("상위 12종목의 1·3·5분 모멘텀과 5분 스캘프 가격을 계산하는 중..."):
                 st.session_state["us_penny_signals"] = analyze_us_penny_candidates(
-                    token, table, session_mode, limit=3, pages=3
+                    token, table, session_mode, limit=12, pages=3
                 )
             st.toast("매수타점 정밀검사 완료")
         except Exception as error:
@@ -4243,12 +4256,12 @@ if has_current_scan and not is_domestic:
         if not signal_items:
             signal_items = [
                 {"row": row.to_dict(), "analysis": None, "error": "차트 계산 대기"}
-                for _, row in table.head(3).iterrows()
+                for _, row in table.head(12).iterrows()
             ]
         labels = {
             f"{item['row'].get('종목명') or item['row'].get('종목코드')} · "
             f"{item['row'].get('종목코드')}": index
-            for index, item in enumerate(signal_items[:3])
+            for index, item in enumerate(signal_items[:12])
         }
         with simple_card_slot.container():
             selected_label = st.selectbox(
