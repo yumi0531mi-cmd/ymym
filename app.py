@@ -1,11 +1,14 @@
 import html
 import json
 import math
+import os
 import re
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -167,24 +170,133 @@ def to_float(value):
         return 0.0
 
 
-@st.cache_data(ttl=82800, show_spinner=False)
+def response_json(response, label="API"):
+    """HTML/빈 응답이 와도 JSONDecodeError 대신 읽기 쉬운 오류를 낸다."""
+    try:
+        return response.json()
+    except ValueError as error:
+        preview = (response.text or "").strip().replace("\n", " ")[:180]
+        raise RuntimeError(
+            f"{label} 응답이 JSON이 아닙니다 (HTTP {response.status_code}): {preview or '빈 응답'}"
+        ) from error
+
+
+TOKEN_CACHE_DIR = Path(os.getenv("KIS_TOKEN_CACHE_DIR", Path.home() / ".kis_scanner"))
+TOKEN_CACHE_FILE = TOKEN_CACHE_DIR / "access_token.json"
+TOKEN_LOCK_FILE = TOKEN_CACHE_DIR / "access_token.lock"
+TOKEN_REUSE_SECONDS = 23 * 60 * 60
+
+
+def _read_saved_access_token():
+    """앱 재실행 후에도 같은 토큰을 재사용한다."""
+    try:
+        data = json.loads(TOKEN_CACHE_FILE.read_text(encoding="utf-8"))
+        token = str(data.get("access_token") or "").strip()
+        issued_at = float(data.get("issued_at") or 0)
+        age = time.time() - issued_at
+        if token and 0 <= age < TOKEN_REUSE_SECONDS:
+            return token
+    except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return ""
+
+
+def _save_access_token(token):
+    TOKEN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "access_token": token,
+        "issued_at": time.time(),
+        "issued_at_kst": datetime.now(SEOUL).isoformat(timespec="seconds"),
+    }
+    fd, temp_name = tempfile.mkstemp(prefix="access_token_", suffix=".tmp", dir=TOKEN_CACHE_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_name, TOKEN_CACHE_FILE)
+        try:
+            os.chmod(TOKEN_CACHE_FILE, 0o600)
+        except OSError:
+            pass
+    finally:
+        try:
+            if os.path.exists(temp_name):
+                os.remove(temp_name)
+        except OSError:
+            pass
+
+
+def _acquire_token_lock(wait_seconds=15):
+    TOKEN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        try:
+            fd = os.open(str(TOKEN_LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
+            os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                if time.time() - TOKEN_LOCK_FILE.stat().st_mtime > 30:
+                    TOKEN_LOCK_FILE.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.2)
+    return False
+
+
+def _release_token_lock():
+    try:
+        TOKEN_LOCK_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def issue_access_token(app_key, app_secret):
-    response = HTTP.post(
-        f"{BASE_URL}/oauth2/tokenP",
-        json={
-            "grant_type": "client_credentials",
-            "appkey": app_key,
-            "appsecret": app_secret,
-        },
-        timeout=10,
-    )
-    if response.status_code != 200:
-        raise RuntimeError(f"접근토큰 발급 실패: HTTP {response.status_code}")
-    data = response.json()
-    token = data.get("access_token")
-    if not token:
-        raise RuntimeError(data.get("error_description") or data.get("msg1") or "접근토큰을 받지 못했습니다.")
-    return token
+    """접근토큰은 디스크에 저장하고 23시간 동안 절대 재발급하지 않는다."""
+    saved = _read_saved_access_token()
+    if saved:
+        return saved
+
+    locked = _acquire_token_lock()
+    if not locked:
+        saved = _read_saved_access_token()
+        if saved:
+            return saved
+        raise RuntimeError("접근토큰 발급 잠금 대기 시간이 초과되었습니다. 잠시 후 새로고침하세요.")
+
+    try:
+        # 다른 실행 프로세스가 먼저 발급했을 수 있으므로 잠금 후 다시 확인한다.
+        saved = _read_saved_access_token()
+        if saved:
+            return saved
+
+        response = HTTP.post(
+            f"{BASE_URL}/oauth2/tokenP",
+            json={
+                "grant_type": "client_credentials",
+                "appkey": app_key,
+                "appsecret": app_secret,
+            },
+            timeout=10,
+        )
+        if response.status_code != 200:
+            data = response_json(response, "접근토큰")
+            raise RuntimeError(
+                data.get("error_description") or data.get("msg1")
+                or f"접근토큰 발급 실패: HTTP {response.status_code}"
+            )
+        data = response_json(response, "접근토큰")
+        token = str(data.get("access_token") or "").strip()
+        if not token:
+            raise RuntimeError(data.get("error_description") or data.get("msg1") or "접근토큰을 받지 못했습니다.")
+        _save_access_token(token)
+        return token
+    finally:
+        _release_token_lock()
 
 
 def make_headers(token, tr_id):
@@ -213,7 +325,7 @@ def issue_ws_approval_key(app_key, app_secret):
     )
     if response.status_code != 200:
         raise RuntimeError(f"실시간 접속키 발급 실패: HTTP {response.status_code}")
-    data = response.json()
+    data = response_json(response)
     approval_key = data.get("approval_key")
     if not approval_key:
         raise RuntimeError(data.get("msg1") or "실시간 접속키를 받지 못했습니다.")
@@ -247,7 +359,7 @@ def get_market_cap_ranking(token, market_code):
         break
     if response.status_code != 200:
         raise RuntimeError(f"시가총액 조회 실패: HTTP {response.status_code}")
-    data = response.json()
+    data = response_json(response)
     if data.get("rt_cd") != "0":
         raise RuntimeError(data.get("msg1", "시가총액 순위를 받지 못했습니다."))
     return data.get("output", [])
@@ -289,7 +401,7 @@ def get_volume_rank(token, sort_code):
         status = response.status_code if response is not None else "응답 없음"
         raise RuntimeError(f"거래량 순위 조회 실패: HTTP {status}")
 
-    data = response.json()
+    data = response_json(response)
     if data.get("rt_cd") != "0":
         raise RuntimeError(data.get("msg1", "거래량 순위를 받지 못했습니다."))
     return data.get("output", [])
@@ -316,7 +428,7 @@ def get_domestic_rank(token, endpoint, tr_id, params, label):
         status = response.status_code if response is not None else "응답 없음"
         raise RuntimeError(f"{label} 조회 실패: HTTP {status}")
 
-    data = response.json()
+    data = response_json(response)
     if data.get("rt_cd") != "0":
         raise RuntimeError(data.get("msg1", f"{label}을 받지 못했습니다."))
     return data.get("output") or []
@@ -412,7 +524,7 @@ def get_us_ranking(token, endpoint, tr_id, params):
         status = response.status_code if response is not None else "응답 없음"
         raise RuntimeError(f"미국주식 순위 조회 실패: HTTP {status}")
 
-    data = response.json()
+    data = response_json(response)
     if data.get("rt_cd") != "0":
         raise RuntimeError(data.get("msg1", "미국주식 순위를 받지 못했습니다."))
     return data.get("output2") or []
@@ -746,7 +858,7 @@ def get_us_penny_search_rows(token, exchange):
         status = response.status_code if response is not None else "응답 없음"
         raise RuntimeError(f"한투 동전주 조건검색 HTTP {status}")
 
-    data = response.json()
+    data = response_json(response)
     if data.get("rt_cd") != "0":
         raise RuntimeError(data.get("msg1") or "한투 동전주 조건검색 실패")
 
@@ -1208,7 +1320,7 @@ def get_us_multiple_prices(token, pairs, session_mode):
         if response.status_code != 200:
             errors.append(f"복수종목 시세 HTTP {response.status_code}")
             continue
-        data = response.json()
+        data = response_json(response)
         if data.get("rt_cd") != "0":
             errors.append(data.get("msg1") or "복수종목 시세 조회 실패")
             continue
@@ -1245,7 +1357,7 @@ def fetch_yahoo_screener(screen_id, max_price=0):
         timeout=4,
     )
     response.raise_for_status()
-    data = response.json()
+    data = response_json(response)
     result = ((data.get("finance") or {}).get("result") or [{}])[0]
     pairs = []
     for quote in result.get("quotes") or []:
@@ -2076,7 +2188,7 @@ def get_integrated_price(token, ticker):
     )
     if response.status_code != 200:
         raise RuntimeError(f"{ticker} 통합현재가 조회 실패: HTTP {response.status_code}")
-    data = response.json()
+    data = response_json(response)
     if data.get("rt_cd") != "0":
         raise RuntimeError(f"{ticker}: {data.get('msg1', '통합현재가를 받지 못했습니다.')}")
 
@@ -2157,7 +2269,7 @@ def get_minute_page(token, ticker, end_time, market_code="UN"):
     )
     if response.status_code != 200:
         raise RuntimeError(f"{ticker} 분봉 조회 실패: HTTP {response.status_code}")
-    data = response.json()
+    data = response_json(response)
     if data.get("rt_cd") != "0":
         raise RuntimeError(data.get("msg1", f"{ticker} 분봉을 받지 못했습니다."))
     return data.get("output2") or []
@@ -2276,7 +2388,7 @@ def get_us_recent_minutes(token, exchange, ticker, session_mode, pages=3):
             if not records:
                 raise RuntimeError(f"{ticker} 미국 분봉 조회 실패: HTTP {response.status_code}")
             break
-        data = response.json()
+        data = response_json(response)
         if data.get("rt_cd") != "0":
             if not records:
                 raise RuntimeError(data.get("msg1") or f"{ticker} 미국 분봉을 받지 못했습니다.")
@@ -3697,6 +3809,8 @@ def merge_realtime(universe, prices, scanner_type="quality"):
         column for column in ("삼중교집합", "교집합수", "체결강도", "오늘누적거래대금")
         if column in result.columns
     ]
+    if not sort_columns:
+        return result.reset_index(drop=True)
     return result.sort_values(sort_columns, ascending=[False] * len(sort_columns)).reset_index(drop=True)
 
 
@@ -3891,10 +4005,16 @@ if has_current_scan and not is_domestic:
     # 화면을 가만히 보고 있어도 시세 나이는 계속 증가해야 한다.
     if "수신타임스탬프" in table.columns:
         now_epoch = time.time()
-        table["시세나이(초)"] = table["수신타임스탬프"].apply(
-            lambda value: round(max(0.0, now_epoch - float(value)), 2)
-            if float(value or 0) > 0 else 999.0
-        )
+        def _safe_quote_age(value):
+            try:
+                timestamp = float(value)
+                if not math.isfinite(timestamp) or timestamp <= 0:
+                    return 999.0
+                return round(max(0.0, now_epoch - timestamp), 2)
+            except (TypeError, ValueError):
+                return 999.0
+
+        table["시세나이(초)"] = table["수신타임스탬프"].apply(_safe_quote_age)
     us_meta = st.session_state.get("us_scan_meta", {})
     us_kind = "우량주" if strategy_code == "quality" else "동전주 급등" if strategy_code == "penny" else "급등주"
     if not MOBILE_SIMPLE_UI:
@@ -4352,8 +4472,9 @@ if has_current_scan and not is_domestic:
     ]
 
     if not MOBILE_SIMPLE_UI:
+        safe_us_columns = [column for column in us_columns if column in table.columns]
         st.dataframe(
-            table[us_columns],
+            table[safe_us_columns],
             use_container_width=True,
             hide_index=True,
             height=500,
@@ -4486,8 +4607,9 @@ if has_current_scan and is_domestic:
     table = st.session_state["scan_table"]
     with st.expander(f"전체 {len(table)}종목 표 보기"):
         st.caption("현재가·VWAP·거래량·거래대금은 한국투자증권 통합시장(UN) 값입니다.")
+        safe_display_columns = [column for column in display_columns if column in table.columns]
         st.dataframe(
-            table[display_columns],
+            table[safe_display_columns],
             use_container_width=True,
             hide_index=True,
             column_config={
