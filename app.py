@@ -15,7 +15,7 @@ st.set_page_config(
 )
 
 st.title("📡 국내 당일 단타 스캐너")
-st.caption("📱 모바일 V3 · 우량주/급등주 통합 버전")
+st.caption("📱 모바일 V4 · 우량주/급등주 통합 버전")
 
 st.markdown(
     """
@@ -172,7 +172,9 @@ def get_volume_rank(token, sort_code):
             f"{BASE_URL}/uapi/domestic-stock/v1/quotations/volume-rank",
             headers=make_headers(token, "FHPST01710000"),
             params={
-                "FID_COND_MRKT_DIV_CODE": "UN",
+                # 거래량 순위 서버는 현재 J(KRX)만 정상 처리합니다.
+                # 선정된 후보의 현재가는 아래에서 다시 UN(통합)으로 조회합니다.
+                "FID_COND_MRKT_DIV_CODE": "J",
                 "FID_COND_SCR_DIV_CODE": "20171",
                 "FID_INPUT_ISCD": "0000",
                 "FID_DIV_CLS_CODE": "0",
@@ -686,7 +688,10 @@ def render_compact_card(saved):
       <div class="footnote">갱신 {updated_at} · 자동매수 신호가 아닙니다. 실제 주문 전 메리츠 통합호가와 시장 상태를 확인하세요.</div>
     </div>
     """
-    st.markdown(card_html, unsafe_allow_html=True)
+    # 줄바꿈·들여쓰기를 제거해 Streamlit이 HTML 일부를
+    # 코드 상자로 오인하지 못하게 합니다.
+    compact_html = "".join(line.strip() for line in card_html.splitlines())
+    st.markdown(compact_html, unsafe_allow_html=True)
 
 
 def decide_status(row):
