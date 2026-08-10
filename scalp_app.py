@@ -106,6 +106,8 @@ def verdict_text(item: dict) -> tuple[str, str]:
     verdict = str(item.get("chart_verdict", "WAIT"))
     if verdict == "BUY_READY" and item.get("entry_checks_passed"):
         return "🟢 매수 검토", "success"
+    if verdict == "BUY_READY":
+        return "🟡 차트 매수 준비·위험확인 필요", "warning"
     if verdict == "NO_ENTRY":
         return "🔴 매수 금지·매도 검토", "error"
     return "🟡 대기", "warning"
@@ -249,6 +251,9 @@ if st.session_state.get("scalp_error"):
 if not latest:
     st.stop()
 
+if latest.get("intraday_fallback"):
+    st.warning("KIS 미국 분봉이 부족하여 Yahoo 보조 분봉을 표시합니다. 이때는 실시간 매수 신호를 내지 않고 관찰만 합니다.")
+
 price = float(latest.get("price", 0) or 0)
 change = float(latest.get("change_percent", 0) or 0)
 label, level = verdict_text(latest)
@@ -302,6 +307,7 @@ with st.expander("진입 전 뉴스·공시 위험을 지금 한 번 확인"):
             try:
                 checked = scanner().analyze_candidate(selected_row, mode)
                 st.session_state["scalp_risk_check"] = checked
+                st.session_state["scalp_latest"] = checked
             except Exception as error:
                 st.error(str(error))
     checked = st.session_state.get("scalp_risk_check")
