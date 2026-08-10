@@ -22,6 +22,36 @@ from streamlit_autorefresh import st_autorefresh
 
 KST = timezone(timedelta(hours=9), name="KST")
 
+KR_UNIVERSE = [
+    {"ticker":"005930","name":"삼성전자","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"000660","name":"SK하이닉스","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"035420","name":"NAVER","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"005380","name":"현대차","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"069500","name":"KODEX 200","exchange":"KR","asset_type":"ETF"},
+    {"ticker":"102110","name":"TIGER 200","exchange":"KR","asset_type":"ETF"},
+    {"ticker":"396500","name":"TIGER 반도체TOP10","exchange":"KR","asset_type":"ETF"},
+    {"ticker":"122630","name":"KODEX 레버리지","exchange":"KR","asset_type":"레버리지 ETF"},
+    {"ticker":"123320","name":"TIGER 레버리지","exchange":"KR","asset_type":"레버리지 ETF"},
+    {"ticker":"488080","name":"TIGER 반도체TOP10레버리지","exchange":"KR","asset_type":"레버리지 ETF"},
+    {"ticker":"423920","name":"TIGER 미국필라델피아반도체레버리지(합성)","exchange":"KR","asset_type":"레버리지 ETF"},
+]
+US_UNIVERSE = [
+    {"ticker":"AAPL","name":"애플","exchange":"NASDAQ","asset_type":"우량주"},
+    {"ticker":"MSFT","name":"마이크로소프트","exchange":"NASDAQ","asset_type":"우량주"},
+    {"ticker":"NVDA","name":"엔비디아","exchange":"NASDAQ","asset_type":"우량주"},
+    {"ticker":"AMZN","name":"아마존","exchange":"NASDAQ","asset_type":"우량주"},
+    {"ticker":"META","name":"메타","exchange":"NASDAQ","asset_type":"우량주"},
+    {"ticker":"GOOGL","name":"알파벳","exchange":"NASDAQ","asset_type":"우량주"},
+    {"ticker":"TSLA","name":"테슬라","exchange":"NASDAQ","asset_type":"우량주"},
+    {"ticker":"SPY","name":"S&P500 ETF","exchange":"AMEX","asset_type":"ETF"},
+    {"ticker":"QQQ","name":"나스닥100 ETF","exchange":"NASDAQ","asset_type":"ETF"},
+    {"ticker":"SMH","name":"반도체 ETF","exchange":"NASDAQ","asset_type":"ETF"},
+    {"ticker":"SOXX","name":"필라델피아 반도체 ETF","exchange":"NASDAQ","asset_type":"ETF"},
+    {"ticker":"SOXL","name":"반도체 3배 레버리지 ETF","exchange":"AMEX","asset_type":"레버리지 ETF"},
+    {"ticker":"TQQQ","name":"나스닥100 3배 레버리지 ETF","exchange":"NASDAQ","asset_type":"레버리지 ETF"},
+    {"ticker":"UPRO","name":"S&P500 3배 레버리지 ETF","exchange":"AMEX","asset_type":"레버리지 ETF"},
+]
+
 
 def _load_bundled_sources() -> dict:
     source_path = Path(__file__).with_name("app.py")
@@ -172,32 +202,19 @@ with st.sidebar:
     st.header("초단타 설정")
     market = st.radio("시장", ["국내", "미국"], horizontal=True)
     mode = "국내 30분 1% 타점" if market == "국내" else "미국 30분 1% 타점"
-    exchange = "KR" if market == "국내" else st.selectbox("미국 거래소", ["NASDAQ", "NYSE", "AMEX"])
+    exchange = "KR" if market == "국내" else "자동 판별"
     minimum_score = st.slider("최소 점수", 30, 90, 50, 5)
     manual_ticker = st.text_input("종목코드 직접 입력", placeholder="005930 또는 AAPL").strip().upper()
     focus_only = st.toggle("선택 종목 1초 집중", True)
-    refresh_candidates = st.button("🔄 후보 즉시 검색", use_container_width=True)
-    st.caption("뉴스·FDA·SEC 전체 검색은 이 앱에서 자동 실행하지 않습니다.")
+    st.caption("분석 대상: 우량주·ETF·레버리지 ETF")
 
 now = time.time()
-candidate_key = f"scalp_candidates::{mode}"
-candidate_time_key = f"scalp_candidates_at::{mode}"
-candidate_due = (not focus_only) and now - float(st.session_state.get(candidate_time_key, 0)) >= 30
-if refresh_candidates or candidate_key not in st.session_state or candidate_due:
-    try:
-        rows = scanner().candidates(mode)
-        # Cheap first-stage ranking only. Detailed minute analysis waits until selection.
-        rows = [dict(row) for row in rows[:20]]
-        st.session_state[candidate_key] = rows
-        st.session_state[candidate_time_key] = now
-    except Exception as error:
-        st.session_state["candidate_error"] = str(error)
-
-candidates = list(st.session_state.get(candidate_key, []))
-options = []
+options = [dict(row) for row in (KR_UNIVERSE if market == "국내" else US_UNIVERSE)]
 if manual_ticker:
-    options.append({"ticker": manual_ticker, "name": manual_ticker, "exchange": exchange})
-options.extend(candidates)
+    known = next((dict(row) for row in options if row["ticker"] == manual_ticker), None)
+    options.insert(0, known or {"ticker": manual_ticker, "name": manual_ticker,
+                               "exchange": "KR" if market == "국내" else "NASDAQ",
+                               "asset_type": "직접 입력"})
 dedup = {}
 for row in options:
     ticker = str(row.get("ticker", "")).upper()
@@ -205,19 +222,15 @@ for row in options:
         dedup[ticker] = row
 options = list(dedup.values())
 
-if not options:
-    st.warning("현재 후보가 없습니다. 후보 즉시 검색을 눌러주세요.")
-    st.stop()
-
 selected_ticker = st.selectbox(
     "집중 분석할 종목",
     [str(row.get("ticker", "")) for row in options],
     format_func=lambda ticker: next(
-        (f"{ticker} · {row.get('name', ticker)} · {float(row.get('screen_change', 0) or 0):+.2f}%"
+        (f"{ticker} · {row.get('name', ticker)} · {row.get('asset_type', '')}"
          for row in options if str(row.get("ticker", "")) == ticker), ticker),
 )
 selected_row = next(row for row in options if str(row.get("ticker", "")) == selected_ticker)
-selected_row.setdefault("exchange", exchange)
+selected_row.setdefault("exchange", "KR" if market == "국내" else "NASDAQ")
 
 if st.session_state.get("scalp_selected") != selected_ticker:
     st.session_state["scalp_selected"] = selected_ticker
@@ -272,11 +285,11 @@ elif level == "error":
 else:
     st.write(latest.get("entry_trigger", "VWAP 지지와 거래량 재증가를 기다리세요."))
 
+f5 = float(latest.get("forecast_5m", 0) or 0)
 f10 = float(latest.get("forecast_10m", 0) or 0)
 f30 = float(latest.get("forecast_30m", 0) or 0)
-f20 = (f10 + f30) / 2
 forecast_cols = st.columns(3)
-for column, minutes, forecast in zip(forecast_cols, (10, 20, 30), (f10, f20, f30)):
+for column, minutes, forecast in zip(forecast_cols, (5, 10, 30), (f5, f10, f30)):
     expected = price * (1 + forecast / 100)
     uncertainty = max(0.20, abs(forecast) * 0.50)
     low = price * (1 + (forecast - uncertainty) / 100)
@@ -289,15 +302,29 @@ for column, minutes, forecast in zip(forecast_cols, (10, 20, 30), (f10, f20, f30
     column.caption(f"예상 범위 {fmt(low)}~{fmt(high)}")
 
 target_probability = int(latest.get("target1_probability", 0) or 0)
-if level == "success" and f10 > 0 and f20 > 0 and f30 > 0:
+if level == "success" and f5 > 0 and f10 > 0 and f30 > 0:
     st.success(
-        f"🚦 진입 조건 통과 · 10·20·30분 방향 일치 · "
+        f"🚦 매수 전 조건 통과 · 5·10·30분 방향 일치 · "
         f"1차 목표 도달 추정 {target_probability}%"
     )
-elif f10 < 0 or f20 < 0:
+elif f5 < 0 or f10 < 0 or f30 < 0:
     st.error("⛔ 단기 예상이 약세입니다. 신규 진입하지 마세요.")
 else:
     st.warning("⏳ 시간대별 방향이 일치하지 않습니다. 진입을 기다리세요.")
+
+st.subheader("매수 전 +1% · +2% · +3% 목표 점검")
+goal_cols = st.columns(3)
+upside = max(f5, f10, f30)
+for column, goal in zip(goal_cols, (1, 2, 3)):
+    goal_price = price * (1 + goal / 100)
+    if level == "success" and min(f5, f10, f30) > 0 and upside >= goal:
+        status = "도달 가능 구간"
+    elif min(f5, f10, f30) < 0:
+        status = "진입 금지"
+    else:
+        status = "아직 부족·대기"
+    column.metric(f"+{goal}% 목표", fmt(goal_price), status)
+st.caption("목표가는 보장이 아니라 현재 분봉·VWAP·EMA·거래량·호가 흐름이 유지될 때의 판단입니다.")
 
 render_chart(latest)
 
@@ -314,42 +341,5 @@ with st.expander("진입 전 뉴스·공시 위험을 지금 한 번 확인"):
     if checked and str(checked.get("ticker")) == selected_ticker:
         st.write(checked.get("news_summary", "뉴스 확인 완료"))
         st.write("규제검증:", checked.get("regulatory_checked", False), "· 거래정지:", checked.get("halt_active", False))
-
-st.subheader("30분 보유 추적")
-entry = st.number_input("실제 매수가", min_value=0.0, value=price, format="%.4f" if price < 100 else "%.0f")
-left, right = st.columns(2)
-if left.button("▶️ 추적 시작", type="primary", use_container_width=True):
-    st.session_state["scalp_position"] = {
-        "ticker": selected_ticker, "entry": float(entry), "start": now,
-        "snapshots": [], "last_snapshot": 0.0,
-    }
-if right.button("⏹️ 추적 종료", use_container_width=True):
-    st.session_state.pop("scalp_position", None)
-
-position = st.session_state.get("scalp_position")
-if position and position.get("ticker") == selected_ticker:
-    elapsed = (now - float(position["start"])) / 60
-    pnl = (price / float(position["entry"]) - 1) * 100 if float(position["entry"]) > 0 else 0
-    if not position["snapshots"] or now - float(position.get("last_snapshot", 0)) >= 600:
-        position["snapshots"].append({
-            "경과(분)": round(elapsed, 1), "시각": datetime.now(KST).strftime("%H:%M:%S"),
-            "가격": price, "수익률(%)": round(pnl, 3), "판정": label,
-        })
-        position["last_snapshot"] = now
-        st.session_state["scalp_position"] = position
-    track = st.columns(4)
-    track[0].metric("경과", f"{elapsed:.1f}분")
-    track[1].metric("실시간 수익률", f"{pnl:+.2f}%")
-    track[2].metric("+1% 목표", fmt(float(position["entry"]) * 1.01))
-    track[3].metric("손절", fmt(latest.get("stop_loss")))
-    if pnl >= 1:
-        st.success("✅ +1% 목표 도달 · 익절 또는 분할매도 검토")
-    elif elapsed >= 30:
-        st.error("⏰ 30분 종료 · 시간손절/청산 검토")
-    elif level == "error":
-        st.error("🔴 보유 신호 훼손 · 매도·손절 검토")
-    else:
-        st.info("보유 추적 중 · 다음 10분 구간을 계속 기록합니다.")
-    st.dataframe(pd.DataFrame(position["snapshots"]), hide_index=True, use_container_width=True)
 
 st.caption(f"마지막 정밀분석: {latest.get('updated_at', '-')} · 화면 시각: {datetime.now(KST).strftime('%H:%M:%S')}")
