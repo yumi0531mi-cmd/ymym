@@ -72,6 +72,20 @@ KR_UNIVERSE = [
     {"ticker":"000660","name":"SK하이닉스","exchange":"KR","asset_type":"우량주"},
     {"ticker":"035420","name":"NAVER","exchange":"KR","asset_type":"우량주"},
     {"ticker":"005380","name":"현대차","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"000270","name":"기아","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"035720","name":"카카오","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"068270","name":"셀트리온","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"105560","name":"KB금융","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"055550","name":"신한지주","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"086790","name":"하나금융지주","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"066570","name":"LG전자","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"051910","name":"LG화학","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"006400","name":"삼성SDI","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"207940","name":"삼성바이오로직스","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"012330","name":"현대모비스","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"028260","name":"삼성물산","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"017670","name":"SK텔레콤","exchange":"KR","asset_type":"우량주"},
+    {"ticker":"030200","name":"KT","exchange":"KR","asset_type":"우량주"},
     {"ticker":"069500","name":"KODEX 200","exchange":"KR","asset_type":"ETF"},
     {"ticker":"102110","name":"TIGER 200","exchange":"KR","asset_type":"ETF"},
     {"ticker":"396500","name":"TIGER 반도체TOP10","exchange":"KR","asset_type":"ETF"},
@@ -81,9 +95,26 @@ KR_UNIVERSE = [
     {"ticker":"423920","name":"TIGER 미국필라델피아반도체레버리지(합성)","exchange":"KR","asset_type":"레버리지 ETF"},
 ]
 US_UNIVERSE = [
+    {"ticker":"AAPL","name":"애플","exchange":"NASDAQ","asset_type":"우량주"},
+    {"ticker":"MSFT","name":"마이크로소프트","exchange":"NASDAQ","asset_type":"우량주"},
+    {"ticker":"NVDA","name":"엔비디아","exchange":"NASDAQ","asset_type":"우량주"},
+    {"ticker":"AMZN","name":"아마존","exchange":"NASDAQ","asset_type":"우량주"},
+    {"ticker":"META","name":"메타","exchange":"NASDAQ","asset_type":"우량주"},
+    {"ticker":"TSLA","name":"테슬라","exchange":"NASDAQ","asset_type":"우량주"},
     {"ticker":"GOOGL","name":"알파벳","exchange":"NASDAQ","asset_type":"우량주"},
     {"ticker":"AMD","name":"AMD","exchange":"NASDAQ","asset_type":"우량주"},
     {"ticker":"INTC","name":"인텔","exchange":"NASDAQ","asset_type":"우량주"},
+    {"ticker":"AVGO","name":"브로드컴","exchange":"NASDAQ","asset_type":"우량주"},
+    {"ticker":"QCOM","name":"퀄컴","exchange":"NASDAQ","asset_type":"우량주"},
+    {"ticker":"MU","name":"마이크론","exchange":"NASDAQ","asset_type":"우량주"},
+    {"ticker":"CSCO","name":"시스코","exchange":"NASDAQ","asset_type":"우량주"},
+    {"ticker":"BAC","name":"뱅크오브아메리카","exchange":"NYSE","asset_type":"우량주"},
+    {"ticker":"JPM","name":"JP모건","exchange":"NYSE","asset_type":"우량주"},
+    {"ticker":"XOM","name":"엑슨모빌","exchange":"NYSE","asset_type":"우량주"},
+    {"ticker":"WMT","name":"월마트","exchange":"NYSE","asset_type":"우량주"},
+    {"ticker":"QQQ","name":"나스닥100 ETF","exchange":"NASDAQ","asset_type":"ETF"},
+    {"ticker":"SPY","name":"S&P500 ETF","exchange":"AMEX","asset_type":"ETF"},
+    {"ticker":"IWM","name":"러셀2000 ETF","exchange":"AMEX","asset_type":"ETF"},
     {"ticker":"SMH","name":"반도체 ETF","exchange":"NASDAQ","asset_type":"ETF"},
     {"ticker":"SOXL","name":"반도체 3배 레버리지 ETF","exchange":"AMEX","asset_type":"레버리지 ETF"},
     {"ticker":"SOXS","name":"반도체 3배 인버스 ETF","exchange":"AMEX","asset_type":"레버리지 ETF"},
@@ -559,6 +590,7 @@ def live_filtered_universe(market: str) -> list[dict]:
     때만 쓰는 장애 대비용이다.
     """
     source = KR_UNIVERSE if market == "국내" else US_UNIVERSE
+    core_tickers = {str(row.get("ticker", "")).upper() for row in source}
     limit = 300000 if market == "국내" else 200
     accepted: list[dict] = []
     ranked_rows: dict[str, dict] = {}
@@ -587,6 +619,11 @@ def live_filtered_universe(market: str) -> list[dict]:
 
     blocked_words = ("스팩", "우선주", "관리", "정리매매", "인버스")
     for candidate in ranked_rows.values():
+        ticker = str(candidate.get("ticker", "")).upper()
+        # 자동 후보는 회복 가능성과 체결 안정성을 우선해 대형 우량주·대표
+        # ETF·충분히 거래되는 레버리지 ETF 풀 안에서만 고른다. 직접 검색은 예외다.
+        if ticker not in core_tickers:
+            continue
         price = float(candidate.get("screen_price", 0) or 0)
         change = float(candidate.get("screen_change", 0) or 0)
         volume = int(candidate.get("screen_volume", 0) or 0)
@@ -624,7 +661,7 @@ def live_filtered_universe(market: str) -> list[dict]:
     # bulk endpoint is empty do we make a very small four-symbol fallback.
     # 전체시장 순위가 모두 실패했을 때만 작은 고정 목록으로 장애를 완화한다.
     # 정상 상황에서는 이 경로가 실행되지 않으므로 화면 속도에 영향이 없다.
-    fallback_source = [] if accepted else source[:4]
+    fallback_source = [] if accepted else source[:12]
 
     def fetch_candidate(row: dict) -> dict | None:
         try:
@@ -632,6 +669,9 @@ def live_filtered_universe(market: str) -> list[dict]:
                      else scanner().client.us_quote(row["ticker"], row["exchange"]))
             candidate = dict(row)
             candidate["screen_price"] = float(quote.get("price", 0) or 0)
+            candidate["screen_volume"] = int(float(
+                quote.get("volume", quote.get("accumulated_volume", quote.get("acml_vol", 0))) or 0
+            ))
             if market == "미국":
                 price, previous, verified_change, source_name = verified_us_change(quote)
                 candidate["screen_price"] = price
@@ -644,17 +684,25 @@ def live_filtered_universe(market: str) -> list[dict]:
             # Korean automatic candidates need room before the +30% ceiling.
             # At +25% or above, remaining upside is too small for a fresh scalp
             # and execution can freeze near the limit-up queue.
-            change_ok = 0 < change < 20.0 if market == "국내" else change > 0
-            if 0 < candidate["screen_price"] <= limit and change_ok:
+            price = candidate["screen_price"]
+            volume = candidate["screen_volume"]
+            trading_value = price * volume
+            change_ok = 0.30 <= change < 15.0 if market == "국내" else 0.20 <= change < 12.0
+            liquidity_ok = (
+                volume >= 300_000 and trading_value >= 30_000_000_000
+                if market == "국내"
+                else volume >= 500_000 and trading_value >= 25_000_000
+            )
+            if 0 < price <= limit and change_ok and liquidity_ok:
                 candidate["asset_type"] = str(candidate.get("asset_type") or "상승 후보")
                 return candidate
         except Exception:
             return None
         return None
 
-    if market == "미국" and fallback_source:
-        # Four workers remain comfortably below the personal KIS request limit
-        # while avoiding an 11-symbol serial wait on every cache refresh.
+    if fallback_source:
+        # 제한된 핵심 풀만 병렬 조회해 화면 정지를 피하고 개인 KIS 호출 한도를
+        # 넘지 않는다. 전 종목 개별 조회는 절대 실행하지 않는다.
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = [pool.submit(fetch_candidate, row) for row in fallback_source]
             for future in as_completed(futures):
@@ -672,6 +720,7 @@ def live_filtered_universe(market: str) -> list[dict]:
         # 상승률이 가장 큰 종목보다 거래대금이 크고 과열되지 않은 종목을
         # 우선한다. 정밀분석에서 실제 반복 폭·VWAP·호가를 다시 검증한다.
         key=lambda row: (
+            0 if "레버리지" in str(row.get("asset_type", "")) or "인버스" in str(row.get("asset_type", "")) else 1,
             float(row.get("screen_price", 0) or 0) * int(row.get("screen_volume", 0) or 0),
             -abs(float(row.get("screen_change", 0) or 0) - 3.0),
         ),
