@@ -293,7 +293,19 @@ st.markdown("""
 <style>
   .block-container {padding-top: 1rem; max-width: 1500px;}
   [data-testid="stMetric"] {background:#f7f8fb;border:1px solid #e6e8ee;border-radius:12px;padding:8px;}
-  @media(max-width:700px){.block-container{padding:.55rem}.stMetric{font-size:.8rem}}
+  [data-testid="stMetricValue"] {font-size:clamp(1.25rem,2.2vw,2.15rem) !important; line-height:1.15; overflow-wrap:anywhere;}
+  [data-testid="stMetricLabel"] {font-size:.88rem !important;}
+  .trade-action {border-radius:14px;padding:15px 18px;margin:.45rem 0 .8rem 0;border:2px solid #d8dce6;background:#f7f8fb;}
+  .trade-action.buy {border-color:#19a15f;background:#ecfbf3}.trade-action.sell {border-color:#e45656;background:#fff0f0}
+  .trade-action.wait {border-color:#dcae32;background:#fff9e8}.trade-action.stop {border-color:#b93838;background:#ffe9e9}
+  .trade-action h2 {font-size:1.45rem;margin:0 0 .35rem 0}.trade-action p {font-size:1rem;margin:.12rem 0}
+  @media(max-width:700px){
+    .block-container{padding:.45rem}
+    [data-testid="stMetric"]{padding:6px}
+    [data-testid="stMetricValue"]{font-size:1.22rem !important}
+    [data-testid="stMetricLabel"]{font-size:.76rem !important}
+    .trade-action h2{font-size:1.2rem}.trade-action p{font-size:.9rem}
+  }
 </style>
 """, unsafe_allow_html=True)
 
@@ -944,6 +956,7 @@ def repeat_scalp_plan(item: dict) -> dict:
     last_volume = volumes[-1] if volumes else 0.0
     trend_score = int(item.get("continuous_rise_score", 0) or 0)
     ret15 = float(item.get("trend_return_15m", 0) or 0)
+    swing_percent = ((target / support) - 1) * 100 if support > 0 and target > support else 0.0
     trend_intact = price >= vwap > 0 and ema9 >= ema20 > 0 and trend_score >= 6 and ret15 >= 0
     near_support = support <= price <= support + max(median_range, 1e-9)
     near_target = target >= price and target - price <= max(median_range, 1e-9)
@@ -981,6 +994,9 @@ def repeat_scalp_plan(item: dict) -> dict:
             f"확인된 지지 {fmt(support)} 이탈 또는 하락 전환 근거 "
             f"{reversal_score}/5 동시 발생"
         )
+    elif swing_percent < 1.0:
+        state, label = "RANGE_TOO_NARROW", f"⚪ 이번 반복 예상 범위 약 +{swing_percent:.2f}%"
+        reason = f"분봉에서 확인된 매수 {fmt(support)} 부근 → 매도 {fmt(target)} 부근"
     elif price >= target or near_target:
         state, label = "TAKE_PROFIT", "🟠 매도 접근·분할매도"
         reason = f"실제 1분봉 저항 {fmt(target)} 도달 구간"
@@ -1007,6 +1023,7 @@ def repeat_scalp_plan(item: dict) -> dict:
         "repeat_scalp_median_bar_range": median_range,
         "repeat_scalp_reversal_score": reversal_score,
         "repeat_scalp_reversal_checks": reversal_checks,
+        "repeat_scalp_range_percent": swing_percent,
     })
     return item
 
@@ -1343,6 +1360,10 @@ continuous_rise = bool(latest.get("continuous_rise"))
 continuous_rise_score = int(latest.get("continuous_rise_score", 0) or 0)
 repeat_state = str(latest.get("repeat_scalp_state", "UNAVAILABLE"))
 repeat_label = str(latest.get("repeat_scalp_label", "⚪ 반복단타 판정 대기"))
+repeat_buy = float(latest.get("repeat_scalp_buy_level", 0) or 0)
+repeat_sell = float(latest.get("repeat_scalp_sell_level", 0) or 0)
+repeat_stop = float(latest.get("stop_loss", latest.get("repeat_scalp_invalidation", 0)) or 0)
+repeat_width = float(latest.get("repeat_scalp_range_percent", 0) or 0)
 if repeat_state == "EXIT":
     regime_name = "하락 전환"
     regime_method = "신규 매수 중단·실제 지지 회복과 하락 전환 해소 확인"
@@ -1390,6 +1411,33 @@ elif require_validation and not validated_signal:
     latest["entry_checks_passed"] = False
 elif level == "success":
     label = f"🟢 매수 검토 · 주요 기법 합의 {buy_votes}/10"
+
+# The first thing a trader sees is one unambiguous action. Detailed indicators
+# remain below as evidence, not as competing instructions.
+if repeat_state == "BUY_PULLBACK" and level == "success":
+    action_class, action_title = "buy", "🟢 지금 매수 구간"
+    action_line = f"{fmt(repeat_buy)} 부근 분할매수 → {fmt(repeat_sell)} 부근 분할매도"
+elif repeat_state == "HOLD_OR_BREAKOUT" and level == "success":
+    action_class, action_title = "buy", "🟢 돌파 확인 후 매수"
+    action_line = f"현재가 지지 확인 → {fmt(repeat_sell)} 부근 분할매도"
+elif repeat_state == "TAKE_PROFIT":
+    action_class, action_title = "sell", "🟠 지금 분할매도"
+    action_line = f"확인된 저항 {fmt(repeat_sell)} 도달 구간 · 추격매수 금지"
+elif repeat_state == "EXIT":
+    action_class, action_title = "stop", "🔴 반복단타 종료·매도"
+    action_line = f"추세가 꺾였습니다. {fmt(repeat_stop)} 이탈 시 재진입하지 마세요."
+elif repeat_state == "RANGE_TOO_NARROW":
+    action_class, action_title = "wait", f"🟡 이번 반복 예상 범위 약 +{repeat_width:.2f}%"
+    action_line = f"매수 {fmt(repeat_buy)} 부근 → 매도 {fmt(repeat_sell)} 부근 · 1% 목표에는 미달"
+else:
+    action_class, action_title = "wait", "🟡 지금은 대기"
+    action_line = f"{fmt(repeat_buy)} 지지 반등 또는 매수 합의가 확인될 때까지 매수하지 마세요."
+st.markdown(
+    f'<div class="trade-action {action_class}"><h2>{action_title}</h2>'
+    f'<p><b>{action_line}</b></p><p>손절·무효 기준: {fmt(repeat_stop)} · '
+    f'확인된 반복 폭: {repeat_width:.2f}%</p></div>',
+    unsafe_allow_html=True,
+)
 top = st.columns([1.4, 1, 1, 1, 1])
 top[0].metric(f"{latest.get('ticker')} · {latest.get('name')}", fmt(price), f"{change:+.2f}%")
 top[1].metric("VWAP", fmt(latest.get("vwap")))
