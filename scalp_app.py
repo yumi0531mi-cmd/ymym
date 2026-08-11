@@ -779,7 +779,6 @@ def background_audit_tick(enabled: bool, now_ts: float) -> None:
         st.session_state["audit_member_index"] = index + 1
 
 
-st_autorefresh(interval=1000, key="scalp_tick")
 st.title("⚡ 초단타 VWAP 매수타점")
 st.caption("선택 종목은 약 1초마다 현재가를 확인하고, 20초마다 1분봉·VWAP·EMA·거래량·호가를 정밀 재분석합니다.")
 
@@ -795,6 +794,13 @@ with st.sidebar:
     st.caption("분석 대상: 우량주·ETF·레버리지 ETF")
 
 now = time.time()
+manual_search_active = bool(manual_ticker)
+# Streamlit reruns the whole script. During a direct search, keep the refresh
+# gentle so a queued one-second rerun cannot make the input look frozen.
+st_autorefresh(
+    interval=2500 if manual_search_active and focus_only else 8000,
+    key="scalp_tick",
+)
 auto_audit = st.sidebar.toggle(
     "오늘 한국장 자동검증",
     False,
@@ -804,7 +810,10 @@ auto_audit = st.sidebar.toggle(
 if AUDIT_IMPORT_ERROR:
     st.sidebar.error("자동검증 파일이 없습니다: run_live_validation.py")
 elif auto_audit:
-    background_audit_tick(True, now)
+    # Direct search has priority over the background universe collector.
+    # The collector resumes automatically as soon as the search box is empty.
+    if not manual_search_active:
+        background_audit_tick(True, now)
     audit_now = datetime.fromtimestamp(now, KST)
     audit_minute = audit_now.hour * 60 + audit_now.minute
     if audit_now.weekday() >= 5:
@@ -845,9 +854,11 @@ elif auto_audit:
     except Exception:
         pass
 
-candidate_board = latest_entry_candidates(market, minimum_score)
+candidate_board = [] if manual_search_active else latest_entry_candidates(market, minimum_score)
 st.subheader("실시간 진입 후보")
-if candidate_board:
+if manual_search_active:
+    st.caption("직접 검색 우선 모드 · 자동 후보 수집을 잠시 멈추고 선택 종목만 분석합니다.")
+elif candidate_board:
     board_rows = []
     for candidate in candidate_board:
         support_text = fmt(candidate["support"])
