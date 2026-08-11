@@ -239,13 +239,25 @@ def store_result(db: sqlite3.Connection, market: str, item: dict, now_ts: int, b
             "continuous_rise", "continuous_rise_score", "continuous_rise_checks",
             "trend_return_5m", "trend_return_15m", "trend_return_30m",
             "up_down_volume_ratio",
+            "repeat_scalp_state", "repeat_scalp_label", "repeat_scalp_reason",
+            "repeat_scalp_buy_level", "repeat_scalp_sell_level",
+            "repeat_scalp_invalidation", "repeat_scalp_median_bar_range",
+            "repeat_scalp_reversal_score", "repeat_scalp_reversal_checks",
+            "screen_change", "change", "data_gate_passed",
+            "verified_spread_percent",
         )
     }
-    data_valid = int(
-        price > 0 and f(item.get("vwap")) > 0 and f(item.get("ema9")) > 0
-        and not bool(item.get("intraday_fallback"))
-        and f(item.get("data_completeness"), 100.0) >= 60.0
-    )
+    # When the UI precision pipeline supplied a freshness-aware gate result,
+    # persist that exact result. Legacy standalone runs retain the conservative
+    # compatibility calculation below.
+    if "data_gate_passed" in item:
+        data_valid = int(bool(item.get("data_gate_passed")))
+    else:
+        data_valid = int(
+            price > 0 and f(item.get("vwap")) > 0 and f(item.get("ema9")) > 0
+            and not bool(item.get("intraday_fallback"))
+            and f(item.get("data_completeness"), 100.0) >= 60.0
+        )
     # 실제 발생 시각을 보존해야 5/10/20/30분 사후가격이 정확히 정렬된다.
     # 중복 방지만 별도의 시간 구간 조회로 수행한다.
     duplicate = db.execute(
