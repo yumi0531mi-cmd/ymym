@@ -739,6 +739,39 @@ def structural_trade_plan(item: dict, market: str) -> dict:
 def precise_analysis(row: dict, mode: str) -> dict:
     raw = scanner().analyze(dict(row), mode)
     item = apply_mode_policy(finalize_trade_item(raw), mode)
+    # The bundled engine reads Korean total depth but historically discarded
+    # level-1 bid/ask prices from the same REST response. Hydrate those exact
+    # KIS fields for direct searches instead of treating them as unavailable.
+    if mode.startswith("국내") and "직접" in str(row.get("asset_type", "")):
+        try:
+            payload = scanner().client._get(
+                "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn",
+                "FHKST01010200",
+                {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": str(row.get("ticker", ""))},
+            )
+            depth = payload.get("output1") or payload.get("output") or {}
+            item["best_ask"] = float(depth.get("askp1", 0) or 0)
+            item["best_bid"] = float(depth.get("bidp1", 0) or 0)
+            item["ask_total"] = float(depth.get("total_askp_rsqn", item.get("ask_total", 0)) or 0)
+            item["bid_total"] = float(depth.get("total_bidp_rsqn", item.get("bid_total", 0)) or 0)
+            item["orderbook_source"] = "한국투자증권 REST 1호가"
+        except Exception as error:
+            item["orderbook_fetch_error"] = f"{type(error).__name__}: {error}"
+    # The quote endpoint and the minute-bar endpoint do not always complete at
+    # the same instant. Retry the lightweight quote/order-book refresh before
+    # declaring depth data missing; never request a new OAuth token here.
+    for _ in range(2):
+        bid = float(item.get("best_bid", 0) or 0)
+        ask = float(item.get("best_ask", 0) or 0)
+        if bid > 0 and ask > 0:
+            break
+        try:
+            refreshed = scanner().refresh_quotes([item], mode)
+            if refreshed:
+                item.update(refreshed[0])
+        except Exception:
+            pass
+        time.sleep(0.2)
     market = "국내" if mode.startswith("국내") else "미국"
     return structural_trade_plan(item, market)
 
