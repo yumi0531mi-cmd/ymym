@@ -593,17 +593,28 @@ def live_filtered_universe(market: str) -> list[dict]:
         name = str(candidate.get("name", ""))
         trading_value = price * volume
         if market == "국내":
+            # 반복단타는 단순 급등률보다 체결 가능한 유동성과 남은 움직임이
+            # 중요하다. 상한가 근접주·동전주·거래대금 부족주는 제외한다.
             valid = (
-                0 < price <= limit and 0 < change < 20.0
-                and volume >= 100_000 and trading_value >= 10_000_000_000
+                2_000 <= price <= limit
+                and 0.30 <= change < 15.0
+                and volume >= 300_000
+                and trading_value >= 30_000_000_000
                 and not any(word in name for word in blocked_words)
             )
         else:
-            # 미국은 프리/정규/애프터 전체 스크리너 값을 사용한다. 소형주부터
-            # $200 이하 우량주·ETF까지 포함하되 무거래/하락 종목만 제거한다.
-            valid = 0.05 <= price <= limit and change > 0 and volume >= 50_000
+            # 미국 자동 후보에서도 저가 소형 급등주를 제거한다. 충분한 거래량과
+            # 거래대금을 동시에 충족해야 여러 차례 진입·청산할 가능성이 있다.
+            # 직접 검색은 이 제한을 받지 않는다.
+            valid = (
+                5.0 <= price <= limit
+                and 0.20 <= change < 12.0
+                and volume >= 500_000
+                and trading_value >= 25_000_000
+                and not any(word in name.upper() for word in ("WARRANT", "RIGHT", "UNIT"))
+            )
         if valid:
-            candidate["asset_type"] = "전 종목 실시간 상승·유동성 후보"
+            candidate["asset_type"] = "반복단타 예비후보·정밀검증 전"
             accepted.append(candidate)
     # The ranked market response is one bulk call. Do not follow it with an
     # unbounded sequence of per-symbol calls: that was the main reason the UI
@@ -658,10 +669,11 @@ def live_filtered_universe(market: str) -> list[dict]:
     deduped = {row["ticker"]: row for row in accepted}
     return sorted(
         deduped.values(),
-        # 상승률만 높은 저유동성 종목보다 거래대금이 동반된 상승 종목을 우선한다.
+        # 상승률이 가장 큰 종목보다 거래대금이 크고 과열되지 않은 종목을
+        # 우선한다. 정밀분석에서 실제 반복 폭·VWAP·호가를 다시 검증한다.
         key=lambda row: (
-            float(row.get("screen_change", 0) or 0),
             float(row.get("screen_price", 0) or 0) * int(row.get("screen_volume", 0) or 0),
+            -abs(float(row.get("screen_change", 0) or 0) - 3.0),
         ),
         reverse=True,
     )[:12]
@@ -703,10 +715,21 @@ def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -
         continuous_rise = bool(detail.get("continuous_rise"))
         level_plan_valid = bool(detail.get("level_plan_valid"))
         repeat_state = str(detail.get("repeat_scalp_state", "UNAVAILABLE"))
+        repeat_width = float(detail.get("repeat_scalp_range_percent", 0) or 0)
+        verified_spread = detail.get("verified_spread_percent")
+        try:
+            verified_spread = float(verified_spread) if verified_spread is not None else None
+        except (TypeError, ValueError):
+            verified_spread = None
         score = float(score or 0)
         if market_code == "KR" and current_change >= 20.0:
             continue
-        if not (data_valid and level_plan_valid and risk_reward >= 1.5):
+        max_repeat_spread = 0.35 if market_code == "KR" else 0.25
+        if not (
+            data_valid and level_plan_valid and risk_reward >= 1.5
+            and repeat_width >= 0.30
+            and verified_spread is not None and verified_spread <= max_repeat_spread
+        ):
             continue
         if repeat_state in {"UNAVAILABLE", "EXIT", "TAKE_PROFIT"}:
             continue
@@ -731,6 +754,7 @@ def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -
             "rvol": rvol, "risk_reward": risk_reward, "issued": int(issued), "rank": rank,
             "trend_score": trend_score,
             "repeat_state": repeat_state,
+            "repeat_width": repeat_width,
             "target": float(detail.get("structural_target", 0) or 0),
             "support": float(detail.get("structural_support", 0) or 0),
         })
