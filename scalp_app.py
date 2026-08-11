@@ -418,7 +418,8 @@ def benchmark_context(market: str, ticker: str) -> dict:
             }
             bench, exchange, direction = mapping.get(ticker, ("QQQ", "NASDAQ", 1))
             quote = scanner().client.us_quote(bench, exchange)
-            change = float(quote.get("change", 0) or 0) * direction
+            _, _, verified_change, _ = verified_us_change(quote)
+            change = verified_change * direction
             bars = scanner().client.us_intraday(bench, exchange, minutes=1)
             intraday = ((float(bars["close"].iloc[-1]) / float(bars["close"].iloc[-6]) - 1) * 100 * direction) if len(bars) >= 6 else 0.0
             return {"name": bench, "change": change, "intraday": intraday, "confirmed": len(bars) >= 20}
@@ -439,6 +440,53 @@ def benchmark_context(market: str, ticker: str) -> dict:
         return {"name": "+".join(code for code, _ in members), "change": change, "intraday": intraday, "confirmed": enough}
     except Exception as error:
         return {"name": "시장지표", "change": 0.0, "confirmed": False, "error": type(error).__name__}
+
+
+def verified_us_change(quote: dict, fallback_price: float = 0.0) -> tuple[float, float, float, str]:
+    """Return a cross-checked US price/change instead of trusting KIS ``rate``.
+
+    Some overseas quote responses have exposed the previous close in the field
+    that older response schemas labelled ``rate``.  Treating that number as a
+    percentage produced values such as SOXL +132.71%.  The previous close and
+    current price are independent fields, so their arithmetic return is the
+    authoritative value whenever both are present.
+    """
+    price = float(quote.get("price", fallback_price) or fallback_price or 0)
+    previous = float(
+        quote.get("previous", quote.get("previous_close", quote.get("base", 0))) or 0
+    )
+    raw_change = float(quote.get("change", quote.get("change_percent", 0)) or 0)
+    if price > 0 and previous > 0:
+        calculated = (price / previous - 1.0) * 100.0
+        return price, previous, round(calculated, 4), "현재가·전일종가 재계산"
+    return price, previous, raw_change, "KIS 원본 등락률(전일종가 미수신)"
+
+
+def normalize_us_item(item: dict, row: dict | None = None) -> dict:
+    """Apply the same verified US change to cards, scores and candidate filters."""
+    if not item:
+        return item
+    ticker = str((row or {}).get("ticker") or item.get("ticker") or "").upper()
+    exchange = str((row or {}).get("exchange") or item.get("exchange") or "NASDAQ")
+    if not ticker:
+        return item
+    try:
+        quote = scanner().client.us_quote(ticker, exchange)
+        price, previous, change, source = verified_us_change(
+            quote, float(item.get("price", 0) or 0)
+        )
+        if price > 0:
+            item["price"] = price
+        item["previous_close"] = previous
+        item["raw_kis_change_percent"] = float(
+            quote.get("change", quote.get("change_percent", 0)) or 0
+        )
+        item["change_percent"] = change
+        item["screen_change"] = change
+        item["change_validation_source"] = source
+    except Exception as error:
+        item["change_validation_error"] = f"{type(error).__name__}: {error}"
+    return item
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -483,7 +531,14 @@ def live_filtered_universe(market: str) -> list[dict]:
                      else scanner().client.us_quote(row["ticker"], row["exchange"]))
             candidate = dict(row)
             candidate["screen_price"] = float(quote.get("price", 0) or 0)
-            candidate["screen_change"] = float(quote.get("change", 0) or 0)
+            if market == "미국":
+                price, previous, verified_change, source_name = verified_us_change(quote)
+                candidate["screen_price"] = price
+                candidate["previous_close"] = previous
+                candidate["screen_change"] = verified_change
+                candidate["change_validation_source"] = source_name
+            else:
+                candidate["screen_change"] = float(quote.get("change", 0) or 0)
             change = candidate["screen_change"]
             # Korean automatic candidates need room before the +30% ceiling.
             # At +25% or above, remaining upside is too small for a fresh scalp
@@ -865,6 +920,8 @@ def repeat_scalp_plan(item: dict) -> dict:
 def precise_analysis(row: dict, mode: str) -> dict:
     raw = scanner().analyze(dict(row), mode)
     item = apply_mode_policy(finalize_trade_item(raw), mode)
+    if not mode.startswith("국내"):
+        item = normalize_us_item(item, row)
     # The bundled engine reads Korean total depth but historically discarded
     # level-1 bid/ask prices from the same REST response. Hydrate those exact
     # KIS fields for direct searches instead of treating them as unavailable.
@@ -899,6 +956,8 @@ def precise_analysis(row: dict, mode: str) -> dict:
             pass
         time.sleep(0.2)
     market = "국내" if mode.startswith("국내") else "미국"
+    if market == "미국":
+        item = normalize_us_item(item, row)
     item = repeat_scalp_plan(structural_trade_plan(item, market))
     _, gate_ok, spread = data_quality_gate(item, market)
     item["data_gate_passed"] = bool(gate_ok)
@@ -1136,6 +1195,8 @@ elif now - float(st.session_state.get("scalp_last_quote", 0)) >= (1 if focus_onl
         refreshed = scanner().refresh_quotes([latest], mode)
         if refreshed:
             latest.update(refreshed[0])
+            if market == "미국":
+                latest = normalize_us_item(latest, selected_row)
             latest = repeat_scalp_plan(structural_trade_plan(latest, market))
             st.session_state["scalp_latest"] = latest
         st.session_state["scalp_last_quote"] = now
