@@ -432,7 +432,7 @@ def benchmark_context(market: str, ticker: str) -> dict:
         return {"name": "시장지표", "change": 0.0, "confirmed": False, "error": type(error).__name__}
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=15, show_spinner=False)
 def live_filtered_universe(market: str) -> list[dict]:
     """상승 종목을 먼저 찾고 가격·유동성을 통과한 종목만 후보로 사용한다."""
     source = KR_UNIVERSE if market == "국내" else US_UNIVERSE
@@ -444,9 +444,12 @@ def live_filtered_universe(market: str) -> list[dict]:
             blocked_words = ("스팩", "우선주", "관리", "정리매매", "인버스")
             for row in ranked:
                 candidate = dict(row)
-                price = float(candidate.get("screen_price", 0) or 0)
-                change = float(candidate.get("screen_change", 0) or 0)
-                volume = int(candidate.get("screen_volume", 0) or 0)
+                price = float(candidate.get("screen_price", candidate.get("price", 0)) or 0)
+                change = float(candidate.get("screen_change", candidate.get("change_percent", candidate.get("change", 0))) or 0)
+                volume = int(candidate.get("screen_volume", candidate.get("volume", 0)) or 0)
+                candidate["screen_price"] = price
+                candidate["screen_change"] = change
+                candidate["screen_volume"] = volume
                 name = str(candidate.get("name", ""))
                 trading_value = price * volume
                 if (
@@ -511,11 +514,14 @@ def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -
         positive_count = sum(x > 0 for x in forecasts)
         rvol = float(detail.get("rvol", 0) or 0)
         risk_reward = float(detail.get("risk_reward", 0) or 0)
+        current_change = float(detail.get("change_percent", detail.get("change", 0)) or 0)
         trend_score = int(detail.get("continuous_rise_score", 0) or 0)
         continuous_rise = bool(detail.get("continuous_rise"))
         level_plan_valid = bool(detail.get("level_plan_valid"))
         repeat_state = str(detail.get("repeat_scalp_state", "UNAVAILABLE"))
         score = float(score or 0)
+        if market_code == "KR" and current_change >= 25.0:
+            continue
         if not (data_valid and level_plan_valid and risk_reward >= 1.5):
             continue
         if repeat_state in {"UNAVAILABLE", "EXIT", "TAKE_PROFIT"}:
@@ -888,7 +894,10 @@ def background_audit_tick(enabled: bool, now_ts: float) -> None:
     if now_dt.weekday() >= 5 or hhmm < 8 * 60 + 50 or hhmm > 15 * 60 + 35:
         return
     last = float(st.session_state.get("audit_last_tick", 0.0))
-    if now_ts - last < 8:
+    # Heavy full-minute-bar validation must not monopolize the interactive app.
+    # Candidate discovery remains cached and lightweight; validation samples
+    # one symbol per minute while the user can search and trade immediately.
+    if now_ts - last < 60:
         return
     dynamic_rows = live_filtered_universe("국내")
     dynamic_members = [
