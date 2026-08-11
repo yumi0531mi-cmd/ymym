@@ -19,6 +19,7 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import altair as alt
 import pandas as pd
@@ -46,7 +47,37 @@ except Exception as audit_import_exception:
     AUDIT_IMPORT_ERROR = str(audit_import_exception)
 
 KST = timezone(timedelta(hours=9), name="KST")
+ET = ZoneInfo("America/New_York")
 HISTORY_DB = Path(tempfile.gettempdir()) / "ymym_scalp_validation.sqlite3"
+
+
+def market_clock(market: str, now: datetime | None = None) -> dict:
+    """Return an explicit, DST-safe market session without guessing from KST."""
+    now_kst = now.astimezone(KST) if now else datetime.now(KST)
+    if market == "국내":
+        minute = now_kst.hour * 60 + now_kst.minute
+        weekday = now_kst.weekday() < 5
+        if weekday and 9 * 60 <= minute < 15 * 60 + 30:
+            session, tradable = "국내 정규장", True
+        else:
+            session, tradable = "국내 장외시간", False
+        return {"session": session, "tradable": tradable, "local_time": now_kst.strftime("%H:%M:%S KST")}
+
+    now_et = now_kst.astimezone(ET)
+    minute = now_et.hour * 60 + now_et.minute
+    weekday = now_et.weekday() < 5
+    if weekday and 4 * 60 <= minute < 9 * 60 + 30:
+        session, tradable = "미국 프리마켓", True
+    elif weekday and 9 * 60 + 30 <= minute < 16 * 60:
+        session, tradable = "미국 정규장", True
+    elif weekday and 16 * 60 <= minute < 20 * 60:
+        session, tradable = "미국 애프터마켓", True
+    else:
+        session, tradable = "미국 장외시간", False
+    return {
+        "session": session, "tradable": tradable,
+        "local_time": f"{now_et.strftime('%H:%M:%S')} ET / {now_kst.strftime('%H:%M:%S')} KST",
+    }
 
 
 def db_connect():
@@ -628,6 +659,12 @@ def live_filtered_universe(market: str) -> list[dict]:
         volume = int(candidate.get("screen_volume", 0) or 0)
         name = str(candidate.get("name", ""))
         trading_value = price * volume
+        screen_high = float(candidate.get("high", candidate.get("screen_high", 0)) or 0)
+        screen_low = float(candidate.get("low", candidate.get("screen_low", 0)) or 0)
+        observed_range = (
+            (screen_high / screen_low - 1) * 100
+            if screen_high > screen_low > 0 else None
+        )
         if market == "국내":
             # 반복단타는 단순 급등률보다 체결 가능한 유동성과 남은 움직임이
             # 중요하다. 상한가 근접주·동전주·거래대금 부족주는 제외한다.
@@ -635,7 +672,8 @@ def live_filtered_universe(market: str) -> list[dict]:
                 2_000 <= price <= limit
                 and 0.30 <= change < 15.0
                 and volume >= 100_000
-                and trading_value >= 10_000_000_000
+                and trading_value >= 30_000_000_000
+                and (observed_range is None or observed_range >= 0.50)
                 and not any(word in name for word in blocked_words)
             )
         else:
@@ -646,11 +684,13 @@ def live_filtered_universe(market: str) -> list[dict]:
                 3.0 <= price <= limit
                 and 0.20 <= change < 12.0
                 and volume >= 100_000
-                and trading_value >= 10_000_000
+                and trading_value >= 30_000_000
+                and (observed_range is None or observed_range >= 0.50)
                 and not any(word in name.upper() for word in ("WARRANT", "RIGHT", "UNIT"))
             )
         if valid:
-            candidate["asset_type"] = "반복단타 예비후보·정밀검증 전"
+            candidate["screen_observed_range_percent"] = observed_range
+            candidate["asset_type"] = "정밀검증 대기·후보 확정 전"
             accepted.append(candidate)
     # The ranked market response is one bulk call. Do not follow it with an
     # unbounded sequence of per-symbol calls: that was the main reason the UI
@@ -1162,6 +1202,19 @@ def repeat_scalp_plan(item: dict) -> dict:
     swing_percent = ((target / support) - 1) * 100 if support > 0 and target > support else 0.0
     mtf_alignment = bool(item.get("mtf_alignment"))
     mtf_exit = bool(item.get("mtf_exit"))
+    rsi = float(item.get("rsi", item.get("rsi14", 50)) or 50)
+    prior_rsi = float(item.get("rsi_previous", item.get("previous_rsi", rsi)) or rsi)
+
+    # A repeat scalp needs a real, recently observed box.  Use the last 30
+    # completed one-minute bars as the 30-minute box; never manufacture a
+    # percentage target when its upper/lower boundaries are absent.
+    box_high = max(highs[-30:]) if len(highs) >= 30 else 0.0
+    box_low = min(lows[-30:]) if len(lows) >= 30 else 0.0
+    box_range_percent = ((box_high / box_low) - 1) * 100 if box_high > box_low > 0 else 0.0
+    box_valid = 0.50 <= box_range_percent <= 4.0
+    box_lower_zone = box_low > 0 and price <= box_low + (box_high - box_low) * 0.35
+    box_upper_zone = box_high > 0 and price >= box_low + (box_high - box_low) * 0.75
+    rsi_recovery = (prior_rsi <= 35 and rsi > prior_rsi) or (rsi >= 40 and rsi <= 68)
     trend_intact = (
         mtf_alignment and price >= vwap > 0 and ema9 >= ema20 > 0
         and trend_score >= 6 and ret15 >= 0
@@ -1205,13 +1258,13 @@ def repeat_scalp_plan(item: dict) -> dict:
     elif swing_percent < 0.5:
         state, label = "RANGE_TOO_NARROW", f"⚪ 이번 반복 예상 범위 약 +{swing_percent:.2f}%"
         reason = f"분봉에서 확인된 매수 {fmt(support)} 부근 → 매도 {fmt(target)} 부근"
-    elif price >= target or near_target:
+    elif price >= target or near_target or box_upper_zone:
         state, label = "TAKE_PROFIT", "🟠 매도 접근·분할매도"
         reason = f"실제 1분봉 저항 {fmt(target)} 도달 구간"
-    elif trend_intact and near_support and bounce and volume_returns:
+    elif trend_intact and box_valid and (near_support or box_lower_zone) and bounce and volume_returns and rsi_recovery:
         state, label = "BUY_PULLBACK", "🟢 눌림 반등 매수"
-        reason = f"일봉·60·15·5분 방향 허용 후 실제 지지 {fmt(support)}에서 1분봉 반등"
-    elif trend_intact and price > ema9 and volume_returns:
+        reason = f"일봉·60·15·5분 방향 허용 후 30분 박스 하단·실제 지지 {fmt(support)}에서 1분봉 반등"
+    elif trend_intact and box_valid and price > ema9 and volume_returns:
         state, label = "HOLD_OR_BREAKOUT", "🟢 보유·돌파 매수 검토"
         reason = f"다중 시간대 상승 정렬·VWAP 유지, 실제 저항 {fmt(target)}까지 공간 확인"
     elif trend_intact:
@@ -1233,6 +1286,14 @@ def repeat_scalp_plan(item: dict) -> dict:
         "repeat_scalp_reversal_checks": reversal_checks,
         "repeat_scalp_range_percent": swing_percent,
         "repeat_scalp_preferred_range": 0.5 <= swing_percent <= 1.5,
+        "repeat_box_valid": box_valid,
+        "repeat_box_low": box_low,
+        "repeat_box_high": box_high,
+        "repeat_box_range_percent": box_range_percent,
+        "repeat_rsi_recovery": rsi_recovery,
+        "trailing_stop_enabled": bool(state in {"HOLD_OR_BREAKOUT", "TAKE_PROFIT"}),
+        "trailing_stop_percent": 0.5,
+        "trailing_stop_price": (max(highs[-10:]) * 0.995 if highs else 0.0),
     })
     return item
 
@@ -1334,25 +1395,27 @@ def background_audit_tick(enabled: bool, now_ts: float, ui_market: str) -> None:
 
 
 st.title("⚡ 초단타 VWAP 매수타점")
-st.caption("집중 모드에서는 약 3초마다 현재가를 갱신하고, 20초마다 분봉·VWAP·이동평균·거래량·호가를 정밀 재분석합니다.")
+st.caption("집중 모드에서는 약 1.5초마다 현재가를 갱신하고, 5초마다 분봉·VWAP·이동평균·거래량·호가를 정밀 재분석합니다.")
 
 
 with st.sidebar:
     st.header("초단타 설정")
     market = st.radio("시장", ["국내", "미국"], horizontal=True)
+    session_info = market_clock(market)
+    st.caption(f"{session_info['session']} · {session_info['local_time']}")
     mode = "국내 30분 1% 타점" if market == "국내" else "미국 30분 1% 타점"
     exchange = "KR" if market == "국내" else "자동 판별"
     minimum_score = st.slider("최소 점수", 30, 90, 50, 5)
     manual_ticker = st.text_input("종목명 또는 종목코드 검색", placeholder="현대차, 005380, SOXL").strip()
     run_mode = st.radio(
         "실행 모드",
-        ["가벼운 현재가", "선택 종목 집중", "오늘 한국장 자동검증"],
+        ["가벼운 현재가", "선택 종목 집중", "시장 자동검증"],
         horizontal=False,
         key="scalp_run_mode",
         help="한 번에 하나의 모드만 실행해 API 과호출과 상태 충돌을 막습니다.",
     )
     focus_only = run_mode == "선택 종목 집중"
-    auto_audit = run_mode == "오늘 한국장 자동검증"
+    auto_audit = run_mode == "시장 자동검증"
     require_validation = st.toggle("실전 검증 잠금", True, help="해당 종목의 실제 5·10분 검증표본이 쌓이기 전에는 초록색 매수 신호를 차단합니다.")
     st.caption("분석 대상: 우량주·ETF·레버리지 ETF")
 
@@ -1363,7 +1426,9 @@ manual_search_active = bool(manual_ticker)
 # 별도 차단한다.
 live_refresh_active = bool(focus_only or auto_audit)
 st_autorefresh(
-    interval=3000 if focus_only else 10000 if auto_audit else 8000,
+    # 직접 종목은 가벼운 현재가만 빠르게 갱신한다. 분봉 정밀분석은 아래의
+    # 별도 5초 주기를 사용하므로 1.5초 화면 갱신이 전체 차트 API를 재호출하지 않는다.
+    interval=1500 if focus_only else 10000 if auto_audit else 8000,
     key="scalp_tick",
 )
 if AUDIT_IMPORT_ERROR:
@@ -1376,18 +1441,23 @@ elif auto_audit:
         background_audit_tick(True, now, market)
     audit_now = datetime.fromtimestamp(now, KST)
     audit_minute = audit_now.hour * 60 + audit_now.minute
-    if audit_now.weekday() >= 5:
+    if market == "미국":
+        if session_info["is_open"]:
+            audit_phase = f"{session_info['session']} · 신호 수집·사후 채점 중"
+        else:
+            audit_phase = f"{session_info['session']} · 다음 미국 세션 대기"
+    elif audit_now.weekday() >= 5:
         audit_phase = "휴장일 · 다음 영업일 대기"
     elif audit_minute < 8 * 60 + 50:
         audit_phase = "준비 완료 · 08:50 자동 시작"
     elif audit_minute < 9 * 60:
         audit_phase = "사전 시세 확인 중 · 09:00 신호 시작"
     elif audit_minute < 15 * 60:
-        audit_phase = "신호 수집·사후 채점 중"
+        audit_phase = "한국 정규장 · 신호 수집·사후 채점 중"
     elif audit_minute <= 15 * 60 + 35:
         audit_phase = "신규 신호 종료 · 30분 사후 채점 중"
     else:
-        audit_phase = "오늘 검증 완료 · 결과를 내려받으세요"
+        audit_phase = "한국장 검증 완료 · 결과를 내려받으세요"
     last_audit_ok = st.session_state.get("audit_last_ok")
     displayed_phase = "집중분석 우선 · 후보 수집 일시정지" if audit_paused_for_focus else audit_phase
     st.sidebar.success(
@@ -1475,8 +1545,8 @@ if not options:
     st.warning("현재 가격 조건을 통과하고 시세가 확인된 자동 후보가 없습니다. 원하는 종목을 직접 검색해 주세요.")
     st.stop()
 
-selected_ticker = st.selectbox(
-    "집중 분석할 종목",
+    selected_ticker = st.selectbox(
+        "집중 분석할 종목 (자동 목록은 정밀검증 대기, 위 표만 확정 후보)",
     [str(row.get("ticker", "")) for row in options],
     format_func=lambda ticker: next(
         (f"{ticker} · {row.get('name', ticker)} · {row.get('asset_type', '')}"
@@ -1493,7 +1563,9 @@ if st.session_state.get("scalp_selected") != selected_ticker:
     st.session_state["scalp_live_history"] = []
 
 latest = dict(st.session_state.get("scalp_latest", {}))
-precise_refresh_seconds = 20 if focus_only else 60
+# 한 종목 집중 모드는 현재가와 완성 전 1분봉의 변화를 놓치지 않도록 5초마다
+# 정밀 재계산한다. 자동 후보 탐색은 API 제한과 전체 처리속도를 위해 60초를 유지한다.
+precise_refresh_seconds = 5 if focus_only else 60
 precise_due = bool(
     not latest
     or (
@@ -1659,6 +1731,22 @@ st.markdown(
     f'확인된 반복 폭: {repeat_width:.2f}%</p></div>',
     unsafe_allow_html=True,
 )
+# Three-minute per-symbol cool-down prevents the same actionable instruction
+# from being shown as a new alert on every Streamlit rerun.  This never places
+# an order; it is only an on-screen/manual-trading notification.
+if action_class in {"buy", "sell", "stop"}:
+    alert_key = f"signal_alert::{market}::{selected_ticker}::{action_class}"
+    last_alert = float(st.session_state.get(alert_key, 0) or 0)
+    if now - last_alert >= 180:
+        st.toast(f"{selected_ticker} · {action_title}")
+        st.session_state[alert_key] = now
+
+trailing_price = float(latest.get("trailing_stop_price", 0) or 0)
+if latest.get("trailing_stop_enabled") and trailing_price > 0:
+    st.caption(
+        f"상방 돌파 대응: 고점 추적 중 · 고점 대비 0.5% 하락 또는 "
+        f"{fmt(trailing_price)} 이탈 시 수익 보존 매도 알림"
+    )
 top = st.columns([1.4, 1, 1, 1, 1])
 top[0].metric(f"{latest.get('ticker')} · {latest.get('name')}", fmt(price), f"{change:+.2f}%")
 top[1].metric("VWAP", fmt(latest.get("vwap")))
