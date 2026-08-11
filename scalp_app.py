@@ -445,7 +445,7 @@ def live_filtered_universe(market: str) -> list[dict]:
                 name = str(candidate.get("name", ""))
                 trading_value = price * volume
                 if (
-                    0 < price <= limit and change > 0
+                    0 < price <= limit and 0 < change < 29.5
                     and volume >= 100_000 and trading_value >= 10_000_000_000
                     and not any(word in name for word in blocked_words)
                 ):
@@ -460,7 +460,9 @@ def live_filtered_universe(market: str) -> list[dict]:
             candidate = dict(row)
             candidate["screen_price"] = float(quote.get("price", 0) or 0)
             candidate["screen_change"] = float(quote.get("change", 0) or 0)
-            if 0 < candidate["screen_price"] <= limit and candidate["screen_change"] > 0:
+            change = candidate["screen_change"]
+            change_ok = 0 < change < 29.5 if market == "국내" else change > 0
+            if 0 < candidate["screen_price"] <= limit and change_ok:
                 accepted.append(candidate)
         except Exception:
             continue
@@ -510,7 +512,12 @@ def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -
             stage, priority = "🟠 눌림목 대기", 1
         else:
             continue
-        trigger = float(detail.get("breakout_entry", 0) or detail.get("pullback_entry", 0) or 0)
+        trigger = float(
+            detail.get("structural_entry", 0)
+            or detail.get("breakout_entry", 0)
+            or detail.get("pullback_entry", 0)
+            or 0
+        )
         rank = priority * 100 + score + positive_count * 5 + min(rvol, 5) * 2 + min(risk_reward, 4) * 2
         candidates.append({
             "ticker": ticker, "name": name or ticker, "stage": stage,
@@ -620,9 +627,70 @@ def render_chart(item: dict) -> None:
     st.altair_chart((wick + body + lines + buy + sell).properties(height=430), use_container_width=True)
 
 
+def structural_trade_plan(item: dict, market: str) -> dict:
+    """실제 분봉 스윙 고저점과 VWAP·EMA로만 진입/매도/무효가를 만든다."""
+    price = float(item.get("price", 0) or 0)
+    highs = [float(x) for x in (item.get("chart_high_1m", []) or []) if float(x or 0) > 0]
+    lows = [float(x) for x in (item.get("chart_low_1m", []) or []) if float(x or 0) > 0]
+    closes = [float(x) for x in (item.get("chart_close_1m", []) or []) if float(x or 0) > 0]
+    if price <= 0 or len(highs) < 10 or len(lows) < 10:
+        item["level_plan_valid"] = False
+        item["level_plan_reason"] = "분봉 고가·저가가 부족해 지지·저항을 확정하지 못함"
+        return item
+
+    swing_highs = [
+        highs[i] for i in range(2, len(highs) - 2)
+        if highs[i] >= max(highs[i - 2:i]) and highs[i] >= max(highs[i + 1:i + 3])
+    ]
+    resistance_candidates = [x for x in swing_highs if x > price]
+    if not resistance_candidates:
+        item["level_plan_valid"] = False
+        item["level_plan_reason"] = "현재가 위에서 확인된 실제 1분봉 스윙 고점이 없음"
+        return item
+    resistance = min(resistance_candidates)
+    resistance_reason = "최근 1분봉에서 확인된 가장 가까운 스윙 고점"
+
+    vwap = float(item.get("vwap", 0) or 0)
+    ema9 = float(item.get("ema9", 0) or 0)
+    swing_lows = [
+        lows[i] for i in range(2, len(lows) - 2)
+        if lows[i] <= min(lows[i - 2:i]) and lows[i] <= min(lows[i + 1:i + 3])
+    ]
+    support_candidates = [(x, "최근 1분봉 스윙 저점") for x in swing_lows if x < price]
+    if 0 < vwap < price:
+        support_candidates.append((vwap, "실제 체결량 가중 VWAP"))
+    if 0 < ema9 < price:
+        support_candidates.append((ema9, "1분봉 EMA9"))
+    if not support_candidates:
+        item["level_plan_valid"] = False
+        item["level_plan_reason"] = "현재가 아래에서 확인된 실제 스윙 저점·VWAP·EMA 지지가 없음"
+        return item
+    support, support_reason = max(support_candidates, key=lambda value: value[0])
+    stop = support
+    entry = price
+    risk = entry - stop
+    reward = resistance - entry
+    rr = reward / risk if risk > 0 else 0.0
+
+    item.update({
+        "structural_entry": entry,
+        "structural_target": resistance,
+        "structural_support": support,
+        "stop_loss": stop,
+        "risk_reward": rr,
+        "level_plan_valid": reward > 0 and risk > 0,
+        "target_basis": resistance_reason,
+        "stop_basis": f"{support_reason} 이탈 시 상승 시나리오 무효",
+        "level_plan_reason": f"{resistance_reason} {fmt(resistance)} / 지지선 {fmt(support)}",
+    })
+    return item
+
+
 def precise_analysis(row: dict, mode: str) -> dict:
     raw = scanner().analyze(dict(row), mode)
-    return apply_mode_policy(finalize_trade_item(raw), mode)
+    item = apply_mode_policy(finalize_trade_item(raw), mode)
+    market = "국내" if mode.startswith("국내") else "미국"
+    return structural_trade_plan(item, market)
 
 
 def background_audit_tick(enabled: bool, now_ts: float) -> None:
@@ -859,6 +927,9 @@ if price > price_limit and not is_manual_search:
 elif not quality_passed:
     level, label = "error", "🔴 판정 불가 · 실시간 데이터 검문 미통과"
     latest["entry_checks_passed"] = False
+elif not bool(latest.get("level_plan_valid")):
+    level, label = "error", "🔴 진입 금지 · 실제 지지·저항 가격대 미확인"
+    latest["entry_checks_passed"] = False
 elif not context_aligned:
     level, label = "error", f"🔴 진입 금지 · 기초지수/시장({context.get('name')}) 동조 미확인"
     latest["entry_checks_passed"] = False
@@ -897,9 +968,23 @@ status_cols[2].metric(
 status_cols[3].metric("손익비", f"{risk_reward:.2f}")
 st.caption(f"현재 적용 기법: {regime_method}")
 
+level_cols = st.columns(4)
+level_cols[0].metric("진입 기준가", fmt(latest.get("structural_entry")))
+level_cols[1].metric("1차 저항 매도가", fmt(latest.get("structural_target")))
+level_cols[2].metric("확인된 지지선", fmt(latest.get("structural_support")))
+level_cols[3].metric("시나리오 무효·손절", fmt(latest.get("stop_loss")))
+st.caption(
+    f"매도가 근거: {latest.get('target_basis', '미확인')} · "
+    f"손절 근거: {latest.get('stop_basis', latest.get('level_plan_reason', '미확인'))}"
+)
+
 getattr(st, level)(label)
 if level == "success":
-    st.write(f"진입: **{fmt(latest.get('pullback_entry'))}** · 손절: **{fmt(latest.get('stop_loss'))}** · +1%: **{fmt(price * 1.01)}**")
+    st.write(
+        f"진입: **{fmt(latest.get('structural_entry'))}** · "
+        f"1차 저항 매도: **{fmt(latest.get('structural_target'))}** · "
+        f"손절: **{fmt(latest.get('stop_loss'))}**"
+    )
 elif level == "error":
     st.write(latest.get("invalidation_reason", "VWAP·EMA·호가 조건 이탈"))
 else:
@@ -910,13 +995,14 @@ breakout_price = float(latest.get("breakout_entry", 0) or 0)
 stop_price = float(latest.get("stop_loss", 0) or 0)
 if level == "success":
     st.success(
-        f"▶ 지금 진입 검토: {fmt(pullback_price)}~{fmt(price)} 지정가 분할매수 · "
-        f"{fmt(stop_price)} 이탈 시 매수 판단 무효"
+        f"▶ 지금 진입 검토: 현재 체결가 {fmt(price)} · "
+        f"최근 스윙 저항 {fmt(latest.get('structural_target'))}에서 1차 매도 · "
+        f"확인된 지지 {fmt(stop_price)} 이탈 시 매수 판단 무효"
     )
 elif level == "warning":
     st.warning(
-        f"▶ 지금은 매수하지 않음 · ① {fmt(pullback_price)} 부근까지 눌린 뒤 VWAP 재돌파하거나 "
-        f"② {fmt(breakout_price)} 위에서 1분봉이 마감되고 매수 합의 6/10 이상이면 진입 검토"
+        f"▶ 지금은 매수하지 않음 · 확인된 지지 {fmt(latest.get('structural_support'))}에서 반등하고 "
+        f"VWAP·EMA를 회복해 매수 합의 6/10 이상이 될 때만 진입 검토"
     )
 else:
     if price > price_limit and not is_manual_search:
@@ -940,16 +1026,18 @@ f20 = float(latest.get("forecast_20m", 0) or 0)
 f30 = float(latest.get("forecast_30m", 0) or 0)
 forecast_cols = st.columns(4)
 for column, minutes, forecast in zip(forecast_cols, (5, 10, 20, 30), (f5, f10, f20, f30)):
-    expected = price * (1 + forecast / 100)
-    uncertainty = max(0.20, abs(forecast) * 0.50)
-    low = price * (1 + (forecast - uncertainty) / 100)
-    high = price * (1 + (forecast + uncertainty) / 100)
-    column.metric(
-        f"{minutes}분 예상 도달가 · {forecast_label(forecast)}",
-        fmt(expected),
-        f"{forecast:+.2f}%",
-    )
-    column.caption(f"예상 범위 {fmt(low)}~{fmt(high)}")
+    direction = forecast_label(forecast)
+    if forecast >= 0.35:
+        grounded_price = fmt(latest.get("structural_target"))
+        basis = latest.get("target_basis", "스윙 고점")
+    elif forecast <= -0.35:
+        grounded_price = fmt(latest.get("structural_support"))
+        basis = latest.get("stop_basis", "스윙 저점")
+    else:
+        grounded_price = f"{fmt(latest.get('structural_support'))}~{fmt(latest.get('structural_target'))}"
+        basis = "확인된 지지·저항 사이"
+    column.metric(f"{minutes}분 판정 · {direction}", grounded_price)
+    column.caption(str(basis))
 
 target_probability = int(latest.get("target1_probability", 0) or 0)
 if level == "success" and min(f5, f10, f20, f30) > 0:
@@ -962,26 +1050,7 @@ elif min(f5, f10, f20, f30) < 0:
 else:
     st.warning("⏳ 시간대별 방향이 일치하지 않습니다. 진입을 기다리세요.")
 
-st.subheader("현재 차트가 가리키는 예상 도달가격")
-path_cols = st.columns(4)
-for column, minutes, forecast in zip(path_cols, (5, 10, 20, 30), (f5, f10, f20, f30)):
-    expected = price * (1 + forecast / 100)
-    direction = "상승" if forecast > 0 else "하락" if forecast < 0 else "횡보"
-    column.metric(f"{minutes}분 뒤 {direction}", fmt(expected), f"현재가 대비 {forecast:+.2f}%")
-
-st.subheader("+1% · +2% · +3% 도달 여부 점검")
-goal_cols = st.columns(3)
-upside = max(f5, f10, f20, f30)
-for column, goal in zip(goal_cols, (1, 2, 3)):
-    goal_price = price * (1 + goal / 100)
-    if level == "success" and min(f5, f10, f20, f30) > 0 and upside >= goal:
-        status = "도달 가능 구간"
-    elif min(f5, f10, f20, f30) < 0:
-        status = "진입 금지"
-    else:
-        status = "아직 부족·대기"
-    column.metric(f"+{goal}% 목표", fmt(goal_price), status)
-st.caption("표시 가격은 현재 데이터에서 가장 가능성이 높은 추정 경로입니다. 실제 체결·뉴스·호가 변화로 달라질 수 있습니다.")
+st.caption("표시 가격은 임의 퍼센트 목표가가 아니라 현재 1분봉에서 실제로 확인된 지지·저항 가격입니다. 확인되지 않으면 숫자를 만들지 않고 진입을 차단합니다.")
 
 render_chart(latest)
 
