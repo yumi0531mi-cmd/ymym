@@ -635,8 +635,8 @@ def live_filtered_universe(market: str) -> list[dict]:
             valid = (
                 2_000 <= price <= limit
                 and 0.30 <= change < 15.0
-                and volume >= 300_000
-                and trading_value >= 30_000_000_000
+                and volume >= 100_000
+                and trading_value >= 10_000_000_000
                 and not any(word in name for word in blocked_words)
             )
         else:
@@ -644,10 +644,10 @@ def live_filtered_universe(market: str) -> list[dict]:
             # 거래대금을 동시에 충족해야 여러 차례 진입·청산할 가능성이 있다.
             # 직접 검색은 이 제한을 받지 않는다.
             valid = (
-                5.0 <= price <= limit
+                3.0 <= price <= limit
                 and 0.20 <= change < 12.0
-                and volume >= 500_000
-                and trading_value >= 25_000_000
+                and volume >= 100_000
+                and trading_value >= 10_000_000
                 and not any(word in name.upper() for word in ("WARRANT", "RIGHT", "UNIT"))
             )
         if valid:
@@ -688,10 +688,13 @@ def live_filtered_universe(market: str) -> list[dict]:
             volume = candidate["screen_volume"]
             trading_value = price * volume
             change_ok = 0.30 <= change < 15.0 if market == "국내" else 0.20 <= change < 12.0
-            liquidity_ok = (
-                volume >= 300_000 and trading_value >= 30_000_000_000
+            # 일부 KIS 현재가 응답은 누적 거래량을 주지 않는다. 핵심 우량주
+            # 풀에서는 이 경우 예비후보로만 통과시키고, 이후 정밀분석의 분봉
+            # 거래량·호가·반복 폭 검문에서 실제 진입 가능 여부를 결정한다.
+            liquidity_ok = volume <= 0 or (
+                volume >= 100_000 and trading_value >= 10_000_000_000
                 if market == "국내"
-                else volume >= 500_000 and trading_value >= 25_000_000
+                else volume >= 100_000 and trading_value >= 10_000_000
             )
             if 0 < price <= limit and change_ok and liquidity_ok:
                 candidate["asset_type"] = str(candidate.get("asset_type") or "상승 후보")
