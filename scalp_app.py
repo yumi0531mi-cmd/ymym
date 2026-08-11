@@ -450,7 +450,7 @@ def live_filtered_universe(market: str) -> list[dict]:
                 name = str(candidate.get("name", ""))
                 trading_value = price * volume
                 if (
-                    0 < price <= limit and 0 < change < 29.5
+                    0 < price <= limit and 0 < change < 25.0
                     and volume >= 100_000 and trading_value >= 10_000_000_000
                     and not any(word in name for word in blocked_words)
                 ):
@@ -466,7 +466,10 @@ def live_filtered_universe(market: str) -> list[dict]:
             candidate["screen_price"] = float(quote.get("price", 0) or 0)
             candidate["screen_change"] = float(quote.get("change", 0) or 0)
             change = candidate["screen_change"]
-            change_ok = 0 < change < 29.5 if market == "국내" else change > 0
+            # Korean automatic candidates need room before the +30% ceiling.
+            # At +25% or above, remaining upside is too small for a fresh scalp
+            # and execution can freeze near the limit-up queue.
+            change_ok = 0 < change < 25.0 if market == "국내" else change > 0
             if 0 < candidate["screen_price"] <= limit and change_ok:
                 accepted.append(candidate)
         except Exception:
