@@ -420,7 +420,7 @@ def benchmark_context(market: str, ticker: str) -> dict:
             intraday = ((float(bars["close"].iloc[-1]) / float(bars["close"].iloc[-6]) - 1) * 100 * direction) if len(bars) >= 6 else 0.0
             return {"name": bench, "change": change, "intraday": intraday, "confirmed": len(bars) >= 20}
         mapping = {
-            "488080": [("005930", 0.5), ("000660", 0.5)…7906 tokens truncated…rt_path.read_bytes(),
+            "488080": [("005930", 0.5), ("000660", 0.5)…7782 tokens truncated…rt_path.read_bytes(),
             file_name="validation_report.html", mime="text/html", key="audit_report_download",
         )
     try:
