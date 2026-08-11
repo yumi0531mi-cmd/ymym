@@ -299,12 +299,17 @@ st.markdown("""
   .trade-action.buy {border-color:#19a15f;background:#ecfbf3}.trade-action.sell {border-color:#e45656;background:#fff0f0}
   .trade-action.wait {border-color:#dcae32;background:#fff9e8}.trade-action.stop {border-color:#b93838;background:#ffe9e9}
   .trade-action h2 {font-size:1.45rem;margin:0 0 .35rem 0}.trade-action p {font-size:1rem;margin:.12rem 0}
+  .forecast-card {background:#f7f8fb;border:1px solid #e6e8ee;border-radius:12px;padding:12px;min-height:118px;}
+  .forecast-card .title {font-size:.9rem;line-height:1.25;margin-bottom:9px;}
+  .forecast-card .price {font-size:1.45rem;font-weight:650;line-height:1.15;white-space:normal;overflow-wrap:anywhere;}
+  .forecast-card .basis {font-size:.78rem;color:#777;margin-top:8px;line-height:1.25;}
   @media(max-width:700px){
     .block-container{padding:.45rem}
     [data-testid="stMetric"]{padding:6px}
     [data-testid="stMetricValue"]{font-size:1.22rem !important}
     [data-testid="stMetricLabel"]{font-size:.76rem !important}
     .trade-action h2{font-size:1.2rem}.trade-action p{font-size:.9rem}
+    .forecast-card{padding:9px;min-height:105px}.forecast-card .price{font-size:1.05rem}.forecast-card .title{font-size:.76rem}
   }
 </style>
 """, unsafe_allow_html=True)
@@ -1557,10 +1562,13 @@ for column, minutes, forecast in zip(forecast_cols, (5, 10, 20, 30), (f5, f10, f
         grounded_price = fmt(latest.get("structural_support"))
         basis = latest.get("stop_basis", "스윙 저점")
     else:
-        grounded_price = f"{fmt(latest.get('structural_support'))}~{fmt(latest.get('structural_target'))}"
+        grounded_price = f"{fmt(latest.get('structural_support'))}<br>~ {fmt(latest.get('structural_target'))}"
         basis = "확인된 지지·저항 사이"
-    column.metric(f"{minutes}분 판정 · {direction}", grounded_price)
-    column.caption(str(basis))
+    column.markdown(
+        f'<div class="forecast-card"><div class="title">{minutes}분 판정 · {direction}</div>'
+        f'<div class="price">{grounded_price}</div><div class="basis">{basis}</div></div>',
+        unsafe_allow_html=True,
+    )
 
 target_probability = int(latest.get("target1_probability", 0) or 0)
 if level == "success" and min(f5, f10, f20, f30) > 0:
