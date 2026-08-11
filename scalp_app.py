@@ -877,6 +877,7 @@ elif now - float(st.session_state.get("scalp_last_quote", 0)) >= 1:
         refreshed = scanner().refresh_quotes([latest], mode)
         if refreshed:
             latest.update(refreshed[0])
+            latest = structural_trade_plan(latest, market)
             st.session_state["scalp_latest"] = latest
         st.session_state["scalp_last_quote"] = now
     except Exception as error:
