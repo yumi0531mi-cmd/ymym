@@ -471,13 +471,13 @@ def live_filtered_universe(market: str) -> list[dict]:
         deduped.values(),
         key=lambda row: (float(row.get("screen_change", 0) or 0), int(row.get("screen_volume", 0) or 0)),
         reverse=True,
-    )[:20]
+    )[:8]
 
 
 def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -> list[dict]:
     """이미 자동검증기가 수집한 최신 분석을 재사용해 추가 API 호출 없이 후보를 정렬한다."""
     market_code = "KR" if market == "국내" else "US"
-    cutoff = int(time.time()) - 12 * 60
+    cutoff = int(time.time()) - 3 * 60
     try:
         with audit_connect() as db:
             rows = db.execute("""
@@ -748,7 +748,7 @@ def background_audit_tick(enabled: bool, now_ts: float) -> None:
     if now_dt.weekday() >= 5 or hhmm < 8 * 60 + 50 or hhmm > 15 * 60 + 35:
         return
     last = float(st.session_state.get("audit_last_tick", 0.0))
-    if now_ts - last < 25:
+    if now_ts - last < 8:
         return
     dynamic_rows = live_filtered_universe("국내")
     dynamic_members = [
@@ -763,7 +763,7 @@ def background_audit_tick(enabled: bool, now_ts: float) -> None:
         with audit_connect() as db:
             if audit_signal_window_open("KR", now_dt):
                 item = precise_analysis(row, "국내 30분 1% 타점")
-                audit_store_result(db, "KR", item, int(now_ts), 300)
+                audit_store_result(db, "KR", item, int(now_ts), 60)
             else:
                 quote = scanner().client.kr_quote(ticker)
                 audit_store_quote(db, "KR", ticker, float(quote.get("price", 0) or 0), int(now_ts))
