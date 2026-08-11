@@ -429,10 +429,30 @@ def benchmark_context(market: str, ticker: str) -> dict:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def live_filtered_universe(market: str) -> list[dict]:
-    """Apply the candidate price ceiling using live KIS quotes, not a stale static list."""
+    """상승 종목을 먼저 찾고 가격·유동성을 통과한 종목만 후보로 사용한다."""
     source = KR_UNIVERSE if market == "국내" else US_UNIVERSE
     limit = 300000 if market == "국내" else 200
     accepted = []
+    if market == "국내":
+        try:
+            ranked = scanner().candidates("국내 돌파")
+            blocked_words = ("스팩", "우선주", "관리", "정리매매", "인버스")
+            for row in ranked:
+                candidate = dict(row)
+                price = float(candidate.get("screen_price", 0) or 0)
+                change = float(candidate.get("screen_change", 0) or 0)
+                volume = int(candidate.get("screen_volume", 0) or 0)
+                name = str(candidate.get("name", ""))
+                trading_value = price * volume
+                if (
+                    0 < price <= limit and change > 0
+                    and volume >= 100_000 and trading_value >= 10_000_000_000
+                    and not any(word in name for word in blocked_words)
+                ):
+                    candidate["asset_type"] = "실시간 상승·유동성 후보"
+                    accepted.append(candidate)
+        except Exception:
+            pass
     for row in source:
         try:
             quote = (scanner().client.kr_quote(row["ticker"]) if market == "국내"
@@ -440,11 +460,16 @@ def live_filtered_universe(market: str) -> list[dict]:
             candidate = dict(row)
             candidate["screen_price"] = float(quote.get("price", 0) or 0)
             candidate["screen_change"] = float(quote.get("change", 0) or 0)
-            if 0 < candidate["screen_price"] <= limit:
+            if 0 < candidate["screen_price"] <= limit and candidate["screen_change"] > 0:
                 accepted.append(candidate)
         except Exception:
             continue
-    return accepted
+    deduped = {row["ticker"]: row for row in accepted}
+    return sorted(
+        deduped.values(),
+        key=lambda row: (float(row.get("screen_change", 0) or 0), int(row.get("screen_volume", 0) or 0)),
+        reverse=True,
+    )[:20]
 
 
 def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -> list[dict]:
@@ -612,8 +637,14 @@ def background_audit_tick(enabled: bool, now_ts: float) -> None:
     last = float(st.session_state.get("audit_last_tick", 0.0))
     if now_ts - last < 25:
         return
-    index = int(st.session_state.get("audit_member_index", 0)) % len(AUDIT_KR_UNIVERSE)
-    ticker, name, exchange_name = AUDIT_KR_UNIVERSE[index]
+    dynamic_rows = live_filtered_universe("국내")
+    dynamic_members = [
+        (str(row.get("ticker")), str(row.get("name") or row.get("ticker")), str(row.get("exchange") or "KR"))
+        for row in dynamic_rows if row.get("ticker")
+    ]
+    audit_members = dynamic_members or AUDIT_KR_UNIVERSE
+    index = int(st.session_state.get("audit_member_index", 0)) % len(audit_members)
+    ticker, name, exchange_name = audit_members[index]
     row = {"ticker": ticker, "name": name, "exchange": exchange_name, "asset_type": "검증대상"}
     try:
         with audit_connect() as db:
