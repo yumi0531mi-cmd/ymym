@@ -356,7 +356,12 @@ def data_quality_gate(item: dict, market: str) -> tuple[list[dict], bool, float 
     max_spread = 0.35 if "레버리지" in str(item.get("asset_type", "")) else 0.25
     if spread is not None:
         checks.append({"검문": "스프레드", "통과": spread <= max_spread, "내용": f"기준 {max_spread:.2f}% 이하"})
-    return checks, all(bool(row["통과"]) for row in checks), spread
+    # Only chart-critical evidence can make the whole analysis unavailable.
+    # KIS occasionally omits an order-book snapshot and RVOL can be distorted
+    # early in a session; those remain visible warnings but must not erase a
+    # valid current price, fresh one-minute bars, VWAP and EMA analysis.
+    critical_checks = checks[:5]
+    return checks, all(bool(row["통과"]) for row in critical_checks), spread
 
 
 def market_regime(item: dict) -> tuple[str, str]:
