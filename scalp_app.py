@@ -339,7 +339,13 @@ def data_quality_gate(item: dict, market: str) -> tuple[list[dict], bool, float 
     last_bar_age = None
     try:
         times = item.get("chart_time_1m", []) or []
-        last_bar = pd.to_datetime(times[-1], utc=True)
+        last_bar = pd.Timestamp(pd.to_datetime(times[-1]))
+        # KIS may return either timezone-aware timestamps or naive Korean
+        # exchange timestamps. Treating a naive KST value as UTC made stale
+        # bars look fresh for nine hours.
+        if last_bar.tzinfo is None:
+            last_bar = last_bar.tz_localize(KST)
+        last_bar = last_bar.tz_convert("UTC")
         last_bar_age = max(0.0, (pd.Timestamp.now(tz="UTC") - last_bar).total_seconds())
     except Exception:
         pass
@@ -461,7 +467,14 @@ def live_filtered_universe(market: str) -> list[dict]:
                     accepted.append(candidate)
         except Exception:
             pass
-    for row in source:
+    # The ranked market response is one bulk call. Do not follow it with an
+    # unbounded sequence of per-symbol calls: that was the main reason the UI
+    # looked frozen. Static blue-chip/ETF fallbacks are deliberately bounded.
+    # If the bulk rising-rank endpoint returned anything, use it immediately.
+    # Blue chips/ETFs remain available through direct search. Only when the
+    # bulk endpoint is empty do we make a very small four-symbol fallback.
+    fallback_source = [] if accepted else source[:4]
+    for row in fallback_source:
         try:
             quote = (scanner().client.kr_quote(row["ticker"]) if market == "국내"
                      else scanner().client.us_quote(row["ticker"], row["exchange"]))
@@ -514,7 +527,9 @@ def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -
         positive_count = sum(x > 0 for x in forecasts)
         rvol = float(detail.get("rvol", 0) or 0)
         risk_reward = float(detail.get("risk_reward", 0) or 0)
-        current_change = float(detail.get("change_percent", detail.get("change", 0)) or 0)
+        current_change = float(
+            detail.get("screen_change", detail.get("change_percent", detail.get("change", 0))) or 0
+        )
         trend_score = int(detail.get("continuous_rise_score", 0) or 0)
         continuous_rise = bool(detail.get("continuous_rise"))
         level_plan_valid = bool(detail.get("level_plan_valid"))
@@ -881,7 +896,11 @@ def precise_analysis(row: dict, mode: str) -> dict:
             pass
         time.sleep(0.2)
     market = "국내" if mode.startswith("국내") else "미국"
-    return repeat_scalp_plan(structural_trade_plan(item, market))
+    item = repeat_scalp_plan(structural_trade_plan(item, market))
+    _, gate_ok, spread = data_quality_gate(item, market)
+    item["data_gate_passed"] = bool(gate_ok)
+    item["verified_spread_percent"] = spread
+    return item
 
 
 def background_audit_tick(enabled: bool, now_ts: float) -> None:
@@ -929,7 +948,7 @@ def background_audit_tick(enabled: bool, now_ts: float) -> None:
 
 
 st.title("⚡ 초단타 VWAP 매수타점")
-st.caption("선택 종목은 약 1초마다 현재가를 확인하고, 20초마다 1분봉·VWAP·EMA·거래량·호가를 정밀 재분석합니다.")
+st.caption("집중 모드에서는 약 2.5초마다 화면을 갱신하고, 20초마다 1분봉·VWAP·EMA·거래량·호가를 정밀 재분석합니다.")
 
 with st.sidebar:
     st.header("초단타 설정")
@@ -947,7 +966,7 @@ manual_search_active = bool(manual_ticker)
 # Streamlit reruns the whole script. During a direct search, keep the refresh
 # gentle so a queued one-second rerun cannot make the input look frozen.
 st_autorefresh(
-    interval=2500 if manual_search_active and focus_only else 8000,
+    interval=2500 if focus_only else 8000,
     key="scalp_tick",
 )
 auto_audit = st.sidebar.toggle(
@@ -961,7 +980,8 @@ if AUDIT_IMPORT_ERROR:
 elif auto_audit:
     # Direct search has priority over the background universe collector.
     # The collector resumes automatically as soon as the search box is empty.
-    if not manual_search_active and not focus_only:
+    audit_paused_for_focus = manual_search_active or focus_only
+    if not audit_paused_for_focus:
         background_audit_tick(True, now)
     audit_now = datetime.fromtimestamp(now, KST)
     audit_minute = audit_now.hour * 60 + audit_now.minute
@@ -978,8 +998,9 @@ elif auto_audit:
     else:
         audit_phase = "오늘 검증 완료 · 결과를 내려받으세요"
     last_audit_ok = st.session_state.get("audit_last_ok")
+    displayed_phase = "집중분석 우선 · 후보 수집 일시정지" if audit_paused_for_focus else audit_phase
     st.sidebar.success(
-        "자동검증 · " + audit_phase
+        "자동검증 · " + displayed_phase
         + (f"\n\n최근 처리: {last_audit_ok}" if last_audit_ok else "")
     )
     if st.session_state.get("audit_last_error"):
@@ -1065,7 +1086,7 @@ if st.session_state.get("scalp_selected") != selected_ticker:
     st.session_state["scalp_live_history"] = []
 
 latest = dict(st.session_state.get("scalp_latest", {}))
-precise_refresh_seconds = 60 if auto_audit else 20
+precise_refresh_seconds = 20 if focus_only or manual_search_active else (60 if auto_audit else 20)
 precise_due = now - float(st.session_state.get("scalp_last_precise", 0)) >= precise_refresh_seconds
 if precise_due or not latest:
     with st.spinner(f"{selected_ticker} 1분봉 정밀분석 중..."):
@@ -1081,7 +1102,7 @@ elif now - float(st.session_state.get("scalp_last_quote", 0)) >= 1:
         refreshed = scanner().refresh_quotes([latest], mode)
         if refreshed:
             latest.update(refreshed[0])
-            latest = structural_trade_plan(latest, market)
+            latest = repeat_scalp_plan(structural_trade_plan(latest, market))
             st.session_state["scalp_latest"] = latest
         st.session_state["scalp_last_quote"] = now
     except Exception as error:
