@@ -590,7 +590,6 @@ def live_filtered_universe(market: str) -> list[dict]:
     때만 쓰는 장애 대비용이다.
     """
     source = KR_UNIVERSE if market == "국내" else US_UNIVERSE
-    core_tickers = {str(row.get("ticker", "")).upper() for row in source}
     limit = 300000 if market == "국내" else 200
     accepted: list[dict] = []
     ranked_rows: dict[str, dict] = {}
@@ -620,10 +619,10 @@ def live_filtered_universe(market: str) -> list[dict]:
     blocked_words = ("스팩", "우선주", "관리", "정리매매", "인버스")
     for candidate in ranked_rows.values():
         ticker = str(candidate.get("ticker", "")).upper()
-        # 자동 후보는 회복 가능성과 체결 안정성을 우선해 대형 우량주·대표
-        # ETF·충분히 거래되는 레버리지 ETF 풀 안에서만 고른다. 직접 검색은 예외다.
-        if ticker not in core_tickers:
-            continue
+        # 거래소 실시간 순위의 전 종목을 1차 검사한다. 고정 우량주·ETF
+        # 목록은 API 순위가 비었을 때만 쓰는 장애 대비용이며, 정상 후보를
+        # 가로막는 화이트리스트로 사용하지 않는다. 아래 유동성·상승률 필터와
+        # 이후 분봉/지지·저항/손익비 검문을 모두 통과해야 화면에 표시된다.
         price = float(candidate.get("screen_price", 0) or 0)
         change = float(candidate.get("screen_change", 0) or 0)
         volume = int(candidate.get("screen_volume", 0) or 0)
