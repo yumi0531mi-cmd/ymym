@@ -234,6 +234,11 @@ def store_result(db: sqlite3.Connection, market: str, item: dict, now_ts: int, b
             "chart_verdict", "entry_checks_passed", "risk_reward", "rvol", "vwap", "ema9",
             "rsi", "five_min_risk_score", "change_percent", "data_completeness",
             "pullback_entry", "breakout_entry", "stop_loss", "risk_reward",
+            "structural_entry", "structural_target", "structural_support",
+            "level_plan_valid", "target_basis", "stop_basis",
+            "continuous_rise", "continuous_rise_score", "continuous_rise_checks",
+            "trend_return_5m", "trend_return_15m", "trend_return_30m",
+            "up_down_volume_ratio",
         )
     }
     data_valid = int(
