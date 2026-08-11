@@ -420,7 +420,7 @@ def benchmark_context(market: str, ticker: str) -> dict:
             intraday = ((float(bars["close"].iloc[-1]) / float(bars["close"].iloc[-6]) - 1) * 100 * direction) if len(bars) >= 6 else 0.0
             return {"name": bench, "change": change, "intraday": intraday, "confirmed": len(bars) >= 20}
         mapping = {
-            "488080": [("005930", 0.5), ("000660", 0.5)…7487 tokens truncated… "오늘 검증 완료 · 결과를 내려받으세요"
+            "488080": [("005930", 0.5), ("000660", 0.5)…7639 tokens truncated… "오늘 검증 완료 · 결과를 내려받으세요"
     last_audit_ok = st.session_state.get("audit_last_ok")
     displayed_phase = "집중분석 우선 · 후보 수집 일시정지" if audit_paused_for_focus else audit_phase
     st.sidebar.success(
