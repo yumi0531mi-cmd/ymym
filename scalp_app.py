@@ -503,26 +503,32 @@ def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -
         positive_count = sum(x > 0 for x in forecasts)
         rvol = float(detail.get("rvol", 0) or 0)
         risk_reward = float(detail.get("risk_reward", 0) or 0)
+        trend_score = int(detail.get("continuous_rise_score", 0) or 0)
+        continuous_rise = bool(detail.get("continuous_rise"))
+        level_plan_valid = bool(detail.get("level_plan_valid"))
         score = float(score or 0)
-        if entry_ok and data_valid and score >= minimum_score:
-            stage, priority = "🟢 지금 진입 검토", 3
-        elif data_valid and score >= minimum_score and positive_count >= 3 and risk_reward >= 1.5:
-            stage, priority = "🟡 돌파 시 진입", 2
-        elif data_valid and positive_count >= 2 and risk_reward >= 1.3:
-            stage, priority = "🟠 눌림목 대기", 1
-        else:
+        if not (data_valid and continuous_rise and level_plan_valid and trend_score >= 7 and risk_reward >= 1.5):
             continue
+        if entry_ok and score >= minimum_score and trend_score >= 8 and positive_count >= 3:
+            stage, priority = "🟢 지금 진입 검토", 3
+        elif score >= minimum_score and positive_count >= 2:
+            stage, priority = "🟡 상승 지속·눌림 대기", 2
+        else:
+            stage, priority = "🔵 상승 구조·확인 대기", 1
         trigger = float(
             detail.get("structural_entry", 0)
             or detail.get("breakout_entry", 0)
             or detail.get("pullback_entry", 0)
             or 0
         )
-        rank = priority * 100 + score + positive_count * 5 + min(rvol, 5) * 2 + min(risk_reward, 4) * 2
+        rank = priority * 100 + trend_score * 12 + score + positive_count * 5 + min(rvol, 5) * 2 + min(risk_reward, 4) * 2
         candidates.append({
             "ticker": ticker, "name": name or ticker, "stage": stage,
             "price": float(price or 0), "trigger": trigger, "score": score,
             "rvol": rvol, "risk_reward": risk_reward, "issued": int(issued), "rank": rank,
+            "trend_score": trend_score,
+            "target": float(detail.get("structural_target", 0) or 0),
+            "support": float(detail.get("structural_support", 0) or 0),
         })
     return sorted(candidates, key=lambda x: x["rank"], reverse=True)[:limit]
 
@@ -633,10 +639,51 @@ def structural_trade_plan(item: dict, market: str) -> dict:
     highs = [float(x) for x in (item.get("chart_high_1m", []) or []) if float(x or 0) > 0]
     lows = [float(x) for x in (item.get("chart_low_1m", []) or []) if float(x or 0) > 0]
     closes = [float(x) for x in (item.get("chart_close_1m", []) or []) if float(x or 0) > 0]
+    volumes = [float(x or 0) for x in (item.get("chart_volume_1m", []) or [])]
     if price <= 0 or len(highs) < 10 or len(lows) < 10:
         item["level_plan_valid"] = False
         item["level_plan_reason"] = "분봉 고가·저가가 부족해 지지·저항을 확정하지 못함"
         return item
+
+    vwap = float(item.get("vwap", 0) or 0)
+    ema9 = float(item.get("ema9", 0) or 0)
+    ema20 = float(item.get("ema20", 0) or 0)
+    ret5 = (closes[-1] / closes[-6] - 1) * 100 if len(closes) >= 6 else 0.0
+    ret15 = (closes[-1] / closes[-16] - 1) * 100 if len(closes) >= 16 else 0.0
+    ret30 = (closes[-1] / closes[-31] - 1) * 100 if len(closes) >= 31 else 0.0
+    higher_high = len(highs) >= 12 and max(highs[-6:]) > max(highs[-12:-6])
+    higher_low = len(lows) >= 12 and min(lows[-6:]) > min(lows[-12:-6])
+    up_volume = down_volume = 0.0
+    for index in range(max(1, len(closes) - 20), len(closes)):
+        volume = volumes[index] if index < len(volumes) else 0.0
+        if closes[index] > closes[index - 1]:
+            up_volume += volume
+        elif closes[index] < closes[index - 1]:
+            down_volume += volume
+    volume_dominance = up_volume / down_volume if down_volume > 0 else (2.0 if up_volume > 0 else 0.0)
+    vwap_gap = ((price / vwap) - 1) * 100 if vwap > 0 else 99.0
+    trend_checks = {
+        "VWAP 위": price > vwap > 0,
+        "EMA 정배열": price >= ema9 > ema20 > 0,
+        "5분 상승": ret5 > 0,
+        "15분 상승": ret15 > 0,
+        "30분 상승": ret30 > 0,
+        "고점 상승": higher_high,
+        "저점 상승": higher_low,
+        "상승봉 거래량 우세": volume_dominance >= 1.05,
+        "VWAP 과대이격 아님": 0 <= vwap_gap <= (2.5 if market == "국내" else 3.0),
+        "당일 고가권 유지": price >= max(highs) * 0.97,
+    }
+    trend_score = sum(bool(value) for value in trend_checks.values())
+    item.update({
+        "continuous_rise": trend_score >= 7 and ret15 > 0 and ret30 > 0,
+        "continuous_rise_score": trend_score,
+        "continuous_rise_checks": trend_checks,
+        "trend_return_5m": ret5,
+        "trend_return_15m": ret15,
+        "trend_return_30m": ret30,
+        "up_down_volume_ratio": volume_dominance,
+    })
 
     swing_highs = [
         highs[i] for i in range(2, len(highs) - 2)
@@ -650,8 +697,6 @@ def structural_trade_plan(item: dict, market: str) -> dict:
     resistance = min(resistance_candidates)
     resistance_reason = "최근 1분봉에서 확인된 가장 가까운 스윙 고점"
 
-    vwap = float(item.get("vwap", 0) or 0)
-    ema9 = float(item.get("ema9", 0) or 0)
     swing_lows = [
         lows[i] for i in range(2, len(lows) - 2)
         if lows[i] <= min(lows[i - 2:i]) and lows[i] <= min(lows[i + 1:i + 3])
@@ -805,14 +850,13 @@ st.subheader("실시간 진입 후보")
 if candidate_board:
     board_rows = []
     for candidate in candidate_board:
-        trigger_text = "즉시 조건 충족" if candidate["stage"].startswith("🟢") else (
-            f"{candidate['trigger']:,.0f} 돌파 확인" if market == "국내" and candidate["trigger"] > 0
-            else f"${candidate['trigger']:,.2f} 돌파 확인" if candidate["trigger"] > 0
-            else "VWAP 재돌파 확인"
-        )
+        support_text = fmt(candidate["support"])
+        trigger_text = "현재 조건 충족" if candidate["stage"].startswith("🟢") else f"{support_text} 지지·VWAP 회복 확인"
         board_rows.append({
             "판정": candidate["stage"], "종목": f"{candidate['ticker']} · {candidate['name']}",
             "현재가": candidate["price"], "진입 발동": trigger_text,
+            "실제 저항": candidate["target"], "무효 지지": candidate["support"],
+            "지속상승": f"{candidate['trend_score']}/10",
             "점수": round(candidate["score"]), "RVOL": round(candidate["rvol"], 1),
             "손익비": round(candidate["risk_reward"], 2),
             "분석시각": datetime.fromtimestamp(candidate["issued"], KST).strftime("%H:%M:%S"),
@@ -919,6 +963,8 @@ context_aligned = bool(context.get("confirmed")) and (
 risk_reward = float(latest.get("risk_reward", 0) or 0)
 price_limit = 300000 if market == "국내" else 200
 is_manual_search = str(selected_row.get("asset_type", "")) == "직접 검색"
+continuous_rise = bool(latest.get("continuous_rise"))
+continuous_rise_score = int(latest.get("continuous_rise_score", 0) or 0)
 if price <= 0:
     st.error("⛔ 현재가가 확인되지 않아 분석과 매수 판정을 중단했습니다.")
     st.stop()
@@ -930,6 +976,9 @@ elif not quality_passed:
     latest["entry_checks_passed"] = False
 elif not bool(latest.get("level_plan_valid")):
     level, label = "error", "🔴 진입 금지 · 실제 지지·저항 가격대 미확인"
+    latest["entry_checks_passed"] = False
+elif not is_manual_search and not continuous_rise:
+    level, label = "error", f"🔴 후보 제외 · 장중 지속상승 {continuous_rise_score}/10"
     latest["entry_checks_passed"] = False
 elif not context_aligned:
     level, label = "error", f"🔴 진입 금지 · 기초지수/시장({context.get('name')}) 동조 미확인"
@@ -978,6 +1027,19 @@ st.caption(
     f"매도가 근거: {latest.get('target_basis', '미확인')} · "
     f"손절 근거: {latest.get('stop_basis', latest.get('level_plan_reason', '미확인'))}"
 )
+st.caption(
+    f"장중 지속상승 판정 {continuous_rise_score}/10 · "
+    f"5분 {'상승' if float(latest.get('trend_return_5m', 0) or 0) > 0 else '하락'} · "
+    f"15분 {'상승' if float(latest.get('trend_return_15m', 0) or 0) > 0 else '하락'} · "
+    f"30분 {'상승' if float(latest.get('trend_return_30m', 0) or 0) > 0 else '하락'}"
+)
+with st.expander("장중 지속상승 판정 근거", expanded=False):
+    trend_rows = [
+        {"조건": key, "통과": "✅" if value else "❌"}
+        for key, value in (latest.get("continuous_rise_checks", {}) or {}).items()
+    ]
+    if trend_rows:
+        st.dataframe(pd.DataFrame(trend_rows), hide_index=True, use_container_width=True)
 
 getattr(st, level)(label)
 if level == "success":
