@@ -514,15 +514,20 @@ def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -
         trend_score = int(detail.get("continuous_rise_score", 0) or 0)
         continuous_rise = bool(detail.get("continuous_rise"))
         level_plan_valid = bool(detail.get("level_plan_valid"))
+        repeat_state = str(detail.get("repeat_scalp_state", "UNAVAILABLE"))
         score = float(score or 0)
-        if not (data_valid and continuous_rise and level_plan_valid and trend_score >= 7 and risk_reward >= 1.5):
+        if not (data_valid and level_plan_valid and risk_reward >= 1.5):
             continue
-        if entry_ok and score >= minimum_score and trend_score >= 8 and positive_count >= 3:
-            stage, priority = "🟢 지금 진입 검토", 3
-        elif score >= minimum_score and positive_count >= 2:
-            stage, priority = "🟡 상승 지속·눌림 대기", 2
+        if repeat_state in {"UNAVAILABLE", "EXIT", "TAKE_PROFIT"}:
+            continue
+        if repeat_state == "BUY_PULLBACK":
+            stage, priority = "🟢 눌림 반등 매수", 4
+        elif repeat_state == "HOLD_OR_BREAKOUT":
+            stage, priority = "🟢 돌파 매수 검토", 3
+        elif repeat_state == "WAIT_PULLBACK":
+            stage, priority = "🟡 눌림목 재매수 대기", 2
         else:
-            stage, priority = "🔵 상승 구조·확인 대기", 1
+            stage, priority = "🔵 추세 재확인 대기", 1
         trigger = float(
             detail.get("structural_entry", 0)
             or detail.get("breakout_entry", 0)
@@ -535,6 +540,7 @@ def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -
             "price": float(price or 0), "trigger": trigger, "score": score,
             "rvol": rvol, "risk_reward": risk_reward, "issued": int(issued), "rank": rank,
             "trend_score": trend_score,
+            "repeat_state": repeat_state,
             "target": float(detail.get("structural_target", 0) or 0),
             "support": float(detail.get("structural_support", 0) or 0),
         })
@@ -739,6 +745,99 @@ def structural_trade_plan(item: dict, market: str) -> dict:
     return item
 
 
+def repeat_scalp_plan(item: dict) -> dict:
+    """Classify a repeatable trend scalp using only observed one-minute levels."""
+    price = float(item.get("price", 0) or 0)
+    support = float(item.get("structural_support", 0) or 0)
+    target = float(item.get("structural_target", 0) or 0)
+    vwap = float(item.get("vwap", 0) or 0)
+    ema9 = float(item.get("ema9", 0) or 0)
+    ema20 = float(item.get("ema20", 0) or 0)
+    closes = [float(x) for x in (item.get("chart_close_1m", []) or []) if float(x or 0) > 0]
+    highs = [float(x) for x in (item.get("chart_high_1m", []) or []) if float(x or 0) > 0]
+    lows = [float(x) for x in (item.get("chart_low_1m", []) or []) if float(x or 0) > 0]
+    volumes = [float(x or 0) for x in (item.get("chart_volume_1m", []) or [])]
+    if not item.get("level_plan_valid") or min(price, support, target) <= 0 or len(closes) < 12:
+        item.update({
+            "repeat_scalp_state": "UNAVAILABLE",
+            "repeat_scalp_label": "⚪ 반복단타 판정 대기",
+            "repeat_scalp_reason": "실제 지지선과 위쪽 저항선이 모두 확인될 때까지 대기",
+        })
+        return item
+
+    ranges = [max(0.0, highs[i] - lows[i]) for i in range(max(0, len(highs) - 20), len(highs))]
+    median_range = float(pd.Series(ranges).median()) if ranges else 0.0
+    median_volume = float(pd.Series(volumes[-20:]).median()) if volumes else 0.0
+    last_volume = volumes[-1] if volumes else 0.0
+    trend_score = int(item.get("continuous_rise_score", 0) or 0)
+    ret15 = float(item.get("trend_return_15m", 0) or 0)
+    trend_intact = price >= vwap > 0 and ema9 >= ema20 > 0 and trend_score >= 6 and ret15 >= 0
+    near_support = support <= price <= support + max(median_range, 1e-9)
+    near_target = target >= price and target - price <= max(median_range, 1e-9)
+    bounce = len(closes) >= 2 and closes[-1] > closes[-2] and lows[-1] <= support + max(median_range, 1e-9)
+    volume_returns = median_volume <= 0 or last_volume >= median_volume
+    recent_high = max(highs[-6:]) if len(highs) >= 12 else price
+    prior_high = max(highs[-12:-6]) if len(highs) >= 12 else recent_high
+    recent_low = min(lows[-6:]) if len(lows) >= 12 else price
+    prior_low = min(lows[-12:-6]) if len(lows) >= 12 else recent_low
+    lower_structure = recent_high < prior_high and recent_low < prior_low
+    vwap_break_persistent = len(closes) >= 3 and vwap > 0 and all(value < vwap for value in closes[-3:])
+    ema_bearish = ema9 < ema20 and ema20 > 0
+    macd_bearish = float(item.get("macd_histogram", 0) or 0) < 0
+    down_volume = up_volume = 0.0
+    for index in range(max(1, len(closes) - 12), len(closes)):
+        volume = volumes[index] if index < len(volumes) else 0.0
+        if closes[index] < closes[index - 1]:
+            down_volume += volume
+        elif closes[index] > closes[index - 1]:
+            up_volume += volume
+    sell_volume_dominant = down_volume > up_volume * 1.15
+    reversal_checks = {
+        "VWAP 아래 3개 봉": vwap_break_persistent,
+        "EMA9·EMA20 하락 정렬": ema_bearish,
+        "고점·저점 동시 하락": lower_structure,
+        "MACD 음전환": macd_bearish,
+        "하락봉 거래량 우세": sell_volume_dominant,
+    }
+    reversal_score = sum(bool(value) for value in reversal_checks.values())
+    breakdown = price < support or reversal_score >= 3
+
+    if breakdown:
+        state, label = "EXIT", "🔴 추세 꺾임·전량매도·재진입 금지"
+        reason = (
+            f"확인된 지지 {fmt(support)} 이탈 또는 하락 전환 근거 "
+            f"{reversal_score}/5 동시 발생"
+        )
+    elif price >= target or near_target:
+        state, label = "TAKE_PROFIT", "🟠 매도 접근·분할매도"
+        reason = f"실제 1분봉 저항 {fmt(target)} 도달 구간"
+    elif trend_intact and near_support and bounce and volume_returns:
+        state, label = "BUY_PULLBACK", "🟢 눌림 반등 매수"
+        reason = f"실제 지지 {fmt(support)} 방어 후 양봉 전환·거래량 유지"
+    elif trend_intact and price > ema9 and volume_returns:
+        state, label = "HOLD_OR_BREAKOUT", "🟢 보유·돌파 매수 검토"
+        reason = f"VWAP·EMA 상승 구조 유지, 실제 저항 {fmt(target)}까지 공간 확인"
+    elif trend_intact:
+        state, label = "WAIT_PULLBACK", "🟡 눌림목 재매수 대기"
+        reason = f"추격하지 말고 실제 지지 {fmt(support)} 반등을 기다림"
+    else:
+        state, label = "WAIT_TREND", "🔵 추세 재확인 대기"
+        reason = "VWAP·EMA 정렬과 15분 상승 흐름이 다시 일치할 때까지 대기"
+
+    item.update({
+        "repeat_scalp_state": state,
+        "repeat_scalp_label": label,
+        "repeat_scalp_reason": reason,
+        "repeat_scalp_buy_level": support,
+        "repeat_scalp_sell_level": target,
+        "repeat_scalp_invalidation": support,
+        "repeat_scalp_median_bar_range": median_range,
+        "repeat_scalp_reversal_score": reversal_score,
+        "repeat_scalp_reversal_checks": reversal_checks,
+    })
+    return item
+
+
 def precise_analysis(row: dict, mode: str) -> dict:
     raw = scanner().analyze(dict(row), mode)
     item = apply_mode_policy(finalize_trade_item(raw), mode)
@@ -776,7 +875,7 @@ def precise_analysis(row: dict, mode: str) -> dict:
             pass
         time.sleep(0.2)
     market = "국내" if mode.startswith("국내") else "미국"
-    return structural_trade_plan(item, market)
+    return repeat_scalp_plan(structural_trade_plan(item, market))
 
 
 def background_audit_tick(enabled: bool, now_ts: float) -> None:
@@ -1017,6 +1116,8 @@ price_limit = 300000 if market == "국내" else 200
 is_manual_search = str(selected_row.get("asset_type", "")) == "직접 검색"
 continuous_rise = bool(latest.get("continuous_rise"))
 continuous_rise_score = int(latest.get("continuous_rise_score", 0) or 0)
+repeat_state = str(latest.get("repeat_scalp_state", "UNAVAILABLE"))
+repeat_label = str(latest.get("repeat_scalp_label", "⚪ 반복단타 판정 대기"))
 if price <= 0:
     st.error("⛔ 현재가가 확인되지 않아 분석과 매수 판정을 중단했습니다.")
     st.stop()
@@ -1038,6 +1139,15 @@ elif not context_aligned:
 elif risk_reward < 1.5:
     level, label = "error", f"🔴 진입 금지 · 손익비 {risk_reward:.2f} (최소 1.50 필요)"
     latest["entry_checks_passed"] = False
+elif repeat_state == "EXIT":
+    level, label = "error", repeat_label
+    latest["entry_checks_passed"] = False
+elif repeat_state == "TAKE_PROFIT":
+    level, label = "warning", repeat_label
+    latest["entry_checks_passed"] = False
+elif repeat_state in {"BUY_PULLBACK", "HOLD_OR_BREAKOUT"} and buy_votes >= 4 and sell_votes <= 2:
+    level, label = "success", repeat_label
+    latest["entry_checks_passed"] = True
 elif sell_votes >= 3:
     level, label = "error", f"🔴 진입 금지 · 매도/약세 기법 {sell_votes}개 감지"
     latest["entry_checks_passed"] = False
@@ -1092,6 +1202,28 @@ with st.expander("장중 지속상승 판정 근거", expanded=False):
     ]
     if trend_rows:
         st.dataframe(pd.DataFrame(trend_rows), hide_index=True, use_container_width=True)
+
+st.subheader("추세 반복단타")
+repeat_reason = str(latest.get("repeat_scalp_reason", "실제 지지·저항 확인 대기"))
+repeat_message = (
+    f"{repeat_label} · 매수 기준 {fmt(latest.get('repeat_scalp_buy_level'))} · "
+    f"매도 기준 {fmt(latest.get('repeat_scalp_sell_level'))} · {repeat_reason}"
+)
+if repeat_state == "EXIT":
+    st.error(repeat_message)
+elif repeat_state == "TAKE_PROFIT":
+    st.warning(repeat_message)
+elif repeat_state in {"BUY_PULLBACK", "HOLD_OR_BREAKOUT"}:
+    st.success(repeat_message)
+else:
+    st.info(repeat_message)
+with st.expander("추세 꺾임 판정 근거", expanded=repeat_state == "EXIT"):
+    reversal_rows = [
+        {"하락 전환 조건": key, "감지": "예" if value else "아니오"}
+        for key, value in (latest.get("repeat_scalp_reversal_checks", {}) or {}).items()
+    ]
+    if reversal_rows:
+        st.dataframe(pd.DataFrame(reversal_rows), hide_index=True, use_container_width=True)
 
 getattr(st, level)(label)
 if level == "success":
