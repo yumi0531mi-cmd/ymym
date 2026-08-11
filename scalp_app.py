@@ -420,24 +420,7 @@ def benchmark_context(market: str, ticker: str) -> dict:
             intraday = ((float(bars["close"].iloc[-1]) / float(bars["close"].iloc[-6]) - 1) * 100 * direction) if len(bars) >= 6 else 0.0
             return {"name": bench, "change": change, "intraday": intraday, "confirmed": len(bars) >= 20}
         mapping = {
-            "488080": [("005930", 0.5), ("000660", 0.5)…7639 tokens truncated… "오늘 검증 완료 · 결과를 내려받으세요"
-    last_audit_ok = st.session_state.get("audit_last_ok")
-    displayed_phase = "집중분석 우선 · 후보 수집 일시정지" if audit_paused_for_focus else audit_phase
-    st.sidebar.success(
-        "자동검증 · " + displayed_phase
-        + (f"\n\n최근 처리: {last_audit_ok}" if last_audit_ok else "")
-    )
-    if st.session_state.get("audit_last_error"):
-        st.sidebar.warning(st.session_state["audit_last_error"])
-    if AUDIT_CSV_PATH.exists():
-        st.sidebar.download_button(
-            "검증 CSV 내려받기", AUDIT_CSV_PATH.read_bytes(),
-            file_name="validation_summary.csv", mime="text/csv", key="audit_csv_download",
-        )
-    audit_report_path = AUDIT_DB_PATH.parent / "validation_report.html"
-    if audit_report_path.exists():
-        st.sidebar.download_button(
-            "검증 보고서 내려받기", audit_report_path.read_bytes(),
+            "488080": [("005930", 0.5), ("000660", 0.5)…7906 tokens truncated…rt_path.read_bytes(),
             file_name="validation_report.html", mime="text/html", key="audit_report_download",
         )
     try:
@@ -493,6 +476,16 @@ for row in options:
     if ticker:
         dedup[ticker] = row
 options = list(dedup.values())
+# 수집 단계의 필터를 통과했더라도 캐시·이전 선택·검증 DB에서 다시
+# 유입될 수 있다. 자동 국내 후보는 화면 직전에도 +20% 이상을 강제 제외한다.
+# 직접 검색은 사용자가 원하는 종목을 확인할 수 있도록 예외로 둔다.
+if market == "국내" and not resolved_manual:
+    options = [
+        row for row in options
+        if 0 < float(
+            row.get("screen_change", row.get("change_percent", row.get("change", 0))) or 0
+        ) < 20.0
+    ]
 
 if not options:
     st.warning("현재 가격 조건을 통과하고 시세가 확인된 자동 후보가 없습니다. 원하는 종목을 직접 검색해 주세요.")
@@ -516,8 +509,14 @@ if st.session_state.get("scalp_selected") != selected_ticker:
     st.session_state["scalp_live_history"] = []
 
 latest = dict(st.session_state.get("scalp_latest", {}))
-precise_refresh_seconds = 20 if focus_only or manual_search_active else (60 if auto_audit else 20)
-precise_due = now - float(st.session_state.get("scalp_last_precise", 0)) >= precise_refresh_seconds
+precise_refresh_seconds = 20 if focus_only else 60
+precise_due = bool(
+    not latest
+    or (
+        live_refresh_active
+        and now - float(st.session_state.get("scalp_last_precise", 0)) >= precise_refresh_seconds
+    )
+)
 if precise_due or not latest:
     with st.spinner(f"{selected_ticker} 1분봉 정밀분석 중..."):
         try:
@@ -527,7 +526,7 @@ if precise_due or not latest:
             st.session_state.pop("scalp_error", None)
         except Exception as error:
             st.session_state["scalp_error"] = str(error)
-elif now - float(st.session_state.get("scalp_last_quote", 0)) >= 1:
+elif now - float(st.session_state.get("scalp_last_quote", 0)) >= (1 if focus_only else 5):
     try:
         refreshed = scanner().refresh_quotes([latest], mode)
         if refreshed:
@@ -548,7 +547,10 @@ if latest.get("intraday_fallback"):
 
 price = float(latest.get("price", 0) or 0)
 change = float(latest.get("change_percent", 0) or 0)
-calibration = calibration_stats(selected_ticker)
+calibration = calibration_stats(selected_ticker) if require_validation else {
+    horizon: {"samples": 0, "accuracy": 0.0, "mae": 0.0, "bias": 0.0}
+    for horizon in (5, 10, 20, 30)
+}
 for horizon in (5, 10, 20, 30):
     stat = calibration[horizon]
     if stat["samples"] >= 20:
@@ -563,7 +565,10 @@ quality_rows, quality_passed, spread_pct = data_quality_gate(latest, market)
 regime_name, regime_method = market_regime(latest)
 strategy_rows, buy_votes, sell_votes, wait_votes = strategy_consensus(latest)
 weighted_score, weighted_buy = weighted_strategy_score(strategy_rows, regime_name)
-context = benchmark_context(market, selected_ticker)
+context_key = f"scalp_context::{market}::{selected_ticker}"
+if live_refresh_active or context_key not in st.session_state:
+    st.session_state[context_key] = benchmark_context(market, selected_ticker)
+context = st.session_state[context_key]
 forecast_up = float(latest.get("forecast_5m", 0) or 0) > 0
 context_aligned = bool(context.get("confirmed")) and (
     not forecast_up or (
@@ -778,7 +783,7 @@ with st.expander("진입 전 뉴스·공시 위험을 지금 한 번 확인"):
         st.write(checked.get("news_summary", "뉴스 확인 완료"))
         st.write("규제검증:", checked.get("regulatory_checked", False), "· 거래정지:", checked.get("halt_active", False))
 
-audit_records = update_prediction_audit(selected_ticker, price, latest, now)
+audit_records = update_prediction_audit(selected_ticker, price, latest, now) if require_validation else []
 completed = []
 for record in audit_records:
     if record["ticker"] != selected_ticker:
