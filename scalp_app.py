@@ -453,7 +453,7 @@ def live_filtered_universe(market: str) -> list[dict]:
                 name = str(candidate.get("name", ""))
                 trading_value = price * volume
                 if (
-                    0 < price <= limit and 0 < change < 25.0
+                    0 < price <= limit and 0 < change < 20.0
                     and volume >= 100_000 and trading_value >= 10_000_000_000
                     and not any(word in name for word in blocked_words)
                 ):
@@ -472,7 +472,7 @@ def live_filtered_universe(market: str) -> list[dict]:
             # Korean automatic candidates need room before the +30% ceiling.
             # At +25% or above, remaining upside is too small for a fresh scalp
             # and execution can freeze near the limit-up queue.
-            change_ok = 0 < change < 25.0 if market == "국내" else change > 0
+            change_ok = 0 < change < 20.0 if market == "국내" else change > 0
             if 0 < candidate["screen_price"] <= limit and change_ok:
                 accepted.append(candidate)
         except Exception:
@@ -520,7 +520,7 @@ def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -
         level_plan_valid = bool(detail.get("level_plan_valid"))
         repeat_state = str(detail.get("repeat_scalp_state", "UNAVAILABLE"))
         score = float(score or 0)
-        if market_code == "KR" and current_change >= 25.0:
+        if market_code == "KR" and current_change >= 20.0:
             continue
         if not (data_valid and level_plan_valid and risk_reward >= 1.5):
             continue
@@ -961,7 +961,7 @@ if AUDIT_IMPORT_ERROR:
 elif auto_audit:
     # Direct search has priority over the background universe collector.
     # The collector resumes automatically as soon as the search box is empty.
-    if not manual_search_active:
+    if not manual_search_active and not focus_only:
         background_audit_tick(True, now)
     audit_now = datetime.fromtimestamp(now, KST)
     audit_minute = audit_now.hour * 60 + audit_now.minute
@@ -1127,6 +1127,9 @@ continuous_rise = bool(latest.get("continuous_rise"))
 continuous_rise_score = int(latest.get("continuous_rise_score", 0) or 0)
 repeat_state = str(latest.get("repeat_scalp_state", "UNAVAILABLE"))
 repeat_label = str(latest.get("repeat_scalp_label", "⚪ 반복단타 판정 대기"))
+if repeat_state == "EXIT":
+    regime_name = "하락 전환"
+    regime_method = "신규 매수 중단·실제 지지 회복과 하락 전환 해소 확인"
 if price <= 0:
     st.error("⛔ 현재가가 확인되지 않아 분석과 매수 판정을 중단했습니다.")
     st.stop()
