@@ -10,6 +10,8 @@ import importlib.abc
 import importlib.util
 import re
 import requests
+import sqlite3
+import tempfile
 import sys
 import time
 import types
@@ -22,7 +24,44 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
+try:
+    from run_live_validation import (
+        KR_UNIVERSE as AUDIT_KR_UNIVERSE,
+        connect as audit_connect,
+        export_summary as audit_export_summary,
+        grade_pending as audit_grade_pending,
+        signal_window_open as audit_signal_window_open,
+        store_quote as audit_store_quote,
+        store_result as audit_store_result,
+        DB_PATH as AUDIT_DB_PATH,
+        CSV_PATH as AUDIT_CSV_PATH,
+    )
+    AUDIT_IMPORT_ERROR = ""
+except Exception as audit_import_exception:
+    AUDIT_KR_UNIVERSE = []
+    AUDIT_IMPORT_ERROR = str(audit_import_exception)
+
 KST = timezone(timedelta(hours=9), name="KST")
+HISTORY_DB = Path(tempfile.gettempdir()) / "ymym_scalp_validation.sqlite3"
+
+
+def db_connect():
+    connection = sqlite3.connect(HISTORY_DB, timeout=10)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL, issued REAL NOT NULL, base_price REAL NOT NULL,
+            f5 REAL NOT NULL, f10 REAL NOT NULL, f20 REAL NOT NULL DEFAULT 0, f30 REAL NOT NULL,
+            actual5 REAL, actual10 REAL, actual20 REAL, actual30 REAL,
+            UNIQUE(ticker, issued)
+        )
+    """)
+    existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(predictions)")}
+    for column, definition in (("f20", "REAL NOT NULL DEFAULT 0"), ("actual20", "REAL")):
+        if column not in existing_columns:
+            connection.execute(f"ALTER TABLE predictions ADD COLUMN {column} {definition}")
+    return connection
 
 KR_UNIVERSE = [
     {"ticker":"005930","name":"삼성전자","exchange":"KR","asset_type":"우량주"},
@@ -38,7 +77,6 @@ KR_UNIVERSE = [
     {"ticker":"423920","name":"TIGER 미국필라델피아반도체레버리지(합성)","exchange":"KR","asset_type":"레버리지 ETF"},
 ]
 US_UNIVERSE = [
-    {"ticker":"NVDA","name":"엔비디아","exchange":"NASDAQ","asset_type":"우량주"},
     {"ticker":"GOOGL","name":"알파벳","exchange":"NASDAQ","asset_type":"우량주"},
     {"ticker":"AMD","name":"AMD","exchange":"NASDAQ","asset_type":"우량주"},
     {"ticker":"INTC","name":"인텔","exchange":"NASDAQ","asset_type":"우량주"},
@@ -52,16 +90,38 @@ US_UNIVERSE = [
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def kr_name_map() -> dict:
-    mapping = {row["name"].replace(" ", ""): (row["ticker"], row["name"]) for row in KR_UNIVERSE}
+    def norm(text: str) -> str:
+        return re.sub(r"[^0-9a-z가-힣]", "", str(text).casefold())
+    mapping = {norm(row["name"]): (row["ticker"], row["name"]) for row in KR_UNIVERSE}
     try:
         from pykrx import stock as krx_stock
         for market_name in ("KOSPI", "KOSDAQ"):
             for code in krx_stock.get_market_ticker_list(market=market_name):
                 name = krx_stock.get_market_ticker_name(code)
                 if name:
-                    mapping[str(name).replace(" ", "")] = (str(code), str(name))
+                    mapping[norm(name)] = (str(code), str(name))
     except Exception:
         pass
+    try:
+        import FinanceDataReader as fdr
+        listing = fdr.StockListing("KRX")
+        code_col = "Code" if "Code" in listing.columns else "Symbol"
+        name_col = "Name" if "Name" in listing.columns else "MarketName"
+        for _, row in listing.iterrows():
+            code, name = str(row.get(code_col, "")), str(row.get(name_col, ""))
+            if code and name and name != "nan":
+                mapping[norm(name)] = (code.zfill(6), name)
+    except Exception:
+        pass
+    mapping.update({
+        norm("SK텔레콤"): ("017670", "SK텔레콤"),
+        norm("LG전자"): ("066570", "LG전자"),
+        norm("KB금융"): ("105560", "KB금융"),
+        norm("신한지주"): ("055550", "신한지주"),
+        norm("셀트리온"): ("068270", "셀트리온"),
+        norm("기아"): ("000270", "기아"),
+        norm("포스코홀딩스"): ("005490", "POSCO홀딩스"),
+    })
     return mapping
 
 
@@ -69,13 +129,20 @@ def kr_name_map() -> dict:
 def yahoo_symbol_search(query: str) -> dict | None:
     """Resolve an arbitrary US ticker or company name without restricting asset type."""
     try:
-        response = requests.get(
-            "https://query1.finance.yahoo.com/v1/finance/search",
-            params={"q": query, "quotesCount": 10, "newsCount": 0},
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=8,
-        )
-        response.raise_for_status()
-        quotes = response.json().get("quotes") or []
+        quotes = []
+        for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+            try:
+                response = requests.get(
+                    f"https://{host}/v1/finance/search",
+                    params={"q": query, "quotesCount": 10, "newsCount": 0},
+                    headers={"User-Agent": "Mozilla/5.0"}, timeout=8,
+                )
+                response.raise_for_status()
+                quotes = response.json().get("quotes") or []
+                if quotes:
+                    break
+            except Exception:
+                continue
         allowed = [q for q in quotes if str(q.get("quoteType", "")).upper() in {"EQUITY", "ETF"}]
         us = [q for q in allowed if str(q.get("exchange", "")).upper() not in {"KSC", "KOE"}]
         q = (us or allowed or [None])[0]
@@ -97,7 +164,7 @@ def resolve_manual(value: str, market: str) -> dict | None:
     if market == "국내":
         if value.isdigit():
             return {"ticker": value.zfill(6), "name": value.zfill(6), "exchange": "KR", "asset_type": "직접 검색"}
-        normalized = value.replace(" ", "")
+        normalized = re.sub(r"[^0-9a-z가-힣]", "", value.casefold())
         mapping = kr_name_map()
         exact = mapping.get(normalized)
         if exact:
@@ -121,6 +188,10 @@ def resolve_manual(value: str, market: str) -> dict | None:
 
 def _load_bundled_sources() -> dict:
     source_path = Path(__file__).with_name("app.py")
+    if not source_path.exists():
+        development_copy = Path(__file__).resolve().parent.parent / "ymym_stock_scanner_fixed" / "app.py"
+        if development_copy.exists():
+            source_path = development_copy
     if not source_path.exists():
         st.error("같은 폴더에 기존 app.py가 필요합니다.")
         st.stop()
@@ -256,6 +327,188 @@ def strategy_consensus(item: dict) -> tuple[list[dict], int, int, int]:
     return votes, buys, sells, waits
 
 
+def data_quality_gate(item: dict, market: str) -> tuple[list[dict], bool, float | None]:
+    price = float(item.get("price", 0) or 0)
+    bars = int(item.get("intraday_bar_count", 0) or len(item.get("chart_close_1m", []) or []))
+    vwap = float(item.get("vwap", 0) or 0)
+    ema9 = float(item.get("ema9", 0) or 0)
+    rvol = float(item.get("rvol", 0) or 0)
+    bid = float(item.get("best_bid", 0) or 0)
+    ask = float(item.get("best_ask", 0) or 0)
+    spread = ((ask - bid) / ((ask + bid) / 2) * 100) if ask > 0 and bid > 0 and ask >= bid else None
+    last_bar_age = None
+    try:
+        times = item.get("chart_time_1m", []) or []
+        last_bar = pd.to_datetime(times[-1], utc=True)
+        last_bar_age = max(0.0, (pd.Timestamp.now(tz="UTC") - last_bar).total_seconds())
+    except Exception:
+        pass
+    checks = [
+        {"검문": "현재가", "통과": price > 0, "내용": fmt(price)},
+        {"검문": "1분봉 수", "통과": bars >= 20, "내용": f"{bars}개"},
+        {"검문": "VWAP·EMA", "통과": vwap > 0 and ema9 > 0, "내용": f"VWAP {fmt(vwap)} / EMA9 {fmt(ema9)}"},
+        {"검문": "분봉 출처", "통과": not bool(item.get("intraday_fallback")), "내용": str(item.get("intraday_source", "미확인"))},
+        {"검문": "마지막 분봉 시각", "통과": last_bar_age is not None and last_bar_age <= 180,
+         "내용": f"{last_bar_age:.0f}초 전" if last_bar_age is not None else "시각 없음"},
+        {"검문": "RVOL 정상범위", "통과": 0.05 <= rvol <= 20, "내용": f"{rvol:.1f}배"},
+        {"검문": "실시간 호가", "통과": spread is not None, "내용": f"{spread:.3f}%" if spread is not None else "미수신"},
+    ]
+    max_spread = 0.35 if "레버리지" in str(item.get("asset_type", "")) else 0.25
+    if spread is not None:
+        checks.append({"검문": "스프레드", "통과": spread <= max_spread, "내용": f"기준 {max_spread:.2f}% 이하"})
+    return checks, all(bool(row["통과"]) for row in checks), spread
+
+
+def market_regime(item: dict) -> tuple[str, str]:
+    price = float(item.get("price", 0) or 0)
+    vwap = float(item.get("vwap", 0) or 0)
+    ema9 = float(item.get("ema9", 0) or 0)
+    ema20 = float(item.get("ema20", 0) or 0)
+    rvol = float(item.get("rvol", 0) or 0)
+    if rvol >= 3:
+        return "변동성 급증장", "돌파·호가·거래량 기법 우선"
+    if price > vwap > 0 and ema9 > ema20 > 0:
+        return "상승 추세장", "눌림목·VWAP 지지·추세추종 우선"
+    if 0 < price < vwap and 0 < ema9 < ema20:
+        return "하락 추세장", "신규 매수 금지·반등 확인 우선"
+    return "횡보장", "VWAP 평균회귀·박스 돌파 확인 우선"
+
+
+def weighted_strategy_score(rows: list[dict], regime: str) -> tuple[float, float]:
+    weights = {row["기법"]: 1.0 for row in rows}
+    if regime == "상승 추세장":
+        for name in ("VWAP 추세", "EMA 추세", "MACD 모멘텀", "다중 시간봉", "추세 정렬"):
+            weights[name] = 1.6
+    elif regime == "횡보장":
+        for name in ("VWAP 추세", "RSI·스토캐스틱", "캔들 패턴", "호가·체결"):
+            weights[name] = 1.6
+    elif regime == "변동성 급증장":
+        for name in ("거래량·RVOL", "호가·체결", "VWAP 추세", "다중 시간봉"):
+            weights[name] = 1.8
+    elif regime == "하락 추세장":
+        for name in ("VWAP 추세", "EMA 추세", "다중 시간봉", "추세 정렬"):
+            weights[name] = 2.0
+    total = sum(weights.values()) or 1.0
+    signed = sum(weights[row["기법"]] * (1 if row["판정"] == "매수" else -1 if row["판정"] == "매도" else 0) for row in rows)
+    buy_weight = sum(weights[row["기법"]] for row in rows if row["판정"] == "매수")
+    return round(signed / total * 100, 1), round(buy_weight / total * 100, 1)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def benchmark_context(market: str, ticker: str) -> dict:
+    try:
+        if market == "미국":
+            mapping = {
+                "SOXL": ("SOXX", "NASDAQ", 1), "SOXS": ("SOXX", "NASDAQ", -1),
+                "TQQQ": ("QQQ", "NASDAQ", 1), "SQQQ": ("QQQ", "NASDAQ", -1),
+            }
+            bench, exchange, direction = mapping.get(ticker, ("QQQ", "NASDAQ", 1))
+            quote = scanner().client.us_quote(bench, exchange)
+            change = float(quote.get("change", 0) or 0) * direction
+            bars = scanner().client.us_intraday(bench, exchange, minutes=1)
+            intraday = ((float(bars["close"].iloc[-1]) / float(bars["close"].iloc[-6]) - 1) * 100 * direction) if len(bars) >= 6 else 0.0
+            return {"name": bench, "change": change, "intraday": intraday, "confirmed": len(bars) >= 20}
+        mapping = {
+            "488080": [("005930", 0.5), ("000660", 0.5)],
+            "396500": [("005930", 0.5), ("000660", 0.5)],
+        }
+        members = mapping.get(ticker, [("069500", 1.0)])
+        change = 0.0
+        intraday = 0.0
+        enough = True
+        for code, weight in members:
+            change += float(scanner().client.kr_quote(code).get("change", 0) or 0) * weight
+            bars = scanner().client.kr_intraday(code)
+            enough = enough and len(bars) >= 20
+            if len(bars) >= 6:
+                intraday += (float(bars["close"].iloc[-1]) / float(bars["close"].iloc[-6]) - 1) * 100 * weight
+        return {"name": "+".join(code for code, _ in members), "change": change, "intraday": intraday, "confirmed": enough}
+    except Exception as error:
+        return {"name": "시장지표", "change": 0.0, "confirmed": False, "error": type(error).__name__}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def live_filtered_universe(market: str) -> list[dict]:
+    """Apply the candidate price ceiling using live KIS quotes, not a stale static list."""
+    source = KR_UNIVERSE if market == "국내" else US_UNIVERSE
+    limit = 300000 if market == "국내" else 200
+    accepted = []
+    for row in source:
+        try:
+            quote = (scanner().client.kr_quote(row["ticker"]) if market == "국내"
+                     else scanner().client.us_quote(row["ticker"], row["exchange"]))
+            candidate = dict(row)
+            candidate["screen_price"] = float(quote.get("price", 0) or 0)
+            candidate["screen_change"] = float(quote.get("change", 0) or 0)
+            if 0 < candidate["screen_price"] <= limit:
+                accepted.append(candidate)
+        except Exception:
+            continue
+    return accepted
+
+
+def update_prediction_audit(ticker: str, price: float, item: dict, now_ts: float) -> list[dict]:
+    bucket = float(int(now_ts // 300) * 300)
+    with db_connect() as db:
+        if price > 0:
+            db.execute(
+                "INSERT OR IGNORE INTO predictions(ticker,issued,base_price,f5,f10,f20,f30) VALUES(?,?,?,?,?,?,?)",
+                (ticker, bucket, price, float(item.get("forecast_5m", 0) or 0),
+                 float(item.get("forecast_10m", 0) or 0), float(item.get("forecast_20m", 0) or 0),
+                 float(item.get("forecast_30m", 0) or 0)),
+            )
+        pending = db.execute(
+            "SELECT id,issued,base_price,f5,f10,f20,f30,actual5,actual10,actual20,actual30 FROM predictions WHERE ticker=? AND issued>=?",
+            (ticker, now_ts - 86400),
+        ).fetchall()
+        for row in pending:
+            record_id, issued, base, f5, f10, f20, f30, a5, a10, a20, a30 = row
+            elapsed = now_ts - issued
+            updates = {}
+            if elapsed >= 300 and a5 is None:
+                updates["actual5"] = (price / base - 1) * 100
+            if elapsed >= 600 and a10 is None:
+                updates["actual10"] = (price / base - 1) * 100
+            if elapsed >= 1200 and a20 is None:
+                updates["actual20"] = (price / base - 1) * 100
+            if elapsed >= 1800 and a30 is None:
+                updates["actual30"] = (price / base - 1) * 100
+            for column, value in updates.items():
+                db.execute(f"UPDATE predictions SET {column}=? WHERE id=?", (value, record_id))
+        rows = db.execute(
+            "SELECT issued,base_price,f5,f10,f20,f30,actual5,actual10,actual20,actual30 FROM predictions WHERE ticker=? ORDER BY issued DESC LIMIT 100",
+            (ticker,),
+        ).fetchall()
+    records = []
+    for issued, base, f5, f10, f20, f30, a5, a10, a20, a30 in rows:
+        record = {"ticker": ticker, "issued": issued, "기준시각": datetime.fromtimestamp(issued, KST).strftime("%m-%d %H:%M"),
+                  "기준가": base, "예상5분": f5, "예상10분": f10, "예상20분": f20, "예상30분": f30}
+        for minutes, expected, actual in ((5, f5, a5), (10, f10, a10), (20, f20, a20), (30, f30, a30)):
+            if actual is not None:
+                record[f"실제{minutes}분"] = round(actual, 3)
+                record[f"적중{minutes}분"] = (expected >= 0) == (actual >= 0)
+        records.append(record)
+    return records
+
+
+def calibration_stats(ticker: str) -> dict:
+    stats = {}
+    with db_connect() as db:
+        for minutes in (5, 10, 20, 30):
+            rows = db.execute(
+                f"SELECT f{minutes},actual{minutes} FROM predictions WHERE ticker=? AND actual{minutes} IS NOT NULL ORDER BY issued DESC LIMIT 300",
+                (ticker,),
+            ).fetchall()
+            if not rows:
+                stats[minutes] = {"samples": 0, "accuracy": 0.0, "bias": 0.0, "mae": 0.0}
+                continue
+            errors = [float(expected) - float(actual) for expected, actual in rows]
+            accuracy = sum((float(expected) >= 0) == (float(actual) >= 0) for expected, actual in rows) / len(rows) * 100
+            stats[minutes] = {"samples": len(rows), "accuracy": accuracy,
+                              "bias": sum(errors) / len(errors), "mae": sum(abs(x) for x in errors) / len(errors)}
+    return stats
+
+
 def render_chart(item: dict) -> None:
     times = item.get("chart_time_1m", [])
     closes = item.get("chart_close_1m", [])
@@ -299,6 +552,41 @@ def precise_analysis(row: dict, mode: str) -> dict:
     return apply_mode_policy(finalize_trade_item(raw), mode)
 
 
+def background_audit_tick(enabled: bool, now_ts: float) -> None:
+    """열어 둔 초단타 앱 안에서 토큰을 공유하며 한국장 전 종목을 순환 검증한다."""
+    if not enabled or AUDIT_IMPORT_ERROR or not AUDIT_KR_UNIVERSE:
+        return
+    now_dt = datetime.fromtimestamp(now_ts, KST)
+    # 08:50 전과 15:36 이후에는 KIS를 호출하지 않는다.
+    hhmm = now_dt.hour * 60 + now_dt.minute
+    if now_dt.weekday() >= 5 or hhmm < 8 * 60 + 50 or hhmm > 15 * 60 + 35:
+        return
+    last = float(st.session_state.get("audit_last_tick", 0.0))
+    if now_ts - last < 25:
+        return
+    index = int(st.session_state.get("audit_member_index", 0)) % len(AUDIT_KR_UNIVERSE)
+    ticker, name, exchange_name = AUDIT_KR_UNIVERSE[index]
+    row = {"ticker": ticker, "name": name, "exchange": exchange_name, "asset_type": "검증대상"}
+    try:
+        with audit_connect() as db:
+            if audit_signal_window_open("KR", now_dt):
+                item = precise_analysis(row, "국내 30분 1% 타점")
+                audit_store_result(db, "KR", item, int(now_ts), 300)
+            else:
+                quote = scanner().client.kr_quote(ticker)
+                audit_store_quote(db, "KR", ticker, float(quote.get("price", 0) or 0), int(now_ts))
+            audit_grade_pending(db, int(now_ts))
+            db.commit()
+            audit_export_summary(db)
+        st.session_state["audit_last_ok"] = f"{ticker} · {now_dt.strftime('%H:%M:%S')}"
+        st.session_state.pop("audit_last_error", None)
+    except Exception as error:
+        st.session_state["audit_last_error"] = f"{ticker}: {type(error).__name__} · {error}"
+    finally:
+        st.session_state["audit_last_tick"] = now_ts
+        st.session_state["audit_member_index"] = index + 1
+
+
 st_autorefresh(interval=1000, key="scalp_tick")
 st.title("⚡ 초단타 VWAP 매수타점")
 st.caption("선택 종목은 약 1초마다 현재가를 확인하고, 20초마다 1분봉·VWAP·EMA·거래량·호가를 정밀 재분석합니다.")
@@ -311,16 +599,69 @@ with st.sidebar:
     minimum_score = st.slider("최소 점수", 30, 90, 50, 5)
     manual_ticker = st.text_input("종목명 또는 종목코드 검색", placeholder="현대차, 005380, SOXL").strip()
     focus_only = st.toggle("선택 종목 1초 집중", True)
+    require_validation = st.toggle("실전 검증 잠금", True, help="해당 종목의 실제 5·10분 검증표본이 쌓이기 전에는 초록색 매수 신호를 차단합니다.")
     st.caption("분석 대상: 우량주·ETF·레버리지 ETF")
 
 now = time.time()
-options = [dict(row) for row in (KR_UNIVERSE if market == "국내" else US_UNIVERSE)]
+auto_audit = st.sidebar.toggle(
+    "오늘 한국장 자동검증",
+    False,
+    help="오전 9시~오후 3시 신규 신호를 기록하고 3시 35분까지 5·10·20·30분 결과를 자동 채점합니다.",
+    key="kr_live_audit_enabled",
+)
+if AUDIT_IMPORT_ERROR:
+    st.sidebar.error("자동검증 파일이 없습니다: run_live_validation.py")
+elif auto_audit:
+    background_audit_tick(True, now)
+    audit_now = datetime.fromtimestamp(now, KST)
+    audit_minute = audit_now.hour * 60 + audit_now.minute
+    if audit_now.weekday() >= 5:
+        audit_phase = "휴장일 · 다음 영업일 대기"
+    elif audit_minute < 8 * 60 + 50:
+        audit_phase = "준비 완료 · 08:50 자동 시작"
+    elif audit_minute < 9 * 60:
+        audit_phase = "사전 시세 확인 중 · 09:00 신호 시작"
+    elif audit_minute < 15 * 60:
+        audit_phase = "신호 수집·사후 채점 중"
+    elif audit_minute <= 15 * 60 + 35:
+        audit_phase = "신규 신호 종료 · 30분 사후 채점 중"
+    else:
+        audit_phase = "오늘 검증 완료 · 결과를 내려받으세요"
+    last_audit_ok = st.session_state.get("audit_last_ok")
+    st.sidebar.success(
+        "자동검증 · " + audit_phase
+        + (f"\n\n최근 처리: {last_audit_ok}" if last_audit_ok else "")
+    )
+    if st.session_state.get("audit_last_error"):
+        st.sidebar.warning(st.session_state["audit_last_error"])
+    if AUDIT_CSV_PATH.exists():
+        st.sidebar.download_button(
+            "검증 CSV 내려받기", AUDIT_CSV_PATH.read_bytes(),
+            file_name="validation_summary.csv", mime="text/csv", key="audit_csv_download",
+        )
+    audit_report_path = AUDIT_DB_PATH.parent / "validation_report.html"
+    if audit_report_path.exists():
+        st.sidebar.download_button(
+            "검증 보고서 내려받기", audit_report_path.read_bytes(),
+            file_name="validation_report.html", mime="text/html", key="audit_report_download",
+        )
+    try:
+        with audit_connect() as audit_db:
+            total_signals = int(audit_db.execute("SELECT COUNT(*) FROM signals").fetchone()[0])
+            completed_signals = int(audit_db.execute("SELECT COUNT(*) FROM signals WHERE result_done=1").fetchone()[0])
+        st.sidebar.caption(f"저장 {total_signals}건 · 30분 채점완료 {completed_signals}건")
+    except Exception:
+        pass
+options = live_filtered_universe(market) if not manual_ticker else []
+resolved_manual = None
 if manual_ticker:
     resolved = resolve_manual(manual_ticker, market)
     if resolved:
+        resolved_manual = resolved
         options.insert(0, resolved)
     else:
         st.sidebar.error("종목을 찾지 못했습니다. 이름을 조금 더 정확히 입력해 주세요.")
+        options = live_filtered_universe(market)
 dedup = {}
 for row in options:
     ticker = str(row.get("ticker", "")).upper()
@@ -328,12 +669,17 @@ for row in options:
         dedup[ticker] = row
 options = list(dedup.values())
 
+if not options:
+    st.warning("현재 가격 조건을 통과하고 시세가 확인된 자동 후보가 없습니다. 원하는 종목을 직접 검색해 주세요.")
+    st.stop()
+
 selected_ticker = st.selectbox(
     "집중 분석할 종목",
     [str(row.get("ticker", "")) for row in options],
     format_func=lambda ticker: next(
         (f"{ticker} · {row.get('name', ticker)} · {row.get('asset_type', '')}"
          for row in options if str(row.get("ticker", "")) == ticker), ticker),
+    key=f"focus_ticker::{market}::{resolved_manual.get('ticker') if resolved_manual else 'default'}",
 )
 selected_row = next(row for row in options if str(row.get("ticker", "")) == selected_ticker)
 selected_row.setdefault("exchange", "KR" if market == "국내" else "NASDAQ")
@@ -345,7 +691,8 @@ if st.session_state.get("scalp_selected") != selected_ticker:
     st.session_state["scalp_live_history"] = []
 
 latest = dict(st.session_state.get("scalp_latest", {}))
-precise_due = now - float(st.session_state.get("scalp_last_precise", 0)) >= 20
+precise_refresh_seconds = 60 if auto_audit else 20
+precise_due = now - float(st.session_state.get("scalp_last_precise", 0)) >= precise_refresh_seconds
 if precise_due or not latest:
     with st.spinner(f"{selected_ticker} 1분봉 정밀분석 중..."):
         try:
@@ -375,8 +722,30 @@ if latest.get("intraday_fallback"):
 
 price = float(latest.get("price", 0) or 0)
 change = float(latest.get("change_percent", 0) or 0)
+calibration = calibration_stats(selected_ticker)
+for horizon in (5, 10, 20, 30):
+    stat = calibration[horizon]
+    if stat["samples"] >= 20:
+        key = f"forecast_{horizon}m"
+        latest[key] = round(float(latest.get(key, 0) or 0) - float(stat["bias"]), 3)
+validated_signal = (
+    calibration[5]["samples"] >= 20 and calibration[10]["samples"] >= 20
+    and calibration[5]["accuracy"] >= 55 and calibration[10]["accuracy"] >= 55
+)
 label, level = verdict_text(latest)
+quality_rows, quality_passed, spread_pct = data_quality_gate(latest, market)
+regime_name, regime_method = market_regime(latest)
 strategy_rows, buy_votes, sell_votes, wait_votes = strategy_consensus(latest)
+weighted_score, weighted_buy = weighted_strategy_score(strategy_rows, regime_name)
+context = benchmark_context(market, selected_ticker)
+forecast_up = float(latest.get("forecast_5m", 0) or 0) > 0
+context_aligned = bool(context.get("confirmed")) and (
+    not forecast_up or (
+        float(context.get("change", 0) or 0) >= -0.05
+        and float(context.get("intraday", 0) or 0) >= -0.10
+    )
+)
+risk_reward = float(latest.get("risk_reward", 0) or 0)
 price_limit = 300000 if market == "국내" else 200
 is_manual_search = str(selected_row.get("asset_type", "")) == "직접 검색"
 if price <= 0:
@@ -385,11 +754,26 @@ if price <= 0:
 if price > price_limit and not is_manual_search:
     level, label = "error", f"🔴 설정 금액 초과 · {fmt(price_limit)} 이하만 분석 대상"
     latest["entry_checks_passed"] = False
+elif not quality_passed:
+    level, label = "error", "🔴 판정 불가 · 실시간 데이터 검문 미통과"
+    latest["entry_checks_passed"] = False
+elif not context_aligned:
+    level, label = "error", f"🔴 진입 금지 · 기초지수/시장({context.get('name')}) 동조 미확인"
+    latest["entry_checks_passed"] = False
+elif risk_reward < 1.5:
+    level, label = "error", f"🔴 진입 금지 · 손익비 {risk_reward:.2f} (최소 1.50 필요)"
+    latest["entry_checks_passed"] = False
 elif sell_votes >= 3:
     level, label = "error", f"🔴 진입 금지 · 매도/약세 기법 {sell_votes}개 감지"
     latest["entry_checks_passed"] = False
+elif weighted_score < 35 or weighted_buy < 55:
+    level, label = "warning", f"🟡 대기 · 장세가중 합의 {weighted_score:+.1f}점"
+    latest["entry_checks_passed"] = False
 elif buy_votes < 6 or sell_votes > 0:
     level, label = "warning", f"🟡 대기 · 매수 합의 {buy_votes}/10 · 매도 경고 {sell_votes}/10"
+    latest["entry_checks_passed"] = False
+elif require_validation and not validated_signal:
+    level, label = "warning", "🟡 모의검증 중 · 실제 적중표본이 쌓이기 전 실전 신호 잠금"
     latest["entry_checks_passed"] = False
 elif level == "success":
     label = f"🟢 매수 검토 · 주요 기법 합의 {buy_votes}/10"
@@ -400,6 +784,17 @@ top[2].metric("EMA9", fmt(latest.get("ema9")))
 top[3].metric("RVOL", f"{float(latest.get('rvol', 0) or 0):.1f}배")
 top[4].metric("하락위험", f"{int(latest.get('five_min_risk_score', 0) or 0)}점")
 
+status_cols = st.columns(4)
+status_cols[0].metric("데이터 검문", "통과" if quality_passed else "실패")
+status_cols[1].metric("현재 장세", regime_name)
+status_cols[2].metric(
+    f"기초지수 {context.get('name')}",
+    f"{float(context.get('change', 0) or 0):+.2f}%",
+    f"최근 5분 {float(context.get('intraday', 0) or 0):+.2f}%" if context.get("confirmed") else "분봉 미확인",
+)
+status_cols[3].metric("손익비", f"{risk_reward:.2f}")
+st.caption(f"현재 적용 기법: {regime_method}")
+
 getattr(st, level)(label)
 if level == "success":
     st.write(f"진입: **{fmt(latest.get('pullback_entry'))}** · 손절: **{fmt(latest.get('stop_loss'))}** · +1%: **{fmt(price * 1.01)}**")
@@ -408,18 +803,41 @@ elif level == "error":
 else:
     st.write(latest.get("entry_trigger", "VWAP 지지와 거래량 재증가를 기다리세요."))
 
-consensus_cols = st.columns(3)
+pullback_price = float(latest.get("pullback_entry", 0) or 0)
+breakout_price = float(latest.get("breakout_entry", 0) or 0)
+stop_price = float(latest.get("stop_loss", 0) or 0)
+if level == "success":
+    st.success(
+        f"▶ 지금 진입 검토: {fmt(pullback_price)}~{fmt(price)} 지정가 분할매수 · "
+        f"{fmt(stop_price)} 이탈 시 매수 판단 무효"
+    )
+elif level == "warning":
+    st.warning(
+        f"▶ 지금은 매수하지 않음 · ① {fmt(pullback_price)} 부근까지 눌린 뒤 VWAP 재돌파하거나 "
+        f"② {fmt(breakout_price)} 위에서 1분봉이 마감되고 매수 합의 6/10 이상이면 진입 검토"
+    )
+else:
+    if price > price_limit and not is_manual_search:
+        st.error("▶ 자동 후보 가격 조건 초과 · 이 종목을 직접 검색하면 금액 제한 없이 다시 판정합니다.")
+    else:
+        st.error(f"▶ 현재는 진입하지 않음 · {fmt(stop_price)} 위 회복과 매수 합의 재형성 전까지 관찰")
+
+consensus_cols = st.columns(4)
 consensus_cols[0].metric("매수 기법", f"{buy_votes}/10")
 consensus_cols[1].metric("매도 기법", f"{sell_votes}/10")
 consensus_cols[2].metric("대기 기법", f"{wait_votes}/10")
+consensus_cols[3].metric("장세가중 합의", f"{weighted_score:+.1f}점", f"매수비중 {weighted_buy:.1f}%")
 with st.expander("매수·매도 기법별 판정 근거", expanded=False):
     st.dataframe(pd.DataFrame(strategy_rows), hide_index=True, use_container_width=True)
+with st.expander("실시간 데이터 검문 내역", expanded=not quality_passed):
+    st.dataframe(pd.DataFrame(quality_rows), hide_index=True, use_container_width=True)
 
 f5 = float(latest.get("forecast_5m", 0) or 0)
 f10 = float(latest.get("forecast_10m", 0) or 0)
+f20 = float(latest.get("forecast_20m", 0) or 0)
 f30 = float(latest.get("forecast_30m", 0) or 0)
-forecast_cols = st.columns(3)
-for column, minutes, forecast in zip(forecast_cols, (5, 10, 30), (f5, f10, f30)):
+forecast_cols = st.columns(4)
+for column, minutes, forecast in zip(forecast_cols, (5, 10, 20, 30), (f5, f10, f20, f30)):
     expected = price * (1 + forecast / 100)
     uncertainty = max(0.20, abs(forecast) * 0.50)
     low = price * (1 + (forecast - uncertainty) / 100)
@@ -432,31 +850,31 @@ for column, minutes, forecast in zip(forecast_cols, (5, 10, 30), (f5, f10, f30))
     column.caption(f"예상 범위 {fmt(low)}~{fmt(high)}")
 
 target_probability = int(latest.get("target1_probability", 0) or 0)
-if level == "success" and f5 > 0 and f10 > 0 and f30 > 0:
+if level == "success" and min(f5, f10, f20, f30) > 0:
     st.success(
-        f"🚦 매수 전 조건 통과 · 5·10·30분 방향 일치 · "
+        f"🚦 매수 전 조건 통과 · 5·10·20·30분 방향 일치 · "
         f"1차 목표 도달 추정 {target_probability}%"
     )
-elif f5 < 0 or f10 < 0 or f30 < 0:
+elif min(f5, f10, f20, f30) < 0:
     st.error("⛔ 단기 예상이 약세입니다. 신규 진입하지 마세요.")
 else:
     st.warning("⏳ 시간대별 방향이 일치하지 않습니다. 진입을 기다리세요.")
 
 st.subheader("현재 차트가 가리키는 예상 도달가격")
-path_cols = st.columns(3)
-for column, minutes, forecast in zip(path_cols, (5, 10, 30), (f5, f10, f30)):
+path_cols = st.columns(4)
+for column, minutes, forecast in zip(path_cols, (5, 10, 20, 30), (f5, f10, f20, f30)):
     expected = price * (1 + forecast / 100)
     direction = "상승" if forecast > 0 else "하락" if forecast < 0 else "횡보"
     column.metric(f"{minutes}분 뒤 {direction}", fmt(expected), f"현재가 대비 {forecast:+.2f}%")
 
 st.subheader("+1% · +2% · +3% 도달 여부 점검")
 goal_cols = st.columns(3)
-upside = max(f5, f10, f30)
+upside = max(f5, f10, f20, f30)
 for column, goal in zip(goal_cols, (1, 2, 3)):
     goal_price = price * (1 + goal / 100)
-    if level == "success" and min(f5, f10, f30) > 0 and upside >= goal:
+    if level == "success" and min(f5, f10, f20, f30) > 0 and upside >= goal:
         status = "도달 가능 구간"
-    elif min(f5, f10, f30) < 0:
+    elif min(f5, f10, f20, f30) < 0:
         status = "진입 금지"
     else:
         status = "아직 부족·대기"
@@ -478,5 +896,29 @@ with st.expander("진입 전 뉴스·공시 위험을 지금 한 번 확인"):
     if checked and str(checked.get("ticker")) == selected_ticker:
         st.write(checked.get("news_summary", "뉴스 확인 완료"))
         st.write("규제검증:", checked.get("regulatory_checked", False), "· 거래정지:", checked.get("halt_active", False))
+
+audit_records = update_prediction_audit(selected_ticker, price, latest, now)
+completed = []
+for record in audit_records:
+    if record["ticker"] != selected_ticker:
+        continue
+    for minutes in (5, 10, 20, 30):
+        if f"실제{minutes}분" in record:
+            completed.append({
+                "기준시각": record["기준시각"], "구간": f"{minutes}분",
+                "예상(%)": record[f"예상{minutes}분"], "실제(%)": record[f"실제{minutes}분"],
+                "방향 적중": "적중" if record[f"적중{minutes}분"] else "실패",
+            })
+with st.expander("자동 적중률 검증 기록", expanded=False):
+    stat_cols = st.columns(4)
+    for column, minutes in zip(stat_cols, (5, 10, 20, 30)):
+        stat = calibration[minutes]
+        column.metric(f"{minutes}분 검증", f"{stat['accuracy']:.1f}%", f"표본 {stat['samples']}건 · 평균오차 {stat['mae']:.2f}%")
+    if completed:
+        accuracy = sum(row["방향 적중"] == "적중" for row in completed) / len(completed) * 100
+        st.metric("이번 앱 실행 중 방향 적중률", f"{accuracy:.1f}%", f"검증 {len(completed)}건")
+        st.dataframe(pd.DataFrame(completed[-30:]), hide_index=True, use_container_width=True)
+    else:
+        st.info("신호를 자동 저장했습니다. 5분 후부터 실제 결과와 비교합니다.")
 
 st.caption(f"마지막 정밀분석: {latest.get('updated_at', '-')} · 화면 시각: {datetime.now(KST).strftime('%H:%M:%S')}")

@@ -1,6 +1,7 @@
 streamlit
 streamlit-autorefresh
 pandas
+altair
 numpy
 requests
 python-dotenv
