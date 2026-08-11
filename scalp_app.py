@@ -1545,8 +1545,8 @@ if not options:
     st.warning("현재 가격 조건을 통과하고 시세가 확인된 자동 후보가 없습니다. 원하는 종목을 직접 검색해 주세요.")
     st.stop()
 
-    selected_ticker = st.selectbox(
-        "집중 분석할 종목 (자동 목록은 정밀검증 대기, 위 표만 확정 후보)",
+selected_ticker = st.selectbox(
+    "집중 분석할 종목 (자동 목록은 정밀검증 대기, 위 표만 확정 후보)",
     [str(row.get("ticker", "")) for row in options],
     format_func=lambda ticker: next(
         (f"{ticker} · {row.get('name', ticker)} · {row.get('asset_type', '')}"
