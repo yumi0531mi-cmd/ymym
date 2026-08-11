@@ -16,6 +16,7 @@ import sys
 import time
 import types
 import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -88,6 +89,48 @@ US_UNIVERSE = [
     {"ticker":"SOXS","name":"반도체 3배 인버스 ETF","exchange":"AMEX","asset_type":"레버리지 ETF"},
     {"ticker":"TQQQ","name":"나스닥100 3배 레버리지 ETF","exchange":"NASDAQ","asset_type":"레버리지 ETF"},
     {"ticker":"SQQQ","name":"나스닥100 3배 인버스 ETF","exchange":"NASDAQ","asset_type":"레버리지 ETF"},
+    {"ticker":"UPRO","name":"S&P500 3배 레버리지","exchange":"AMEX","asset_type":"3배 레버리지 ETF"},
+    {"ticker":"SPXU","name":"S&P500 3배 인버스","exchange":"AMEX","asset_type":"3배 인버스 ETF"},
+    {"ticker":"SSO","name":"S&P500 2배 레버리지","exchange":"AMEX","asset_type":"2배 레버리지 ETF"},
+    {"ticker":"SDS","name":"S&P500 2배 인버스","exchange":"AMEX","asset_type":"2배 인버스 ETF"},
+    {"ticker":"QLD","name":"나스닥100 2배 레버리지","exchange":"NASDAQ","asset_type":"2배 레버리지 ETF"},
+    {"ticker":"QID","name":"나스닥100 2배 인버스","exchange":"AMEX","asset_type":"2배 인버스 ETF"},
+    {"ticker":"TECL","name":"미국 기술주 3배 레버리지","exchange":"AMEX","asset_type":"3배 레버리지 ETF"},
+    {"ticker":"TECS","name":"미국 기술주 3배 인버스","exchange":"AMEX","asset_type":"3배 인버스 ETF"},
+    {"ticker":"FAS","name":"미국 금융주 3배 레버리지","exchange":"AMEX","asset_type":"3배 레버리지 ETF"},
+    {"ticker":"FAZ","name":"미국 금융주 3배 인버스","exchange":"AMEX","asset_type":"3배 인버스 ETF"},
+    {"ticker":"LABU","name":"미국 바이오 3배 레버리지","exchange":"AMEX","asset_type":"3배 레버리지 ETF"},
+    {"ticker":"LABD","name":"미국 바이오 3배 인버스","exchange":"AMEX","asset_type":"3배 인버스 ETF"},
+    {"ticker":"TNA","name":"러셀2000 3배 레버리지","exchange":"AMEX","asset_type":"3배 레버리지 ETF"},
+    {"ticker":"TZA","name":"러셀2000 3배 인버스","exchange":"AMEX","asset_type":"3배 인버스 ETF"},
+    {"ticker":"URTY","name":"러셀2000 3배 레버리지","exchange":"AMEX","asset_type":"3배 레버리지 ETF"},
+    {"ticker":"SRTY","name":"러셀2000 3배 인버스","exchange":"AMEX","asset_type":"3배 인버스 ETF"},
+    {"ticker":"UDOW","name":"다우30 3배 레버리지","exchange":"AMEX","asset_type":"3배 레버리지 ETF"},
+    {"ticker":"SDOW","name":"다우30 3배 인버스","exchange":"AMEX","asset_type":"3배 인버스 ETF"},
+    {"ticker":"NUGT","name":"금광주 2배 레버리지","exchange":"AMEX","asset_type":"2배 레버리지 ETF"},
+    {"ticker":"DUST","name":"금광주 2배 인버스","exchange":"AMEX","asset_type":"2배 인버스 ETF"},
+    {"ticker":"GUSH","name":"미국 원유생산 2배 레버리지","exchange":"AMEX","asset_type":"2배 레버리지 ETF"},
+    {"ticker":"DRIP","name":"미국 원유생산 2배 인버스","exchange":"AMEX","asset_type":"2배 인버스 ETF"},
+    {"ticker":"BOIL","name":"천연가스 2배 레버리지","exchange":"AMEX","asset_type":"2배 레버리지 ETF"},
+    {"ticker":"KOLD","name":"천연가스 2배 인버스","exchange":"AMEX","asset_type":"2배 인버스 ETF"},
+    {"ticker":"UCO","name":"원유 2배 레버리지","exchange":"AMEX","asset_type":"2배 레버리지 ETF"},
+    {"ticker":"SCO","name":"원유 2배 인버스","exchange":"AMEX","asset_type":"2배 인버스 ETF"},
+    {"ticker":"BITX","name":"비트코인 선물 2배 레버리지","exchange":"AMEX","asset_type":"2배 레버리지 ETF"},
+    {"ticker":"BITI","name":"비트코인 선물 인버스","exchange":"AMEX","asset_type":"인버스 ETF"},
+    {"ticker":"MSTU","name":"마이크로스트래티지 2배 레버리지","exchange":"AMEX","asset_type":"2배 레버리지 ETF"},
+    {"ticker":"MSTZ","name":"마이크로스트래티지 2배 인버스","exchange":"AMEX","asset_type":"2배 인버스 ETF"},
+    {"ticker":"NVDL","name":"엔비디아 2배 레버리지","exchange":"NASDAQ","asset_type":"2배 레버리지 ETF"},
+    {"ticker":"NVD","name":"엔비디아 2배 인버스","exchange":"NASDAQ","asset_type":"2배 인버스 ETF"},
+    {"ticker":"TSLL","name":"테슬라 2배 레버리지","exchange":"NASDAQ","asset_type":"2배 레버리지 ETF"},
+    {"ticker":"TSLS","name":"테슬라 1배 인버스","exchange":"NASDAQ","asset_type":"인버스 ETF"},
+    {"ticker":"AMZU","name":"아마존 2배 레버리지","exchange":"NASDAQ","asset_type":"2배 레버리지 ETF"},
+    {"ticker":"AMZD","name":"아마존 2배 인버스","exchange":"NASDAQ","asset_type":"2배 인버스 ETF"},
+    {"ticker":"GGLL","name":"알파벳 2배 레버리지","exchange":"NASDAQ","asset_type":"2배 레버리지 ETF"},
+    {"ticker":"GGLS","name":"알파벳 2배 인버스","exchange":"NASDAQ","asset_type":"2배 인버스 ETF"},
+    {"ticker":"AAPU","name":"애플 2배 레버리지","exchange":"NASDAQ","asset_type":"2배 레버리지 ETF"},
+    {"ticker":"AAPD","name":"애플 2배 인버스","exchange":"NASDAQ","asset_type":"2배 인버스 ETF"},
+    {"ticker":"METU","name":"메타 2배 레버리지","exchange":"NASDAQ","asset_type":"2배 레버리지 ETF"},
+    {"ticker":"METD","name":"메타 2배 인버스","exchange":"NASDAQ","asset_type":"2배 인버스 ETF"},
 ]
 
 
@@ -491,41 +534,71 @@ def normalize_us_item(item: dict, row: dict | None = None) -> dict:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def live_filtered_universe(market: str) -> list[dict]:
-    """상승 종목을 먼저 찾고 가격·유동성을 통과한 종목만 후보로 사용한다."""
+    """거래소 전체 순위에서 상승·유동성 후보를 만든다.
+
+    종목마다 현재가를 순차 조회하지 않는다. 한국은 KIS 거래소 순위,
+    미국은 Yahoo/TradingView/Nasdaq의 전시장 스크리너 결과를 합친 뒤
+    화면에 보여줄 소수만 남긴다. 고정 목록은 모든 순위 소스가 실패했을
+    때만 쓰는 장애 대비용이다.
+    """
     source = KR_UNIVERSE if market == "국내" else US_UNIVERSE
     limit = 300000 if market == "국내" else 200
-    accepted = []
-    if market == "국내":
+    accepted: list[dict] = []
+    ranked_rows: dict[str, dict] = {}
+    modes = (
+        ("국내 돌파", "국내 거래대금 급증")
+        if market == "국내"
+        else ("미국 30분 1% 타점", "미국 급등주")
+    )
+    for mode in modes:
         try:
-            ranked = scanner().candidates("국내 돌파")
-            blocked_words = ("스팩", "우선주", "관리", "정리매매", "인버스")
-            for row in ranked:
+            for row in scanner().candidates(mode):
                 candidate = dict(row)
-                price = float(candidate.get("screen_price", candidate.get("price", 0)) or 0)
-                change = float(candidate.get("screen_change", candidate.get("change_percent", candidate.get("change", 0))) or 0)
-                volume = int(candidate.get("screen_volume", candidate.get("volume", 0)) or 0)
-                candidate["screen_price"] = price
-                candidate["screen_change"] = change
-                candidate["screen_volume"] = volume
-                name = str(candidate.get("name", ""))
-                trading_value = price * volume
-                if (
-                    0 < price <= limit and 0 < change < 20.0
-                    and volume >= 100_000 and trading_value >= 10_000_000_000
-                    and not any(word in name for word in blocked_words)
-                ):
-                    candidate["asset_type"] = "실시간 상승·유동성 후보"
-                    accepted.append(candidate)
+                ticker = str(candidate.get("ticker") or candidate.get("code") or "").upper().strip()
+                if not ticker:
+                    continue
+                old = ranked_rows.get(ticker, {})
+                # 같은 종목이 상승률/거래량 순위 양쪽에 있으면 더 완전한 값을 보존한다.
+                merged = {**old, **candidate}
+                merged["screen_price"] = float(candidate.get("screen_price") or old.get("screen_price") or candidate.get("price") or 0)
+                merged["screen_change"] = float(candidate.get("screen_change") if candidate.get("screen_change") is not None else old.get("screen_change", candidate.get("change_percent", candidate.get("change", 0))) or 0)
+                merged["screen_volume"] = max(int(float(old.get("screen_volume", 0) or 0)), int(float(candidate.get("screen_volume", candidate.get("volume", 0)) or 0)))
+                merged["ticker"] = ticker
+                ranked_rows[ticker] = merged
         except Exception:
-            pass
+            continue
+
+    blocked_words = ("스팩", "우선주", "관리", "정리매매", "인버스")
+    for candidate in ranked_rows.values():
+        price = float(candidate.get("screen_price", 0) or 0)
+        change = float(candidate.get("screen_change", 0) or 0)
+        volume = int(candidate.get("screen_volume", 0) or 0)
+        name = str(candidate.get("name", ""))
+        trading_value = price * volume
+        if market == "국내":
+            valid = (
+                0 < price <= limit and 0 < change < 20.0
+                and volume >= 100_000 and trading_value >= 10_000_000_000
+                and not any(word in name for word in blocked_words)
+            )
+        else:
+            # 미국은 프리/정규/애프터 전체 스크리너 값을 사용한다. 소형주부터
+            # $200 이하 우량주·ETF까지 포함하되 무거래/하락 종목만 제거한다.
+            valid = 0.05 <= price <= limit and change > 0 and volume >= 50_000
+        if valid:
+            candidate["asset_type"] = "전 종목 실시간 상승·유동성 후보"
+            accepted.append(candidate)
     # The ranked market response is one bulk call. Do not follow it with an
     # unbounded sequence of per-symbol calls: that was the main reason the UI
     # looked frozen. Static blue-chip/ETF fallbacks are deliberately bounded.
     # If the bulk rising-rank endpoint returned anything, use it immediately.
     # Blue chips/ETFs remain available through direct search. Only when the
     # bulk endpoint is empty do we make a very small four-symbol fallback.
+    # 전체시장 순위가 모두 실패했을 때만 작은 고정 목록으로 장애를 완화한다.
+    # 정상 상황에서는 이 경로가 실행되지 않으므로 화면 속도에 영향이 없다.
     fallback_source = [] if accepted else source[:4]
-    for row in fallback_source:
+
+    def fetch_candidate(row: dict) -> dict | None:
         try:
             quote = (scanner().client.kr_quote(row["ticker"]) if market == "국내"
                      else scanner().client.us_quote(row["ticker"], row["exchange"]))
@@ -545,15 +618,36 @@ def live_filtered_universe(market: str) -> list[dict]:
             # and execution can freeze near the limit-up queue.
             change_ok = 0 < change < 20.0 if market == "국내" else change > 0
             if 0 < candidate["screen_price"] <= limit and change_ok:
-                accepted.append(candidate)
+                candidate["asset_type"] = str(candidate.get("asset_type") or "상승 후보")
+                return candidate
         except Exception:
-            continue
+            return None
+        return None
+
+    if market == "미국" and fallback_source:
+        # Four workers remain comfortably below the personal KIS request limit
+        # while avoiding an 11-symbol serial wait on every cache refresh.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(fetch_candidate, row) for row in fallback_source]
+            for future in as_completed(futures):
+                candidate = future.result()
+                if candidate:
+                    accepted.append(candidate)
+    else:
+        for row in fallback_source:
+            candidate = fetch_candidate(row)
+            if candidate:
+                accepted.append(candidate)
     deduped = {row["ticker"]: row for row in accepted}
     return sorted(
         deduped.values(),
-        key=lambda row: (float(row.get("screen_change", 0) or 0), int(row.get("screen_volume", 0) or 0)),
+        # 상승률만 높은 저유동성 종목보다 거래대금이 동반된 상승 종목을 우선한다.
+        key=lambda row: (
+            float(row.get("screen_change", 0) or 0),
+            float(row.get("screen_price", 0) or 0) * int(row.get("screen_volume", 0) or 0),
+        ),
         reverse=True,
-    )[:8]
+    )[:12]
 
 
 def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -> list[dict]:
