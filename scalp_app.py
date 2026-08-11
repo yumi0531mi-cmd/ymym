@@ -27,10 +27,12 @@ from streamlit_autorefresh import st_autorefresh
 try:
     from run_live_validation import (
         KR_UNIVERSE as AUDIT_KR_UNIVERSE,
+        US_UNIVERSE as AUDIT_US_UNIVERSE,
         connect as audit_connect,
         export_summary as audit_export_summary,
         grade_pending as audit_grade_pending,
         signal_window_open as audit_signal_window_open,
+        market_is_open as audit_market_is_open,
         store_quote as audit_store_quote,
         store_result as audit_store_result,
         DB_PATH as AUDIT_DB_PATH,
@@ -39,6 +41,7 @@ try:
     AUDIT_IMPORT_ERROR = ""
 except Exception as audit_import_exception:
     AUDIT_KR_UNIVERSE = []
+    AUDIT_US_UNIVERSE = []
     AUDIT_IMPORT_ERROR = str(audit_import_exception)
 
 KST = timezone(timedelta(hours=9), name="KST")
@@ -418,9 +421,7 @@ def benchmark_context(market: str, ticker: str) -> dict:
             change = float(quote.get("change", 0) or 0) * direction
             bars = scanner().client.us_intraday(bench, exchange, minutes=1)
             intraday = ((float(bars["close"].iloc[-1]) / float(bars["close"].iloc[-6]) - 1) * 100 * direction) if len(bars) >= 6 else 0.0
-            return {"name": bench, "change": change, "intraday": intraday, "confirmed": len(bars) >= 20}
-        mapping = {
-            "488080": [("005930", 0.5), ("000660", 0.5)…7782 tokens truncated…rt_path.read_bytes(),
+            return {"name": bench, "change": change, "intraday"…7888 tokens truncated…rt_path.read_bytes(),
             file_name="validation_report.html", mime="text/html", key="audit_report_download",
         )
     try:
