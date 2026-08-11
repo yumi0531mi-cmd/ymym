@@ -779,7 +779,7 @@ def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -
         max_repeat_spread = 0.35 if market_code == "KR" else 0.25
         if not (
             data_valid and level_plan_valid and risk_reward >= 1.5
-            and repeat_width >= 0.30
+            and repeat_width >= 0.50
             and verified_spread is not None and verified_spread <= max_repeat_spread
         ):
             continue
@@ -799,7 +799,8 @@ def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -
             or detail.get("pullback_entry", 0)
             or 0
         )
-        rank = priority * 100 + trend_score * 12 + score + positive_count * 5 + min(rvol, 5) * 2 + min(risk_reward, 4) * 2
+        preferred_range_bonus = 30 if 0.5 <= repeat_width <= 1.5 else (10 if repeat_width > 1.5 else 0)
+        rank = priority * 100 + trend_score * 12 + score + positive_count * 5 + min(rvol, 5) * 2 + min(risk_reward, 4) * 2 + preferred_range_bonus
         candidates.append({
             "ticker": ticker, "name": name or ticker, "stage": stage,
             "price": float(price or 0), "trigger": trigger, "score": score,
@@ -1011,6 +1012,99 @@ def structural_trade_plan(item: dict, market: str) -> dict:
     return item
 
 
+def _aggregate_ohlcv(item: dict, minutes: int) -> list[dict]:
+    """Build completed multi-minute OHLCV bars from the one-minute source."""
+    opens = [float(x or 0) for x in (item.get("chart_open_1m", []) or [])]
+    highs = [float(x or 0) for x in (item.get("chart_high_1m", []) or [])]
+    lows = [float(x or 0) for x in (item.get("chart_low_1m", []) or [])]
+    closes = [float(x or 0) for x in (item.get("chart_close_1m", []) or [])]
+    volumes = [float(x or 0) for x in (item.get("chart_volume_1m", []) or [])]
+    size = min(len(opens), len(highs), len(lows), len(closes))
+    if size < minutes:
+        return []
+    start = size % minutes
+    bars: list[dict] = []
+    for index in range(start, size, minutes):
+        end = min(index + minutes, size)
+        if end - index < minutes:
+            continue
+        chunk_high = highs[index:end]
+        chunk_low = lows[index:end]
+        chunk_close = closes[index:end]
+        if min(opens[index], *chunk_high, *chunk_low, *chunk_close) <= 0:
+            continue
+        bars.append({
+            "open": opens[index], "high": max(chunk_high), "low": min(chunk_low),
+            "close": chunk_close[-1], "volume": sum(volumes[index:end]) if volumes else 0.0,
+        })
+    return bars
+
+
+def multi_timeframe_plan(item: dict, market: str) -> dict:
+    """Use 60/15/5-minute direction as filters; keep 1-minute data for execution."""
+    price = float(item.get("price", 0) or 0)
+    previous = float(item.get("previous_close", item.get("prev_close", 0)) or 0)
+    day_open = float(item.get("open", item.get("day_open", 0)) or 0)
+    day_change = ((price / previous) - 1) * 100 if price > 0 and previous > 0 else float(
+        item.get("change_percent", item.get("change", 0)) or 0
+    )
+    daily_bullish = day_change >= -0.30 and (day_open <= 0 or price >= day_open * 0.995)
+    daily_bearish = day_change <= -1.0 and day_open > 0 and price < day_open
+
+    results: dict[int, dict] = {}
+    for minutes in (5, 15, 60):
+        bars = _aggregate_ohlcv(item, minutes)
+        closes = [row["close"] for row in bars]
+        highs = [row["high"] for row in bars]
+        lows = [row["low"] for row in bars]
+        volumes = [row["volume"] for row in bars]
+        available = len(bars) >= 2
+        ret = ((closes[-1] / closes[-2]) - 1) * 100 if available and closes[-2] > 0 else 0.0
+        ema = pd.Series(closes).ewm(span=min(5, max(2, len(closes))), adjust=False).mean() if closes else pd.Series(dtype=float)
+        ema_up = len(ema) >= 2 and float(ema.iloc[-1]) >= float(ema.iloc[-2])
+        higher_structure = (
+            len(bars) >= 3 and highs[-1] >= highs[-2] and lows[-1] >= lows[-2]
+        )
+        lower_structure = (
+            len(bars) >= 3 and highs[-1] < highs[-2] and lows[-1] < lows[-2]
+        )
+        prior_volume = float(pd.Series(volumes[:-1]).median()) if len(volumes) >= 2 else 0.0
+        volume_ok = not volumes or prior_volume <= 0 or volumes[-1] >= prior_volume * 0.70
+        bullish = available and ret >= 0 and ema_up and not lower_structure and volume_ok
+        bearish = available and ret < 0 and (not ema_up or lower_structure)
+        results[minutes] = {
+            "available": available, "bars": len(bars), "return": ret,
+            "ema_up": bool(ema_up), "higher_structure": bool(higher_structure),
+            "lower_structure": bool(lower_structure), "volume_ok": bool(volume_ok),
+            "bullish": bool(bullish), "bearish": bool(bearish),
+        }
+
+    five = results[5]
+    fifteen = results[15]
+    hourly = results[60]
+    hourly_allows = hourly["bullish"] or not hourly["available"]
+    alignment = daily_bullish and hourly_allows and fifteen["bullish"] and five["bullish"]
+    higher_timeframe_exit = (
+        fifteen["bearish"] and (hourly["bearish"] or daily_bearish)
+    ) or (five["bearish"] and fifteen["bearish"] and price < float(item.get("vwap", 0) or 0))
+    checks = {
+        "일봉·당일 큰 방향": daily_bullish,
+        "60분봉 방향 허용": hourly_allows,
+        "15분봉 상승": fifteen["bullish"],
+        "5분봉 상승": five["bullish"],
+        "1분봉은 실행 타점으로 사용": True,
+    }
+    item.update({
+        "mtf_alignment": bool(alignment),
+        "mtf_exit": bool(higher_timeframe_exit),
+        "mtf_checks": checks,
+        "mtf_detail": {str(key): value for key, value in results.items()},
+        "daily_direction_change": day_change,
+        "daily_direction_bullish": daily_bullish,
+    })
+    return item
+
+
 def repeat_scalp_plan(item: dict) -> dict:
     """Classify a repeatable trend scalp using only observed one-minute levels."""
     price = float(item.get("price", 0) or 0)
@@ -1038,7 +1132,12 @@ def repeat_scalp_plan(item: dict) -> dict:
     trend_score = int(item.get("continuous_rise_score", 0) or 0)
     ret15 = float(item.get("trend_return_15m", 0) or 0)
     swing_percent = ((target / support) - 1) * 100 if support > 0 and target > support else 0.0
-    trend_intact = price >= vwap > 0 and ema9 >= ema20 > 0 and trend_score >= 6 and ret15 >= 0
+    mtf_alignment = bool(item.get("mtf_alignment"))
+    mtf_exit = bool(item.get("mtf_exit"))
+    trend_intact = (
+        mtf_alignment and price >= vwap > 0 and ema9 >= ema20 > 0
+        and trend_score >= 6 and ret15 >= 0
+    )
     near_support = support <= price <= support + max(median_range, 1e-9)
     near_target = target >= price and target - price <= max(median_range, 1e-9)
     bounce = len(closes) >= 2 and closes[-1] > closes[-2] and lows[-1] <= support + max(median_range, 1e-9)
@@ -1067,7 +1166,7 @@ def repeat_scalp_plan(item: dict) -> dict:
         "하락봉 거래량 우세": sell_volume_dominant,
     }
     reversal_score = sum(bool(value) for value in reversal_checks.values())
-    breakdown = price < support or reversal_score >= 3
+    breakdown = price < support or reversal_score >= 3 or mtf_exit
 
     if breakdown:
         state, label = "EXIT", "🔴 추세 꺾임·전량매도·재진입 금지"
@@ -1075,7 +1174,7 @@ def repeat_scalp_plan(item: dict) -> dict:
             f"확인된 지지 {fmt(support)} 이탈 또는 하락 전환 근거 "
             f"{reversal_score}/5 동시 발생"
         )
-    elif swing_percent < 1.0:
+    elif swing_percent < 0.5:
         state, label = "RANGE_TOO_NARROW", f"⚪ 이번 반복 예상 범위 약 +{swing_percent:.2f}%"
         reason = f"분봉에서 확인된 매수 {fmt(support)} 부근 → 매도 {fmt(target)} 부근"
     elif price >= target or near_target:
@@ -1083,16 +1182,16 @@ def repeat_scalp_plan(item: dict) -> dict:
         reason = f"실제 1분봉 저항 {fmt(target)} 도달 구간"
     elif trend_intact and near_support and bounce and volume_returns:
         state, label = "BUY_PULLBACK", "🟢 눌림 반등 매수"
-        reason = f"실제 지지 {fmt(support)} 방어 후 양봉 전환·거래량 유지"
+        reason = f"일봉·60·15·5분 방향 허용 후 실제 지지 {fmt(support)}에서 1분봉 반등"
     elif trend_intact and price > ema9 and volume_returns:
         state, label = "HOLD_OR_BREAKOUT", "🟢 보유·돌파 매수 검토"
-        reason = f"VWAP·EMA 상승 구조 유지, 실제 저항 {fmt(target)}까지 공간 확인"
+        reason = f"다중 시간대 상승 정렬·VWAP 유지, 실제 저항 {fmt(target)}까지 공간 확인"
     elif trend_intact:
         state, label = "WAIT_PULLBACK", "🟡 눌림목 재매수 대기"
         reason = f"추격하지 말고 실제 지지 {fmt(support)} 반등을 기다림"
     else:
         state, label = "WAIT_TREND", "🔵 추세 재확인 대기"
-        reason = "VWAP·EMA 정렬과 15분 상승 흐름이 다시 일치할 때까지 대기"
+        reason = "일봉·60분·15분·5분 방향이 다시 정렬될 때까지 1분봉 매수 신호 차단"
 
     item.update({
         "repeat_scalp_state": state,
@@ -1105,6 +1204,7 @@ def repeat_scalp_plan(item: dict) -> dict:
         "repeat_scalp_reversal_score": reversal_score,
         "repeat_scalp_reversal_checks": reversal_checks,
         "repeat_scalp_range_percent": swing_percent,
+        "repeat_scalp_preferred_range": 0.5 <= swing_percent <= 1.5,
     })
     return item
 
@@ -1150,7 +1250,7 @@ def precise_analysis(row: dict, mode: str) -> dict:
     market = "국내" if mode.startswith("국내") else "미국"
     if market == "미국":
         item = normalize_us_item(item, row)
-    item = repeat_scalp_plan(structural_trade_plan(item, market))
+    item = repeat_scalp_plan(multi_timeframe_plan(structural_trade_plan(item, market), market))
     _, gate_ok, spread = data_quality_gate(item, market)
     item["data_gate_passed"] = bool(gate_ok)
     item["verified_spread_percent"] = spread
@@ -1389,7 +1489,7 @@ elif now - float(st.session_state.get("scalp_last_quote", 0)) >= (1 if focus_onl
             latest.update(refreshed[0])
             if market == "미국":
                 latest = normalize_us_item(latest, selected_row)
-            latest = repeat_scalp_plan(structural_trade_plan(latest, market))
+            latest = repeat_scalp_plan(multi_timeframe_plan(structural_trade_plan(latest, market), market))
             st.session_state["scalp_latest"] = latest
         st.session_state["scalp_last_quote"] = now
     except Exception as error:
@@ -1509,7 +1609,7 @@ elif repeat_state == "EXIT":
     action_line = f"추세가 꺾였습니다. {fmt(repeat_stop)} 이탈 시 재진입하지 마세요."
 elif repeat_state == "RANGE_TOO_NARROW":
     action_class, action_title = "wait", f"🟡 이번 반복 예상 범위 약 +{repeat_width:.2f}%"
-    action_line = f"매수 {fmt(repeat_buy)} 부근 → 매도 {fmt(repeat_sell)} 부근 · 1% 목표에는 미달"
+    action_line = f"매수 {fmt(repeat_buy)} 부근 → 매도 {fmt(repeat_sell)} 부근 · 0.5% 최소 반복 폭에 미달"
 else:
     action_class, action_title = "wait", "🟡 지금은 대기"
     action_line = f"{fmt(repeat_buy)} 지지 반등 또는 매수 합의가 확인될 때까지 매수하지 마세요."
@@ -1559,6 +1659,21 @@ with st.expander("장중 지속상승 판정 근거", expanded=False):
     ]
     if trend_rows:
         st.dataframe(pd.DataFrame(trend_rows), hide_index=True, use_container_width=True)
+
+with st.expander("다중 시간대 승인 · 일봉→60분→15분→5분→1분", expanded=False):
+    mtf_rows = [
+        {"시간대 조건": key, "판정": "✅ 허용" if value else "❌ 차단"}
+        for key, value in (latest.get("mtf_checks", {}) or {}).items()
+    ]
+    if mtf_rows:
+        st.dataframe(pd.DataFrame(mtf_rows), hide_index=True, use_container_width=True)
+    mtf_detail = latest.get("mtf_detail", {}) or {}
+    if mtf_detail:
+        st.caption(" · ".join(
+            f"{minutes}분 {float(detail.get('return', 0) or 0):+.2f}%"
+            f"({'상승' if detail.get('bullish') else '하락' if detail.get('bearish') else '중립'})"
+            for minutes, detail in mtf_detail.items()
+        ))
 
 st.subheader("추세 반복단타")
 repeat_reason = str(latest.get("repeat_scalp_reason", "실제 지지·저항 확인 대기"))
