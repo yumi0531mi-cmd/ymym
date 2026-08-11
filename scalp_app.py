@@ -730,6 +730,7 @@ def live_filtered_universe(market: str) -> list[dict]:
     )[:12]
 
 
+@st.cache_data(ttl=5, show_spinner=False)
 def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -> list[dict]:
     """이미 자동검증기가 수집한 최신 분석을 재사용해 추가 API 호출 없이 후보를 정렬한다."""
     market_code = "KR" if market == "국내" else "US"
@@ -857,6 +858,7 @@ def update_prediction_audit(ticker: str, price: float, item: dict, now_ts: float
     return records
 
 
+@st.cache_data(ttl=10, show_spinner=False)
 def calibration_stats(ticker: str) -> dict:
     stats = {}
     with db_connect() as db:
@@ -1081,7 +1083,10 @@ def multi_timeframe_plan(item: dict, market: str) -> dict:
     five = results[5]
     fifteen = results[15]
     hourly = results[60]
-    hourly_allows = hourly["bullish"] or not hourly["available"]
+    # A missing/neutral 60-minute comparison is not a bullish approval.  The
+    # shorter 15/5-minute trend may still be shown, but a green entry requires
+    # an actually confirmed hourly direction.
+    hourly_allows = hourly["bullish"]
     alignment = daily_bullish and hourly_allows and fifteen["bullish"] and five["bullish"]
     higher_timeframe_exit = (
         fifteen["bearish"] and (hourly["bearish"] or daily_bearish)
@@ -1093,10 +1098,34 @@ def multi_timeframe_plan(item: dict, market: str) -> dict:
         "5분봉 상승": five["bullish"],
         "1분봉은 실행 타점으로 사용": True,
     }
+    def timeframe_status(detail: dict) -> str:
+        if not detail.get("available"):
+            return "자료 형성 중 · 승인 아님"
+        if detail.get("bullish"):
+            return "상승 · 매매 방향 허용"
+        if detail.get("bearish"):
+            return "하락 · 신규매수 차단"
+        return "중립 · 기다림"
+
+    higher_trend = bool(
+        daily_bullish and fifteen["bullish"]
+        and (hourly["bullish"] or not hourly["available"])
+    )
+    short_pullback = bool(higher_trend and five["bearish"])
+    statuses = {
+        "일봉·오늘 큰 방향": "상승 허용" if daily_bullish else "하락·약세 차단",
+        "60분봉·장 전체 방향": timeframe_status(hourly),
+        "15분봉·몇 시간 방향": timeframe_status(fifteen),
+        "5분봉·반복단타 구간": timeframe_status(five),
+        "1분봉·실제 주문 타점": "상위 시간대 승인 후 매수·매도 확인",
+    }
     item.update({
         "mtf_alignment": bool(alignment),
         "mtf_exit": bool(higher_timeframe_exit),
         "mtf_checks": checks,
+        "mtf_status": statuses,
+        "mtf_higher_trend": higher_trend,
+        "mtf_short_pullback": short_pullback,
         "mtf_detail": {str(key): value for key, value in results.items()},
         "daily_direction_change": day_change,
         "daily_direction_bullish": daily_bullish,
@@ -1305,7 +1334,7 @@ def background_audit_tick(enabled: bool, now_ts: float, ui_market: str) -> None:
 
 
 st.title("⚡ 초단타 VWAP 매수타점")
-st.caption("집중 모드에서는 약 2.5초마다 화면을 갱신하고, 20초마다 1분봉·VWAP·EMA·거래량·호가를 정밀 재분석합니다.")
+st.caption("집중 모드에서는 약 3초마다 현재가를 갱신하고, 20초마다 분봉·VWAP·이동평균·거래량·호가를 정밀 재분석합니다.")
 
 
 with st.sidebar:
@@ -1334,7 +1363,7 @@ manual_search_active = bool(manual_ticker)
 # 별도 차단한다.
 live_refresh_active = bool(focus_only or auto_audit)
 st_autorefresh(
-    interval=2500 if focus_only else 8000 if auto_audit else 5000,
+    interval=3000 if focus_only else 10000 if auto_audit else 8000,
     key="scalp_tick",
 )
 if AUDIT_IMPORT_ERROR:
@@ -1544,6 +1573,8 @@ repeat_buy = float(latest.get("repeat_scalp_buy_level", 0) or 0)
 repeat_sell = float(latest.get("repeat_scalp_sell_level", 0) or 0)
 repeat_stop = float(latest.get("stop_loss", latest.get("repeat_scalp_invalidation", 0)) or 0)
 repeat_width = float(latest.get("repeat_scalp_range_percent", 0) or 0)
+higher_trend = bool(latest.get("mtf_higher_trend"))
+short_pullback = bool(latest.get("mtf_short_pullback"))
 if repeat_state == "EXIT":
     regime_name = "하락 전환"
     regime_method = "신규 매수 중단·실제 지지 회복과 하락 전환 해소 확인"
@@ -1592,9 +1623,13 @@ elif require_validation and not validated_signal:
 elif level == "success":
     label = f"🟢 매수 검토 · 주요 기법 합의 {buy_votes}/10"
 
-# The first thing a trader sees is one unambiguous action. Detailed indicators
-# remain below as evidence, not as competing instructions.
-if repeat_state == "BUY_PULLBACK" and level == "success":
+# The first thing a trader sees is one unambiguous action.  Market direction
+# and entry timing are combined here so a bullish regime cannot appear to
+# contradict the instruction shown immediately below it.
+if not quality_passed:
+    action_class, action_title = "wait", "⚪ 시세 확인 중·주문 대기"
+    action_line = "현재가·분봉·호가 중 미수신 항목을 다시 확인하고 있습니다. 확인 전에는 주문하지 마세요."
+elif repeat_state == "BUY_PULLBACK" and level == "success":
     action_class, action_title = "buy", "🟢 지금 매수 구간"
     action_line = f"{fmt(repeat_buy)} 부근 분할매수 → {fmt(repeat_sell)} 부근 분할매도"
 elif repeat_state == "HOLD_OR_BREAKOUT" and level == "success":
@@ -1606,6 +1641,12 @@ elif repeat_state == "TAKE_PROFIT":
 elif repeat_state == "EXIT":
     action_class, action_title = "stop", "🔴 반복단타 종료·매도"
     action_line = f"추세가 꺾였습니다. {fmt(repeat_stop)} 이탈 시 재진입하지 마세요."
+elif short_pullback:
+    action_class, action_title = "wait", "🟡 상승 추세 속 단기 조정·매수 대기"
+    action_line = f"15분 이상 흐름은 상승이지만 5분봉이 하락 중입니다. {fmt(repeat_buy)} 지지 후 5분봉 재상승을 기다리세요."
+elif higher_trend:
+    action_class, action_title = "wait", "🔵 상승 방향 유지·매수 타점 대기"
+    action_line = f"큰 방향은 상승입니다. 1분봉이 {fmt(repeat_buy)} 지지 후 VWAP를 회복할 때만 진입하세요."
 elif repeat_state == "RANGE_TOO_NARROW":
     action_class, action_title = "wait", f"🟡 이번 반복 예상 범위 약 +{repeat_width:.2f}%"
     action_line = f"매수 {fmt(repeat_buy)} 부근 → 매도 {fmt(repeat_sell)} 부근 · 0.5% 최소 반복 폭에 미달"
@@ -1621,8 +1662,8 @@ st.markdown(
 top = st.columns([1.4, 1, 1, 1, 1])
 top[0].metric(f"{latest.get('ticker')} · {latest.get('name')}", fmt(price), f"{change:+.2f}%")
 top[1].metric("VWAP", fmt(latest.get("vwap")))
-top[2].metric("EMA9", fmt(latest.get("ema9")))
-top[3].metric("RVOL", f"{float(latest.get('rvol', 0) or 0):.1f}배")
+top[2].metric("단기 평균선(EMA9)", fmt(latest.get("ema9")))
+top[3].metric("평소 대비 거래량", f"{float(latest.get('rvol', 0) or 0):.1f}배")
 top[4].metric("하락위험", f"{int(latest.get('five_min_risk_score', 0) or 0)}점")
 
 status_cols = st.columns(4)
@@ -1633,7 +1674,7 @@ status_cols[2].metric(
     f"{float(context.get('change', 0) or 0):+.2f}%",
     f"최근 5분 {float(context.get('intraday', 0) or 0):+.2f}%" if context.get("confirmed") else "분봉 미확인",
 )
-status_cols[3].metric("손익비", f"{risk_reward:.2f}")
+status_cols[3].metric("예상수익÷예상손실", f"{risk_reward:.2f}배")
 st.caption(f"현재 적용 기법: {regime_method}")
 
 level_cols = st.columns(4)
@@ -1660,10 +1701,13 @@ with st.expander("장중 지속상승 판정 근거", expanded=False):
         st.dataframe(pd.DataFrame(trend_rows), hide_index=True, use_container_width=True)
 
 with st.expander("다중 시간대 승인 · 일봉→60분→15분→5분→1분", expanded=False):
-    mtf_rows = [
-        {"시간대 조건": key, "판정": "✅ 허용" if value else "❌ 차단"}
-        for key, value in (latest.get("mtf_checks", {}) or {}).items()
-    ]
+    mtf_status = latest.get("mtf_status", {}) or {}
+    mtf_rows = [{"시간대 역할": key, "현재 판정": value} for key, value in mtf_status.items()]
+    if not mtf_rows:
+        mtf_rows = [
+            {"시간대 역할": key, "현재 판정": "상승 허용" if value else "신규매수 차단"}
+            for key, value in (latest.get("mtf_checks", {}) or {}).items()
+        ]
     if mtf_rows:
         st.dataframe(pd.DataFrame(mtf_rows), hide_index=True, use_container_width=True)
     mtf_detail = latest.get("mtf_detail", {}) or {}
@@ -1680,14 +1724,15 @@ repeat_message = (
     f"{repeat_label} · 매수 기준 {fmt(latest.get('repeat_scalp_buy_level'))} · "
     f"매도 기준 {fmt(latest.get('repeat_scalp_sell_level'))} · {repeat_reason}"
 )
-if repeat_state == "EXIT":
-    st.error(repeat_message)
-elif repeat_state == "TAKE_PROFIT":
-    st.warning(repeat_message)
-elif repeat_state in {"BUY_PULLBACK", "HOLD_OR_BREAKOUT"}:
-    st.success(repeat_message)
+# Repeat the same top-level instruction here instead of presenting a second,
+# competing verdict.  Detailed model output remains available as evidence.
+if action_class == "buy":
+    st.success(f"{action_title} · {action_line}")
+elif action_class in {"sell", "stop"}:
+    st.error(f"{action_title} · {action_line}")
 else:
-    st.info(repeat_message)
+    st.info(f"{action_title} · {action_line}")
+st.caption(f"세부 계산: {repeat_message}")
 with st.expander("추세 꺾임 판정 근거", expanded=repeat_state == "EXIT"):
     reversal_rows = [
         {"하락 전환 조건": key, "감지": "예" if value else "아니오"}
@@ -1696,43 +1741,29 @@ with st.expander("추세 꺾임 판정 근거", expanded=repeat_state == "EXIT")
     if reversal_rows:
         st.dataframe(pd.DataFrame(reversal_rows), hide_index=True, use_container_width=True)
 
-getattr(st, level)(label)
-if level == "success":
-    st.write(
-        f"진입: **{fmt(latest.get('structural_entry'))}** · "
-        f"1차 저항 매도: **{fmt(latest.get('structural_target'))}** · "
-        f"손절: **{fmt(latest.get('stop_loss'))}**"
-    )
-elif level == "error":
-    st.write(latest.get("invalidation_reason", "VWAP·EMA·호가 조건 이탈"))
-else:
-    st.write(latest.get("entry_trigger", "VWAP 지지와 거래량 재증가를 기다리세요."))
+with st.expander("최종 판정의 세부 차단·허용 근거", expanded=False):
+    getattr(st, level)(label)
+    if level == "success":
+        st.write(
+            f"진입: **{fmt(latest.get('structural_entry'))}** · "
+            f"1차 저항 매도: **{fmt(latest.get('structural_target'))}** · "
+            f"손절: **{fmt(latest.get('stop_loss'))}**"
+        )
+    elif level == "error":
+        st.write(latest.get("invalidation_reason", "VWAP·이동평균·호가 조건 이탈"))
+    else:
+        st.write(latest.get("entry_trigger", "VWAP 지지와 거래량 재증가를 기다리세요."))
 
 pullback_price = float(latest.get("pullback_entry", 0) or 0)
 breakout_price = float(latest.get("breakout_entry", 0) or 0)
 stop_price = float(latest.get("stop_loss", 0) or 0)
-if level == "success":
-    st.success(
-        f"▶ 지금 진입 검토: 현재 체결가 {fmt(price)} · "
-        f"최근 스윙 저항 {fmt(latest.get('structural_target'))}에서 1차 매도 · "
-        f"확인된 지지 {fmt(stop_price)} 이탈 시 매수 판단 무효"
-    )
-elif level == "warning":
-    st.warning(
-        f"▶ 지금은 매수하지 않음 · 확인된 지지 {fmt(latest.get('structural_support'))}에서 반등하고 "
-        f"VWAP·EMA를 회복해 매수 합의 6/10 이상이 될 때만 진입 검토"
-    )
-else:
-    if price > price_limit and not is_manual_search:
-        st.error("▶ 자동 후보 가격 조건 초과 · 이 종목을 직접 검색하면 금액 제한 없이 다시 판정합니다.")
-    else:
-        st.error(f"▶ 현재는 진입하지 않음 · {fmt(stop_price)} 위 회복과 매수 합의 재형성 전까지 관찰")
+st.caption(f"한 줄 결론: {action_title} · {action_line}")
 
 consensus_cols = st.columns(4)
 consensus_cols[0].metric("매수 기법", f"{buy_votes}/10")
 consensus_cols[1].metric("매도 기법", f"{sell_votes}/10")
 consensus_cols[2].metric("대기 기법", f"{wait_votes}/10")
-consensus_cols[3].metric("장세가중 합의", f"{weighted_score:+.1f}점", f"매수비중 {weighted_buy:.1f}%")
+consensus_cols[3].metric("종합 매수 강도", f"{weighted_score:+.1f}점", f"매수 근거 비중 {weighted_buy:.1f}%")
 with st.expander("매수·매도 기법별 판정 근거", expanded=False):
     st.dataframe(pd.DataFrame(strategy_rows), hide_index=True, use_container_width=True)
 with st.expander("실시간 데이터 검문 내역", expanded=not quality_passed):
@@ -1771,8 +1802,10 @@ elif min(f5, f10, f20, f30) < 0:
 else:
     st.warning("⏳ 시간대별 방향이 일치하지 않습니다. 진입을 기다리세요.")
 
-st.caption("표시 가격은 임의 퍼센트 목표가가 아니라 현재 1분봉에서 실제로 확인된 지지·저항 가격입니다. 확인되지 않으면 숫자를 만들지 않고 진입을 차단합니다.")
+st.caption("표시 가격은 임의 퍼센트 목표가가 아니라 현재 분봉에서 실제로 확인된 지지·저항 가격입니다. 확인되지 않으면 숫자를 만들지 않고 진입을 차단합니다.")
 
+st.subheader("실시간 차트 분석 · 매수·매도 타점")
+st.caption("5·15·60분봉으로 방향을 확인하고, 아래 1분봉에서 실제 진입·매도 위치를 표시합니다.")
 render_chart(latest)
 
 with st.expander("진입 전 뉴스·공시 위험을 지금 한 번 확인"):
