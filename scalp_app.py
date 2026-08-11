@@ -447,6 +447,54 @@ def live_filtered_universe(market: str) -> list[dict]:
     return accepted
 
 
+def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -> list[dict]:
+    """이미 자동검증기가 수집한 최신 분석을 재사용해 추가 API 호출 없이 후보를 정렬한다."""
+    market_code = "KR" if market == "국내" else "US"
+    cutoff = int(time.time()) - 12 * 60
+    try:
+        with audit_connect() as db:
+            rows = db.execute("""
+                SELECT s.ticker,s.name,s.issued,s.base_price,s.verdict,s.score,
+                       s.entry_ok,s.data_valid,s.forecast5,s.forecast10,
+                       s.forecast20,s.forecast30,s.detail_json
+                FROM signals s
+                JOIN (
+                    SELECT ticker,MAX(issued) AS issued FROM signals
+                    WHERE market=? AND issued>=? GROUP BY ticker
+                ) latest ON latest.ticker=s.ticker AND latest.issued=s.issued
+                WHERE s.market=?
+            """, (market_code, cutoff, market_code)).fetchall()
+    except Exception:
+        return []
+    candidates = []
+    for ticker, name, issued, price, verdict, score, entry_ok, data_valid, f5, f10, f20, f30, detail_json in rows:
+        try:
+            detail = json.loads(detail_json or "{}")
+        except Exception:
+            detail = {}
+        forecasts = [float(x or 0) for x in (f5, f10, f20, f30)]
+        positive_count = sum(x > 0 for x in forecasts)
+        rvol = float(detail.get("rvol", 0) or 0)
+        risk_reward = float(detail.get("risk_reward", 0) or 0)
+        score = float(score or 0)
+        if entry_ok and data_valid and score >= minimum_score:
+            stage, priority = "🟢 지금 진입 검토", 3
+        elif data_valid and score >= minimum_score and positive_count >= 3 and risk_reward >= 1.5:
+            stage, priority = "🟡 돌파 시 진입", 2
+        elif data_valid and positive_count >= 2 and risk_reward >= 1.3:
+            stage, priority = "🟠 눌림목 대기", 1
+        else:
+            continue
+        trigger = float(detail.get("breakout_entry", 0) or detail.get("pullback_entry", 0) or 0)
+        rank = priority * 100 + score + positive_count * 5 + min(rvol, 5) * 2 + min(risk_reward, 4) * 2
+        candidates.append({
+            "ticker": ticker, "name": name or ticker, "stage": stage,
+            "price": float(price or 0), "trigger": trigger, "score": score,
+            "rvol": rvol, "risk_reward": risk_reward, "issued": int(issued), "rank": rank,
+        })
+    return sorted(candidates, key=lambda x: x["rank"], reverse=True)[:limit]
+
+
 def update_prediction_audit(ticker: str, price: float, item: dict, now_ts: float) -> list[dict]:
     bucket = float(int(now_ts // 300) * 300)
     with db_connect() as db:
@@ -652,6 +700,29 @@ elif auto_audit:
         st.sidebar.caption(f"저장 {total_signals}건 · 30분 채점완료 {completed_signals}건")
     except Exception:
         pass
+
+candidate_board = latest_entry_candidates(market, minimum_score)
+st.subheader("실시간 진입 후보")
+if candidate_board:
+    board_rows = []
+    for candidate in candidate_board:
+        trigger_text = "즉시 조건 충족" if candidate["stage"].startswith("🟢") else (
+            f"{candidate['trigger']:,.0f} 돌파 확인" if market == "국내" and candidate["trigger"] > 0
+            else f"${candidate['trigger']:,.2f} 돌파 확인" if candidate["trigger"] > 0
+            else "VWAP 재돌파 확인"
+        )
+        board_rows.append({
+            "판정": candidate["stage"], "종목": f"{candidate['ticker']} · {candidate['name']}",
+            "현재가": candidate["price"], "진입 발동": trigger_text,
+            "점수": round(candidate["score"]), "RVOL": round(candidate["rvol"], 1),
+            "손익비": round(candidate["risk_reward"], 2),
+            "분석시각": datetime.fromtimestamp(candidate["issued"], KST).strftime("%H:%M:%S"),
+        })
+    st.dataframe(pd.DataFrame(board_rows), hide_index=True, use_container_width=True)
+    st.caption("🟢도 주문 보장이 아니라 현재 데이터의 진입 조건 충족입니다. 표시된 발동가·손절 조건을 함께 확인하세요.")
+else:
+    st.info("현재 진입 조건에 가까운 후보가 없습니다. 자동검증기가 전 종목을 한 바퀴 도는 동안 갱신됩니다.")
+
 options = live_filtered_universe(market) if not manual_ticker else []
 resolved_manual = None
 if manual_ticker:
