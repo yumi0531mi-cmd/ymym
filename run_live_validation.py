@@ -195,7 +195,9 @@ def signal_window_open(market: str, now: datetime) -> bool:
         ny = now.astimezone(ZoneInfo("America/New_York"))
         if ny.weekday() >= 5:
             return False
-        return clock_time(9, 30) <= ny.time() <= clock_time(16, 0)
+        # 프리·정규·애프터 세션을 모두 별도 표본으로 보존한다. 정규장 밖의
+        # 데이터는 앱의 세션 필드로 구분되며 정규장 적중률과 섞어 해석하지 않는다.
+        return clock_time(4, 0) <= ny.time() <= clock_time(20, 0)
     except Exception:
         return False
 
