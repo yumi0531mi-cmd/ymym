@@ -1442,7 +1442,7 @@ elif auto_audit:
     audit_now = datetime.fromtimestamp(now, KST)
     audit_minute = audit_now.hour * 60 + audit_now.minute
     if market == "미국":
-        if session_info["is_open"]:
+        if session_info["tradable"]:
             audit_phase = f"{session_info['session']} · 신호 수집·사후 채점 중"
         else:
             audit_phase = f"{session_info['session']} · 다음 미국 세션 대기"
