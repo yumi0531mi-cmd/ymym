@@ -17,6 +17,7 @@ import pandas as pd
 
 KST = timezone(timedelta(hours=9), name="KST")
 ET = ZoneInfo("America/New_York")
+SCANNER_ENGINE_VERSION = "2026.08.13-v3"
 
 
 @dataclass(frozen=True)
