@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """KIS 초단타 신호 무인 수집·사후검증기.
 
-같은 폴더의 app.py에 번들된 엔진을 재사용한다. Streamlit 화면과 무관하게
-실행되며 SQLite에 신호와 5/10/20/30분 후 결과를 영구 저장한다.
+scalp_app.py의 0.5~1.5% 반복폭, 실제 1차/2차 목표, 추가상승 판정을
+signals.detail_json에 보존한다. +1/+2/+3%는 검증 통계 전용이며 매매 목표가와 무관하다.
 """
 from __future__ import annotations
 
@@ -10,20 +10,20 @@ import argparse
 import ast
 import base64
 import csv
+import html
 import importlib.abc
 import importlib.util
 import json
 import logging
-import html
+import math
+import os
 import signal
 import sqlite3
 import sys
 import time
-import types
 import zlib
-import os
-import math
-from dataclasses import dataclass
+
+import pandas as pd
 from datetime import datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
 
@@ -38,18 +38,14 @@ KR_UNIVERSE = [
     ("005930", "삼성전자", "KR"), ("000660", "SK하이닉스", "KR"),
     ("035420", "NAVER", "KR"), ("005380", "현대차", "KR"),
     ("069500", "KODEX 200", "KR"), ("102110", "TIGER 200", "KR"),
-    ("396500", "TIGER 반도체TOP10", "KR"),
-    ("122630", "KODEX 레버리지", "KR"),
-    ("123320", "TIGER 레버리지", "KR"),
-    ("488080", "TIGER 반도체TOP10레버리지", "KR"),
+    ("396500", "TIGER 반도체TOP10", "KR"), ("122630", "KODEX 레버리지", "KR"),
+    ("123320", "TIGER 레버리지", "KR"), ("488080", "TIGER 반도체TOP10레버리지", "KR"),
 ]
 US_UNIVERSE = [
     ("GOOGL", "알파벳", "NASDAQ"), ("AMD", "AMD", "NASDAQ"),
     ("INTC", "인텔", "NASDAQ"), ("SMH", "반도체 ETF", "NASDAQ"),
-    ("SOXL", "반도체 3배 레버리지 ETF", "AMEX"),
-    ("SOXS", "반도체 3배 인버스 ETF", "AMEX"),
-    ("TQQQ", "나스닥100 3배 레버리지 ETF", "NASDAQ"),
-    ("SQQQ", "나스닥100 3배 인버스 ETF", "NASDAQ"),
+    ("SOXL", "반도체 3배 레버리지 ETF", "AMEX"), ("SOXS", "반도체 3배 인버스 ETF", "AMEX"),
+    ("TQQQ", "나스닥100 3배 레버리지 ETF", "NASDAQ"), ("SQQQ", "나스닥100 3배 인버스 ETF", "NASDAQ"),
 ]
 
 
@@ -64,20 +60,17 @@ def setup_logging() -> None:
 
 def load_engine():
     source_path = ROOT / "app.py"
-    # Codex 작업 폴더에서는 통합 앱이 이웃 결과 폴더에 있고, 실제 GitHub 배포 시에는
-    # 검증기와 같은 저장소 루트에 있다.
     if not source_path.exists():
         development_copy = ROOT.parent / "ymym_stock_scanner_fixed" / "app.py"
         if development_copy.exists():
             source_path = development_copy
     if not source_path.exists():
         raise FileNotFoundError("run_live_validation.py와 같은 폴더에 app.py가 필요합니다.")
+
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
     bundled = None
     for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "_BUNDLED" for target in node.targets
-        ):
+        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "_BUNDLED" for target in node.targets):
             bundled = ast.literal_eval(node.value)
             break
     if not isinstance(bundled, dict):
@@ -129,7 +122,12 @@ def connect() -> sqlite3.Connection:
             max_up30 REAL, max_down30 REAL, result_done INTEGER NOT NULL DEFAULT 0,
             stop_price REAL, data_valid INTEGER NOT NULL DEFAULT 0,
             hit1_before_stop INTEGER, hit2_before_stop INTEGER, hit3_before_stop INTEGER,
-            stop_first INTEGER, detail_json TEXT, UNIQUE(market,ticker,issued)
+            stop_first INTEGER, detail_json TEXT,
+            repeat_entry_price REAL, target1_price REAL, target2_price REAL,
+            repeat_range_percent REAL, repeat_candidate INTEGER NOT NULL DEFAULT 0,
+            entry_touched INTEGER, target1_before_stop INTEGER, target2_before_stop INTEGER,
+            continuation_score REAL, continuation_label TEXT, extra_after_target1 REAL,
+            UNIQUE(market,ticker,issued)
         )
     """)
     db.execute("""
@@ -145,12 +143,18 @@ def connect() -> sqlite3.Connection:
             singleton INTEGER PRIMARY KEY CHECK(singleton=1), pid INTEGER, heartbeat INTEGER
         )
     """)
-    # 이전 시험 DB도 삭제 없이 새 열을 추가한다.
+
+    # 기존 검증 DB는 삭제하지 않고 필요한 열만 추가한다.
     existing = {row[1] for row in db.execute("PRAGMA table_info(signals)")}
     migrations = {
         "stop_price": "REAL", "data_valid": "INTEGER NOT NULL DEFAULT 0",
         "hit1_before_stop": "INTEGER", "hit2_before_stop": "INTEGER",
         "hit3_before_stop": "INTEGER", "stop_first": "INTEGER",
+        "repeat_entry_price": "REAL", "target1_price": "REAL", "target2_price": "REAL",
+        "repeat_range_percent": "REAL", "repeat_candidate": "INTEGER NOT NULL DEFAULT 0",
+        "entry_touched": "INTEGER", "target1_before_stop": "INTEGER",
+        "target2_before_stop": "INTEGER", "continuation_score": "REAL",
+        "continuation_label": "TEXT", "extra_after_target1": "REAL",
     }
     for column, definition in migrations.items():
         if column not in existing:
@@ -161,7 +165,7 @@ def connect() -> sqlite3.Connection:
 def f(value, default=0.0) -> float:
     try:
         number = float(value)
-        return number if number == number else default
+        return number if math.isfinite(number) else default
     except (TypeError, ValueError, OverflowError):
         return default
 
@@ -169,35 +173,23 @@ def f(value, default=0.0) -> float:
 def market_is_open(market: str, now: datetime) -> bool:
     if market == "KR":
         local = now.astimezone(KST)
-        if local.weekday() >= 5:
-            return False
-        return clock_time(8, 50) <= local.time() <= clock_time(15, 35)
-    # 미국 프리마켓부터 애프터마켓까지 시세 추적. 뉴욕 시간으로 계산해 서머타임을 반영한다.
+        return local.weekday() < 5 and clock_time(8, 50) <= local.time() <= clock_time(15, 35)
     try:
         from zoneinfo import ZoneInfo
         ny = now.astimezone(ZoneInfo("America/New_York"))
-        if ny.weekday() >= 5:
-            return False
-        return clock_time(4, 0) <= ny.time() <= clock_time(20, 0)
+        return ny.weekday() < 5 and clock_time(4, 0) <= ny.time() <= clock_time(20, 0)
     except Exception:
         return False
 
 
 def signal_window_open(market: str, now: datetime) -> bool:
-    """신규 예측을 발행하는 시간. 이후 35분은 기존 예측 채점용 시세만 받는다."""
     if market == "KR":
         local = now.astimezone(KST)
-        if local.weekday() >= 5:
-            return False
-        return clock_time(9, 0) <= local.time() <= clock_time(15, 0)
+        return local.weekday() < 5 and clock_time(9, 0) <= local.time() <= clock_time(15, 0)
     try:
         from zoneinfo import ZoneInfo
         ny = now.astimezone(ZoneInfo("America/New_York"))
-        if ny.weekday() >= 5:
-            return False
-        # 프리·정규·애프터 세션을 모두 별도 표본으로 보존한다. 정규장 밖의
-        # 데이터는 앱의 세션 필드로 구분되며 정규장 적중률과 섞어 해석하지 않는다.
-        return clock_time(4, 0) <= ny.time() <= clock_time(20, 0)
+        return ny.weekday() < 5 and clock_time(4, 0) <= ny.time() <= clock_time(19, 30)
     except Exception:
         return False
 
@@ -206,12 +198,467 @@ def row_for(ticker: str, name: str, exchange: str) -> dict:
     return {"ticker": ticker, "name": name, "exchange": exchange, "asset_type": "검증대상"}
 
 
+def _num(value, default=0.0):
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else default
+    except Exception:
+        return default
+
+
+def _numeric_list(item, key):
+    values = item.get(key, []) or []
+    result = []
+    for value in values:
+        number = _num(value, float("nan"))
+        if math.isfinite(number):
+            result.append(number)
+    return result
+
+
+def _dedupe_levels(levels, tolerance_pct=0.06):
+    clean = sorted(x for x in (_num(v) for v in levels) if x > 0)
+    result = []
+    for level in clean:
+        if not result:
+            result.append(level)
+            continue
+        if abs(level / result[-1] - 1.0) * 100 <= tolerance_pct:
+            result[-1] = max(result[-1], level)
+        else:
+            result.append(level)
+    return result
+
+
+def _intraday_ohlcv(item):
+    opens = _numeric_list(item, "chart_open_1m")
+    highs = _numeric_list(item, "chart_high_1m")
+    lows = _numeric_list(item, "chart_low_1m")
+    closes = _numeric_list(item, "chart_close_1m")
+    raw_volumes = item.get("chart_volume_1m", []) or []
+    n = min(len(opens), len(highs), len(lows), len(closes))
+    if n < 12:
+        return pd.DataFrame()
+
+    opens, highs, lows, closes = opens[-n:], highs[-n:], lows[-n:], closes[-n:]
+    volumes = [_num(v) for v in raw_volumes[-n:]]
+    if len(volumes) < n:
+        volumes = [0.0] * (n - len(volumes)) + volumes
+
+    times = list(item.get("chart_time_1m", []) or [])
+    if len(times) >= n:
+        times = times[-n:]
+    else:
+        times = list(range(n))
+
+    frame = pd.DataFrame({
+        "time": times,
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+        "volume": volumes,
+    })
+    frame = frame[
+        (frame["open"] > 0)
+        & (frame["high"] > 0)
+        & (frame["low"] > 0)
+        & (frame["close"] > 0)
+        & (frame["high"] >= frame[["open", "close", "low"]].max(axis=1))
+        & (frame["low"] <= frame[["open", "close", "high"]].min(axis=1))
+    ].copy()
+    if frame.empty:
+        return frame
+
+    # 장/세션 사이의 큰 공백이 있으면 마지막 연속 분봉 구간만 사용해
+    # 전일 저항이 당일 초단타 목표에 섞이는 것을 줄인다.
+    try:
+        parsed = pd.to_datetime(frame["time"], errors="coerce")
+        if parsed.notna().sum() >= max(12, len(frame) // 2):
+            frame["_parsed_time"] = parsed
+            frame = frame.sort_values("_parsed_time").reset_index(drop=True)
+            gaps = frame["_parsed_time"].diff().dt.total_seconds().fillna(0)
+            gap_rows = frame.index[gaps > 45 * 60].tolist()
+            if gap_rows:
+                frame = frame.iloc[gap_rows[-1]:].copy()
+    except Exception:
+        pass
+
+    return frame.tail(180).reset_index(drop=True)
+
+
+def _atr_and_range(frame):
+    if frame.empty:
+        return 0.0, 0.0
+    prev = frame["close"].shift(1)
+    tr = pd.concat(
+        [
+            frame["high"] - frame["low"],
+            (frame["high"] - prev).abs(),
+            (frame["low"] - prev).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr14 = _num(tr.tail(14).mean())
+    median_range = _num((frame["high"] - frame["low"]).tail(20).median())
+    return atr14, median_range
+
+
+def _swing_levels(values, kind="high"):
+    levels = []
+    if len(values) < 7:
+        return levels
+    for i in range(2, len(values) - 2):
+        window = values[i - 2:i + 3]
+        value = values[i]
+        if kind == "high" and value >= max(window):
+            levels.append(value)
+        elif kind == "low" and value <= min(window):
+            levels.append(value)
+    return _dedupe_levels(levels)
+
+
+def apply_repeat_scalp_overlay(item, market_code):
+    """기존 엔진 결과를 보존하면서 반복단타 전용 차트 레벨만 추가한다."""
+    if not isinstance(item, dict):
+        return item
+    item = dict(item)
+    price = _num(item.get("price"))
+    frame = _intraday_ohlcv(item)
+    if price <= 0 or len(frame) < 20:
+        item.update(
+            repeat_chart_valid=False,
+            repeat_chart_reason="현재가 또는 연속 1분봉 20개 미만",
+            repeat_candidate=False,
+        )
+        return item
+
+    highs = frame["high"].tolist()
+    lows = frame["low"].tolist()
+    closes = frame["close"].tolist()
+    volumes = frame["volume"].tolist()
+    atr14, median_range = _atr_and_range(frame)
+    if atr14 <= 0:
+        atr14 = median_range
+    if median_range <= 0:
+        median_range = atr14
+
+    vwap = _num(item.get("vwap"))
+    ema9 = _num(item.get("ema9"))
+    ema20 = _num(item.get("ema20"))
+    rsi = _num(item.get("rsi"), 50.0)
+    macd = _num(item.get("macd_histogram"))
+    rvol = _num(item.get("rvol"))
+    f10 = _num(item.get("forecast_10m"))
+    f30 = _num(item.get("forecast_30m"))
+
+    bid = _num(item.get("best_bid"))
+    ask = _num(item.get("best_ask"))
+    spread = ((ask - bid) / ((ask + bid) / 2) * 100) if ask >= bid > 0 else None
+    spread_limit = 0.35 if "레버리지" in str(item.get("asset_type", "")) else 0.25
+    quality_checks = {
+        "분봉 실데이터": not bool(item.get("intraday_fallback")),
+        "VWAP 확인": vwap > 0,
+        "EMA9·20 확인": ema9 > 0 and ema20 > 0,
+        "호가 스프레드": spread is None or spread <= spread_limit,
+    }
+    quality_pass = all(quality_checks.values())
+
+    ret5 = (closes[-1] / closes[-6] - 1) * 100 if len(closes) >= 6 and closes[-6] > 0 else 0.0
+    ret15 = (closes[-1] / closes[-16] - 1) * 100 if len(closes) >= 16 and closes[-16] > 0 else 0.0
+    ret30 = (closes[-1] / closes[-31] - 1) * 100 if len(closes) >= 31 and closes[-31] > 0 else 0.0
+
+    recent_hi = max(highs[-6:])
+    previous_hi = max(highs[-12:-6]) if len(highs) >= 12 else recent_hi
+    recent_lo = min(lows[-6:])
+    previous_lo = min(lows[-12:-6]) if len(lows) >= 12 else recent_lo
+
+    up_volume = down_volume = 0.0
+    start = max(1, len(closes) - 20)
+    for i in range(start, len(closes)):
+        vol = volumes[i] if i < len(volumes) else 0.0
+        if closes[i] > closes[i - 1]:
+            up_volume += vol
+        elif closes[i] < closes[i - 1]:
+            down_volume += vol
+    volume_ratio = up_volume / down_volume if down_volume > 0 else (2.0 if up_volume > 0 else 0.0)
+
+    trend_checks = {
+        "VWAP 위": price > vwap > 0,
+        "EMA 정배열": price >= ema9 >= ema20 > 0,
+        "5분 상승": ret5 > 0,
+        "15분 상승": ret15 >= 0,
+        "30분 상승": ret30 >= -0.15,
+        "고점 상승": recent_hi >= previous_hi,
+        "저점 상승": recent_lo >= previous_lo,
+        "상승봉 거래량 우세": volume_ratio >= 1.05,
+        "RSI 과열 아님": rsi < (82 if market_code == "US" else 78),
+        "10분 전망 급락 아님": f10 > -0.40,
+    }
+    trend_score = sum(bool(v) for v in trend_checks.values())
+
+    swing_lows = _swing_levels(lows, "low")
+    support_candidates = [(x, "1분봉 스윙 저점") for x in swing_lows if 0 < x < price]
+    recent_low = min(lows[-20:])
+    if 0 < recent_low < price:
+        support_candidates.append((recent_low, "최근 20분 저점"))
+    if 0 < vwap < price:
+        support_candidates.append((vwap, "VWAP"))
+    if 0 < ema9 < price:
+        support_candidates.append((ema9, "EMA9"))
+    if 0 < ema20 < price:
+        support_candidates.append((ema20, "EMA20"))
+
+    if not support_candidates:
+        item.update(
+            repeat_chart_valid=False,
+            repeat_chart_reason="현재가 아래 차트 지지선 미확인",
+            repeat_candidate=False,
+            repeat_trend_score=trend_score,
+            repeat_trend_checks=trend_checks,
+        )
+        return item
+
+    support, support_basis = max(support_candidates, key=lambda x: x[0])
+
+    swing_highs = _swing_levels(highs, "high")
+    # 반복단타 1차 목표는 지지선 대비 최소 +0.5% 공간이 있는 첫 의미 있는 저항만 사용한다.
+    min_repeat_target = support * 1.005
+    resistance_candidates = [x for x in swing_highs if x > price and x >= min_repeat_target]
+    box_high = max(highs[-30:])
+    box_low = min(lows[-30:])
+    box_width = max(0.0, box_high - box_low)
+    prior_high = max(highs[-30:-1]) if len(highs) >= 31 else max(highs[:-1])
+    for level in (box_high, prior_high):
+        if level > price and level >= min_repeat_target:
+            resistance_candidates.append(level)
+    resistance_candidates = _dedupe_levels(resistance_candidates)
+
+    target1 = 0.0
+    target2 = 0.0
+    target1_basis = ""
+    target2_basis = ""
+    if resistance_candidates:
+        target1 = resistance_candidates[0]
+        target1_basis = "현재가 위 가장 가까운 실제 1분봉 저항"
+        higher = [x for x in resistance_candidates[1:] if x > target1 * 1.0005]
+        if higher:
+            target2 = higher[0]
+            target2_basis = "1차 위 다음 실제 1분봉 저항"
+    elif trend_score >= 7:
+        # 신저가/신고가 돌파로 실제 저항이 아직 없을 때만 최근 ATR·봉폭을 투영한다.
+        projection1 = max(atr14 * 1.25, median_range * 1.50)
+        if box_width > 0:
+            projection1 = min(projection1, max(atr14 * 2.20, box_width * 0.50))
+        target1 = price + projection1
+        target1_basis = "신고가 구간 · 최근 1분봉 ATR/박스폭 투영"
+
+    if target1 > price and target2 <= target1 and trend_score >= 6:
+        projection2 = max(atr14 * 1.35, median_range * 1.75, (target1 - price) * 0.80)
+        if box_width > 0:
+            projection2 = min(projection2, max(atr14 * 2.40, box_width * 0.60))
+        target2 = target1 + projection2
+        target2_basis = "다음 저항 미형성 · ATR/최근 박스폭 보수 투영"
+
+    if not (0 < support < price < target1):
+        item.update(
+            repeat_chart_valid=False,
+            repeat_chart_reason="지지 < 현재가 < 1차 목표 가격순서 불충족",
+            repeat_candidate=False,
+            repeat_support=support,
+            repeat_trend_score=trend_score,
+            repeat_trend_checks=trend_checks,
+        )
+        return item
+
+    stop_buffer = max(atr14 * 0.35, median_range * 0.45)
+    if stop_buffer <= 0:
+        stop_buffer = support * 0.0025
+    stop_buffer = min(stop_buffer, support * 0.0060)
+    stop = max(0.0, support - stop_buffer)
+    entry = support
+
+    repeat_width = (target1 / entry - 1) * 100 if target1 > entry > 0 else 0.0
+    t1_from_current = (target1 / price - 1) * 100
+    t2_from_current = (target2 / price - 1) * 100 if target2 > price else 0.0
+    extra_after_t1 = (target2 / target1 - 1) * 100 if target2 > target1 > 0 else 0.0
+    risk = entry - stop
+    reward = target1 - entry
+    repeat_rr = reward / risk if risk > 0 else 0.0
+
+    continuation_checks = {
+        "2차 차트 목표 존재": target2 > target1,
+        "VWAP 위 유지": price > vwap > 0,
+        "EMA 정배열": ema9 >= ema20 > 0,
+        "15분 실제 상승": ret15 > 0,
+        "30분 약세 아님": ret30 >= -0.10,
+        "상승봉 거래량 우세": volume_ratio >= 1.05,
+        "MACD 비약세": macd >= 0,
+        "RVOL 확보": rvol >= 0.80,
+        "10분 전망 약세 아님": f10 > -0.25,
+        "30분 전망 약세 아님": f30 > -0.35,
+    }
+    continuation_score = sum(bool(v) for v in continuation_checks.values())
+    if target2 <= target1:
+        continuation_state = "NONE"
+        continuation_label = "⚪ 2차 목표 미확인"
+    elif continuation_score >= 8:
+        continuation_state = "HIGH"
+        continuation_label = "🟢 추가상승 가능성 높음"
+    elif continuation_score >= 6:
+        continuation_state = "MID"
+        continuation_label = "🟡 추가상승 가능·1차 후 확인"
+    else:
+        continuation_state = "LOW"
+        continuation_label = "🔴 1차 부근 상승 제한 가능"
+
+    near = max(median_range * 0.75, atr14 * 0.35)
+    if price <= support:
+        repeat_state = "BREAKDOWN"
+        repeat_label = "🔴 지지 이탈"
+    elif price >= target1 - near:
+        repeat_state = "TAKE_PROFIT"
+        repeat_label = "🟠 1차 매도구간 근접"
+    elif price <= support + near and trend_score >= 6:
+        repeat_state = "BUY_ZONE"
+        repeat_label = "🟢 반복 매수구간 근접"
+    elif trend_score >= 6:
+        repeat_state = "WAIT_PULLBACK"
+        repeat_label = "🟡 지지 눌림 대기"
+    else:
+        repeat_state = "WAIT_TREND"
+        repeat_label = "⚪ 추세 재확인"
+
+    preferred = 0.50 <= repeat_width <= 1.50
+    candidate = bool(
+        preferred
+        and trend_score >= 6
+        and repeat_state not in {"BREAKDOWN", "TAKE_PROFIT"}
+        and repeat_rr >= 1.20
+        and quality_pass
+    )
+
+    item.update(
+        repeat_chart_valid=True,
+        repeat_chart_reason="연속 1분봉 지지·저항/ATR 계산 완료",
+        repeat_candidate=candidate,
+        repeat_entry=entry,
+        repeat_support=support,
+        repeat_stop=stop,
+        repeat_target1=target1,
+        repeat_target2=target2,
+        repeat_width_percent=repeat_width,
+        repeat_target1_current_upside=t1_from_current,
+        repeat_target2_current_upside=t2_from_current,
+        repeat_extra_after_target1=extra_after_t1,
+        repeat_risk_reward=repeat_rr,
+        repeat_state=repeat_state,
+        repeat_label=repeat_label,
+        repeat_trend_score=trend_score,
+        repeat_trend_checks=trend_checks,
+        repeat_support_basis=support_basis,
+        repeat_target1_basis=target1_basis,
+        repeat_target2_basis=target2_basis,
+        repeat_atr14=atr14,
+        repeat_median_range=median_range,
+        repeat_volume_ratio=volume_ratio,
+        repeat_continuation_state=continuation_state,
+        repeat_continuation_label=continuation_label,
+        repeat_continuation_score=continuation_score,
+        repeat_continuation_checks=continuation_checks,
+        repeat_preferred_range=preferred,
+        repeat_quality_pass=quality_pass,
+        repeat_quality_checks=quality_checks,
+        repeat_spread_percent=spread,
+        repeat_spread_limit=spread_limit,
+        repeat_chart_box_low=box_low,
+        repeat_chart_box_high=box_high,
+    )
+    return item
+
+
+
+def _adapt_repeat_overlay_for_audit(item: dict) -> dict:
+    """새 반복단타 필드를 기존 검증 DB/초단타 UI 필드명과 동기화한다."""
+    if not isinstance(item, dict):
+        return item
+    width = f(item.get("repeat_width_percent"))
+    state = str(item.get("repeat_state") or "WAIT_TREND")
+    if width < 0.50 and item.get("repeat_chart_valid"):
+        old_state = "RANGE_TOO_NARROW"
+    elif width > 1.50 and item.get("repeat_chart_valid"):
+        old_state = "RANGE_TOO_WIDE"
+    else:
+        old_state = {
+            "BUY_ZONE": "BUY_PULLBACK",
+            "WAIT_PULLBACK": "WAIT_PULLBACK",
+            "TAKE_PROFIT": "TAKE_PROFIT",
+            "BREAKDOWN": "EXIT",
+            "WAIT_TREND": "WAIT_TREND",
+        }.get(state, "WAIT_TREND")
+
+    cont = str(item.get("repeat_continuation_state") or "NONE")
+    old_cont = {
+        "HIGH": "STRONG",
+        "MID": "WATCH",
+        "LOW": "LIMITED",
+        "NONE": "NO_TARGET2",
+    }.get(cont, "NO_TARGET2")
+
+    item.update(
+        structural_entry=f(item.get("price")),
+        structural_support=f(item.get("repeat_support")),
+        structural_target=f(item.get("repeat_target1")),
+        structural_target1=f(item.get("repeat_target1")),
+        structural_target2=f(item.get("repeat_target2")),
+        stop_loss=f(item.get("repeat_stop")),
+        target1_upside_percent=f(item.get("repeat_target1_current_upside")),
+        target2_upside_percent=f(item.get("repeat_target2_current_upside")),
+        risk_reward=f(item.get("repeat_risk_reward")),
+        risk_reward_target1=f(item.get("repeat_risk_reward")),
+        level_plan_valid=bool(item.get("repeat_chart_valid")),
+        level_plan_reason=str(item.get("repeat_chart_reason") or ""),
+        target_basis=str(item.get("repeat_target1_basis") or ""),
+        target1_basis=str(item.get("repeat_target1_basis") or ""),
+        target2_basis=str(item.get("repeat_target2_basis") or ""),
+        stop_basis=f"{item.get('repeat_support_basis', '차트 지지')} 이탈 + ATR 완충",
+        chart_box_high=f(item.get("repeat_chart_box_high")),
+        chart_box_low=f(item.get("repeat_chart_box_low")),
+        chart_box_width=max(0.0, f(item.get("repeat_chart_box_high")) - f(item.get("repeat_chart_box_low"))),
+        continuous_rise=bool(f(item.get("repeat_trend_score")) >= 7),
+        continuous_rise_score=int(f(item.get("repeat_trend_score"))),
+        continuous_rise_checks=item.get("repeat_trend_checks") or {},
+        repeat_scalp_state=old_state,
+        repeat_scalp_label=str(item.get("repeat_label") or ""),
+        repeat_scalp_reason=str(item.get("repeat_chart_reason") or ""),
+        repeat_scalp_buy_level=f(item.get("repeat_entry")),
+        repeat_scalp_sell_level=f(item.get("repeat_target1")),
+        repeat_scalp_invalidation=f(item.get("repeat_stop")),
+        repeat_scalp_median_bar_range=f(item.get("repeat_median_range")),
+        repeat_scalp_range_percent=width,
+        repeat_scalp_preferred_range=bool(item.get("repeat_preferred_range")),
+        repeat_scalp_can_extend=cont == "HIGH",
+        repeat_scalp_extension_label=str(item.get("repeat_continuation_label") or ""),
+        repeat_scalp_extension_reason=f"추가상승 근거 {int(f(item.get('repeat_continuation_score')))}/10",
+        repeat_scalp_extension_percent=f(item.get("repeat_extra_after_target1")),
+        upside_continuation_state=old_cont,
+        upside_continuation_label=str(item.get("repeat_continuation_label") or ""),
+        upside_continuation_score=int(f(item.get("repeat_continuation_score"))),
+        upside_continuation_checks=item.get("repeat_continuation_checks") or {},
+        additional_upside_after_target1=f(item.get("repeat_extra_after_target1")),
+        target2_total_upside=f(item.get("repeat_target2_current_upside")),
+    )
+    return item
+
 def analyze_one(engine, policy, finalize, market: str, member: tuple[str, str, str]) -> dict | None:
     ticker, name, exchange = member
     mode = "국내 30분 1% 타점" if market == "KR" else "미국 30분 1% 타점"
     try:
         result = engine.analyze(row_for(ticker, name, exchange), mode)
         result = policy(finalize(result), mode)
+        # 검증기에서도 앱과 동일한 1분봉 지지/저항·ATR 후처리를 반드시 실행한다.
+        result = apply_repeat_scalp_overlay(result, market)
+        result = _adapt_repeat_overlay_for_audit(result)
         if f(result.get("price")) <= 0:
             raise ValueError("현재가 0")
         return result
@@ -220,38 +667,64 @@ def analyze_one(engine, policy, finalize, market: str, member: tuple[str, str, s
         return None
 
 
+DETAIL_KEYS = (
+    "chart_verdict", "entry_checks_passed",
+    "risk_reward", "risk_reward_target1", "risk_reward_target2",
+    "rvol", "vwap", "ema9", "ema20", "rsi", "five_min_risk_score",
+    "change_percent", "screen_change", "change", "data_completeness",
+    "pullback_entry", "breakout_entry", "stop_loss",
+    "structural_entry", "structural_support", "structural_target",
+    "structural_target1", "structural_target2",
+    "target1_upside_percent", "target2_upside_percent",
+    "target_basis", "target1_basis", "target2_basis", "stop_basis",
+    "level_plan_valid", "level_plan_reason",
+    "chart_resistance_levels", "chart_box_high", "chart_box_low", "chart_box_width",
+    "breakout_active",
+    "continuous_rise", "continuous_rise_score", "continuous_rise_checks",
+    "trend_return_5m", "trend_return_15m", "trend_return_30m",
+    "up_down_volume_ratio",
+    "mtf_alignment", "mtf_exit", "mtf_higher_trend", "mtf_short_pullback",
+    "mtf_checks", "mtf_status", "mtf_detail",
+    "repeat_scalp_state", "repeat_scalp_label", "repeat_scalp_reason",
+    "repeat_scalp_buy_level", "repeat_scalp_sell_level", "repeat_scalp_invalidation",
+    "repeat_scalp_median_bar_range", "repeat_scalp_range_percent", "repeat_scalp_preferred_range",
+    "repeat_box_valid", "repeat_box_low", "repeat_box_high", "repeat_box_range_percent",
+    "repeat_rsi_recovery",
+    "repeat_scalp_can_extend", "repeat_scalp_extension_label",
+    "repeat_scalp_extension_reason", "repeat_scalp_extension_percent",
+    "upside_continuation_state", "upside_continuation_label",
+    "upside_continuation_score", "upside_continuation_checks",
+    "additional_upside_after_target1", "target2_total_upside",
+    "repeat_scalp_reversal_score", "repeat_scalp_reversal_checks",
+    "trailing_stop_enabled", "trailing_stop_percent", "trailing_stop_price",
+    "data_gate_passed", "verified_spread_percent",
+    "repeat_chart_valid", "repeat_chart_reason", "repeat_candidate",
+    "repeat_entry", "repeat_support", "repeat_stop", "repeat_target1", "repeat_target2",
+    "repeat_width_percent", "repeat_target1_current_upside", "repeat_target2_current_upside",
+    "repeat_extra_after_target1", "repeat_risk_reward", "repeat_state", "repeat_label",
+    "repeat_trend_score", "repeat_trend_checks", "repeat_support_basis",
+    "repeat_target1_basis", "repeat_target2_basis", "repeat_atr14", "repeat_median_range",
+    "repeat_volume_ratio", "repeat_continuation_state", "repeat_continuation_label",
+    "repeat_continuation_score", "repeat_continuation_checks", "repeat_preferred_range",
+    "repeat_chart_box_low", "repeat_chart_box_high",
+)
+
+
 def store_result(db: sqlite3.Connection, market: str, item: dict, now_ts: int, bucket_seconds: int) -> None:
     ticker = str(item.get("ticker") or "").upper()
     price = f(item.get("price"))
     if not ticker or price <= 0:
         return
+
     captured = now_ts - now_ts % 60
     bucket = now_ts - now_ts % bucket_seconds
     db.execute(
         "INSERT OR REPLACE INTO quotes(market,ticker,captured,price) VALUES(?,?,?,?)",
         (market, ticker, captured, price),
     )
-    detail = {
-        key: item.get(key) for key in (
-            "chart_verdict", "entry_checks_passed", "risk_reward", "rvol", "vwap", "ema9",
-            "rsi", "five_min_risk_score", "change_percent", "data_completeness",
-            "pullback_entry", "breakout_entry", "stop_loss", "risk_reward",
-            "structural_entry", "structural_target", "structural_target2", "structural_support",
-            "level_plan_valid", "target_basis", "stop_basis",
-            "continuous_rise", "continuous_rise_score", "continuous_rise_checks",
-            "trend_return_5m", "trend_return_15m", "trend_return_30m",
-            "up_down_volume_ratio",
-            "repeat_scalp_state", "repeat_scalp_label", "repeat_scalp_reason",
-            "repeat_scalp_buy_level", "repeat_scalp_sell_level", "repeat_scalp_can_extend",
-            "repeat_scalp_invalidation", "repeat_scalp_median_bar_range",
-            "repeat_scalp_reversal_score", "repeat_scalp_reversal_checks",
-            "screen_change", "change", "data_gate_passed",
-            "verified_spread_percent",
-        )
-    }
-    # When the UI precision pipeline supplied a freshness-aware gate result,
-    # persist that exact result. Legacy standalone runs retain the conservative
-    # compatibility calculation below.
+
+    detail = {key: item.get(key) for key in DETAIL_KEYS}
+
     if "data_gate_passed" in item:
         data_valid = int(bool(item.get("data_gate_passed")))
     else:
@@ -260,26 +733,40 @@ def store_result(db: sqlite3.Connection, market: str, item: dict, now_ts: int, b
             and not bool(item.get("intraday_fallback"))
             and f(item.get("data_completeness"), 100.0) >= 60.0
         )
-    # 실제 발생 시각을 보존해야 5/10/20/30분 사후가격이 정확히 정렬된다.
-    # 중복 방지만 별도의 시간 구간 조회로 수행한다.
+
+    repeat_entry = f(item.get("repeat_entry", item.get("repeat_scalp_buy_level")))
+    target1 = f(item.get("repeat_target1", item.get("structural_target1", item.get("structural_target"))))
+    target2 = f(item.get("repeat_target2", item.get("structural_target2")))
+    repeat_range = f(item.get("repeat_width_percent", item.get("repeat_scalp_range_percent")))
+    repeat_candidate = int(bool(item.get("repeat_candidate")))
+    continuation_score = f(item.get("repeat_continuation_score", item.get("upside_continuation_score")))
+    continuation_label = str(item.get("repeat_continuation_label") or item.get("upside_continuation_label") or "")
+    extra_after_target1 = f(item.get("repeat_extra_after_target1", item.get("additional_upside_after_target1")))
+    stop_price = f(item.get("repeat_stop", item.get("stop_loss")))
+
     duplicate = db.execute(
         "SELECT 1 FROM signals WHERE market=? AND ticker=? AND issued BETWEEN ? AND ? LIMIT 1",
         (market, ticker, bucket, bucket + bucket_seconds - 1),
     ).fetchone()
     if duplicate:
         return
+
     db.execute("""
         INSERT INTO signals(
             market,ticker,name,issued,base_price,verdict,score,entry_ok,
-            forecast5,forecast10,forecast20,forecast30,stop_price,data_valid,detail_json
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            forecast5,forecast10,forecast20,forecast30,stop_price,data_valid,detail_json,
+            repeat_entry_price,target1_price,target2_price,repeat_range_percent,repeat_candidate,
+            continuation_score,continuation_label,extra_after_target1
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         market, ticker, str(item.get("name") or ticker), now_ts, price,
         str(item.get("chart_verdict") or "WAIT"), f(item.get("score")),
-        int(bool(item.get("entry_checks_passed"))), f(item.get("forecast_5m")),
-        f(item.get("forecast_10m")), f(item.get("forecast_20m")),
-        f(item.get("forecast_30m")), f(item.get("stop_loss")), data_valid,
-        json.dumps(detail, ensure_ascii=False, default=str),
+        int(bool(item.get("entry_checks_passed"))),
+        f(item.get("forecast_5m")), f(item.get("forecast_10m")),
+        f(item.get("forecast_20m")), f(item.get("forecast_30m")),
+        stop_price, data_valid, json.dumps(detail, ensure_ascii=False, default=str),
+        repeat_entry, target1, target2, repeat_range, repeat_candidate,
+        continuation_score, continuation_label, extra_after_target1,
     ))
 
 
@@ -294,26 +781,29 @@ def store_quote(db: sqlite3.Connection, market: str, ticker: str, price: float, 
 
 
 def nearest_quote(db: sqlite3.Connection, market: str, ticker: str, target: int, tolerance=150):
-    row = db.execute("""
+    return db.execute("""
         SELECT price,captured FROM quotes
         WHERE market=? AND ticker=? AND captured BETWEEN ? AND ?
         ORDER BY ABS(captured-?) LIMIT 1
     """, (market, ticker, target - tolerance, target + tolerance, target)).fetchone()
-    return row
 
 
 def grade_pending(db: sqlite3.Connection, now_ts: int) -> None:
     rows = db.execute("""
-        SELECT id,market,ticker,issued,base_price,actual5,actual10,actual20,actual30,stop_price
+        SELECT id,market,ticker,issued,base_price,actual5,actual10,actual20,actual30,
+               stop_price,repeat_entry_price,target1_price,target2_price,repeat_candidate
         FROM signals WHERE result_done=0 AND issued>=?
     """, (now_ts - 3 * 86400,)).fetchall()
-    for signal_id, market, ticker, issued, base, a5, a10, a20, a30, stop_price in rows:
+
+    for (signal_id, market, ticker, issued, base, a5, a10, a20, a30, stop_price,
+         repeat_entry_price, target1_price, target2_price, repeat_candidate) in rows:
         updates = {}
         for minutes, existing in ((5, a5), (10, a10), (20, a20), (30, a30)):
             if existing is None and now_ts >= issued + minutes * 60:
                 quote = nearest_quote(db, market, ticker, issued + minutes * 60)
                 if quote and base > 0:
                     updates[f"actual{minutes}"] = (f(quote[0]) / base - 1) * 100
+
         if now_ts >= issued + 30 * 60:
             extrema = db.execute("""
                 SELECT MAX(price),MIN(price) FROM quotes
@@ -322,28 +812,97 @@ def grade_pending(db: sqlite3.Connection, now_ts: int) -> None:
             if extrema and extrema[0] is not None:
                 updates["max_up30"] = (f(extrema[0]) / base - 1) * 100
                 updates["max_down30"] = (f(extrema[1]) / base - 1) * 100
+
             path = db.execute("""
                 SELECT captured,price FROM quotes
                 WHERE market=? AND ticker=? AND captured BETWEEN ? AND ? ORDER BY captured
             """, (market, ticker, issued, issued + 30 * 60)).fetchall()
+
             stop = f(stop_price)
-            stop_index = next((index for index, (_, price) in enumerate(path) if stop > 0 and f(price) <= stop), None)
-            first_target_index = next((index for index, (_, price) in enumerate(path) if f(price) >= base * 1.01), None)
-            updates["stop_first"] = int(
-                stop_index is not None and (first_target_index is None or stop_index < first_target_index)
+            repeat_entry = f(repeat_entry_price)
+            target1 = f(target1_price)
+            target2 = f(target2_price)
+
+            # 반복단타는 실제 매수가에 먼저 닿아야 체결된 것으로 본다.
+            entry_index = None
+            if path and repeat_entry > 0:
+                if f(path[0][1]) <= repeat_entry:
+                    entry_index = 0
+                else:
+                    entry_index = next(
+                        (i for i, (_, p) in enumerate(path) if f(p) <= repeat_entry),
+                        None,
+                    )
+                updates["entry_touched"] = int(entry_index is not None)
+
+            if entry_index is not None:
+                trade_path = path[entry_index:]
+                stop_rel = next(
+                    (i for i, (_, p) in enumerate(trade_path) if stop > 0 and f(p) <= stop),
+                    None,
+                )
+                t1_rel = next(
+                    (i for i, (_, p) in enumerate(trade_path) if target1 > 0 and f(p) >= target1),
+                    None,
+                )
+                t2_rel = next(
+                    (i for i, (_, p) in enumerate(trade_path) if target2 > target1 > 0 and f(p) >= target2),
+                    None,
+                )
+                updates["target1_before_stop"] = int(
+                    t1_rel is not None and (stop_rel is None or t1_rel < stop_rel)
+                )
+                updates["target2_before_stop"] = int(
+                    t2_rel is not None and (stop_rel is None or t2_rel < stop_rel)
+                ) if target2 > target1 > 0 else None
+                updates["stop_first"] = int(
+                    stop_rel is not None and (t1_rel is None or stop_rel < t1_rel)
+                )
+            elif repeat_entry > 0:
+                # 매수가 미체결은 손실도 성공도 아닌 '미체결'로 분리한다.
+                updates["target1_before_stop"] = None
+                updates["target2_before_stop"] = None
+                updates["stop_first"] = 0
+            else:
+                # 레거시 신호에는 반복 매수가가 없으므로 기존 방식으로만 stop_first를 유지한다.
+                stop_index = next(
+                    (i for i, (_, p) in enumerate(path) if stop > 0 and f(p) <= stop),
+                    None,
+                )
+                first_target_index = next(
+                    (i for i, (_, p) in enumerate(path) if f(p) >= base * 1.01),
+                    None,
+                )
+                updates["stop_first"] = int(
+                    stop_index is not None
+                    and (first_target_index is None or stop_index < first_target_index)
+                )
+
+            # +1/+2/+3%는 전략 목표가가 아니라 비교 통계 전용으로 계속 보존한다.
+            legacy_stop_index = next(
+                (i for i, (_, p) in enumerate(path) if stop > 0 and f(p) <= stop),
+                None,
             )
             for goal in (1, 2, 3):
                 target = base * (1 + goal / 100)
-                target_index = next((index for index, (_, price) in enumerate(path) if f(price) >= target), None)
-                hit = target_index is not None and (stop_index is None or target_index < stop_index)
+                target_index = next(
+                    (i for i, (_, p) in enumerate(path) if f(p) >= target),
+                    None,
+                )
+                hit = target_index is not None and (
+                    legacy_stop_index is None or target_index < legacy_stop_index
+                )
                 updates[f"hit{goal}_before_stop"] = int(hit)
+
             projected = {
-                5: updates.get("actual5", a5), 10: updates.get("actual10", a10),
-                20: updates.get("actual20", a20), 30: updates.get("actual30", a30),
+                5: updates.get("actual5", a5),
+                10: updates.get("actual10", a10),
+                20: updates.get("actual20", a20),
+                30: updates.get("actual30", a30),
             }
-            # 일시적인 인터넷/API 지연이면 15분 동안 추가 시세를 기다린다.
             if all(value is not None for value in projected.values()) or now_ts >= issued + 45 * 60:
                 updates["result_done"] = 1
+
         if updates:
             assignments = ",".join(f"{key}=?" for key in updates)
             db.execute(f"UPDATE signals SET {assignments} WHERE id=?", (*updates.values(), signal_id))
@@ -354,13 +913,21 @@ def export_summary(db: sqlite3.Connection) -> None:
         SELECT market,ticker,name,datetime(issued,'unixepoch','+9 hours'),base_price,
                verdict,score,entry_ok,forecast5,actual5,forecast10,actual10,
                forecast20,actual20,forecast30,actual30,max_up30,max_down30,
-               stop_price,data_valid,hit1_before_stop,hit2_before_stop,hit3_before_stop,stop_first
+               stop_price,data_valid,
+               repeat_entry_price,target1_price,target2_price,repeat_range_percent,repeat_candidate,
+               entry_touched,target1_before_stop,target2_before_stop,
+               continuation_score,continuation_label,extra_after_target1,
+               hit1_before_stop,hit2_before_stop,hit3_before_stop,stop_first
         FROM signals ORDER BY issued DESC
     """).fetchall()
-    headers = ["시장","티커","종목명","신호시각(KST)","기준가","판정","점수","진입통과",
-               "예상5분","실제5분","예상10분","실제10분","예상20분","실제20분",
-               "예상30분","실제30분","30분최대상승","30분최대하락","손절가","데이터유효",
-               "+1%선도달","+2%선도달","+3%선도달","손절선도달"]
+    headers = [
+        "시장","티커","종목명","신호시각(KST)","기준가","판정","점수","기존진입통과",
+        "예상5분","실제5분","예상10분","실제10분","예상20분","실제20분",
+        "예상30분","실제30분","30분최대상승","30분최대하락","손절가","데이터유효",
+        "반복매수가","차트1차목표","차트2차목표","반복폭%","반복후보",
+        "매수가체결","1차선도달","2차선도달","추가상승점수","추가상승판정","1차후추가폭%",
+        "+1%비교통계","+2%비교통계","+3%비교통계","손절먼저",
+    ]
     with CSV_PATH.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle)
         writer.writerow(headers)
@@ -386,76 +953,76 @@ def wilson_interval(values: list[bool], z: float = 1.96) -> tuple[float, float] 
 def export_html_report(db: sqlite3.Connection) -> None:
     report_path = DB_PATH.parent / "validation_report.html"
     completed = db.execute("""
-        SELECT market,ticker,name,entry_ok,data_valid,forecast5,actual5,forecast10,actual10,
-               forecast20,actual20,forecast30,actual30,hit1_before_stop,hit2_before_stop,
-               hit3_before_stop,stop_first,max_up30,max_down30
+        SELECT market,ticker,name,repeat_candidate,data_valid,repeat_range_percent,
+               entry_touched,target1_before_stop,target2_before_stop,stop_first,
+               continuation_label,extra_after_target1,max_up30,max_down30,
+               forecast5,actual5,forecast10,actual10,forecast20,actual20,forecast30,actual30,
+               repeat_entry_price,target1_price,target2_price
         FROM signals WHERE result_done=1 ORDER BY issued DESC
     """).fetchall()
     valid = [row for row in completed if row[4] == 1]
-    entries = [row for row in valid if row[3] == 1]
-    observations = [row for row in valid if row[3] != 1]
+    repeat_candidates = [row for row in valid if row[3] == 1]
+    filled = [row for row in repeat_candidates if row[6] == 1]
+
     cards = []
-    for label, expected_index, actual_index in (("5분 방향",5,6),("10분 방향",7,8),("20분 방향",9,10),("30분 방향",11,12)):
-        judged = [((f(row[expected_index]) >= 0) == (f(row[actual_index]) >= 0)) for row in valid if row[actual_index] is not None]
+    entry_values = [bool(row[6]) for row in repeat_candidates if row[6] is not None]
+    cards.append(("반복매수가 체결", ratio(entry_values), len(entry_values), wilson_interval(entry_values)))
+    t1_values = [bool(row[7]) for row in filled if row[7] is not None]
+    cards.append(("차트 1차 선도달", ratio(t1_values), len(t1_values), wilson_interval(t1_values)))
+    t2_values = [bool(row[8]) for row in filled if row[8] is not None]
+    cards.append(("차트 2차 선도달", ratio(t2_values), len(t2_values), wilson_interval(t2_values)))
+    avoid_values = [not bool(row[9]) for row in filled if row[9] is not None]
+    cards.append(("1차 전 손절회피", ratio(avoid_values), len(avoid_values), wilson_interval(avoid_values)))
+
+    for label, expected_index, actual_index in (
+        ("5분 방향",14,15),("10분 방향",16,17),("20분 방향",18,19),("30분 방향",20,21)
+    ):
+        judged = [
+            ((f(row[expected_index]) >= 0) == (f(row[actual_index]) >= 0))
+            for row in valid if row[actual_index] is not None
+        ]
         cards.append((label, ratio(judged), len(judged), wilson_interval(judged)))
-    for label, index in (("진입신호 +1%",13),("진입신호 +2%",14),("진입신호 +3%",15)):
-        judged = [bool(row[index]) for row in entries if row[index] is not None]
-        cards.append((label, ratio(judged), len(judged), wilson_interval(judged)))
-    observation_plus_one = [bool(row[13]) for row in observations if row[13] is not None]
-    cards.append((
-        "관찰군 +1%", ratio(observation_plus_one), len(observation_plus_one),
-        wilson_interval(observation_plus_one),
-    ))
-    avoided_stop = [not bool(row[16]) for row in entries if row[16] is not None]
-    cards.append(("진입신호 손절회피", ratio(avoided_stop), len(avoided_stop), wilson_interval(avoided_stop)))
-    recent_rows = "".join(
-        "<tr>" + "".join(f"<td>{html.escape(str(value if value is not None else '-'))}</td>" for value in (
-            row[0], row[1], row[2], "통과" if row[3] else "관찰", "유효" if row[4] else "제외",
-            row[13], row[14], row[15], row[16], round(f(row[17]),3), round(f(row[18]),3),
-        )) + "</tr>" for row in completed[:100]
-    )
+
     card_html = "".join(
-        f'<div class="card"><small>{html.escape(label)}</small><b>{value}</b><span>표본 {samples}건</span>'
-        f'<span>95% 범위 {interval[0]*100:.1f}~{interval[1]*100:.1f}%</span></div>'
-        if interval else f'<div class="card"><small>{html.escape(label)}</small><b>{value}</b><span>표본 없음</span></div>'
+        f'<div class="card"><small>{html.escape(label)}</small><b>{value}</b>'
+        f'<span>표본 {samples}건</span>'
+        + (f'<span>95% 범위 {interval[0]*100:.1f}~{interval[1]*100:.1f}%</span>' if interval else '')
+        + '</div>'
         for label, value, samples, interval in cards
     )
-    plus_one = [bool(row[13]) for row in entries if row[13] is not None]
-    plus_one_interval = wilson_interval(plus_one)
-    observation_interval = wilson_interval(observation_plus_one)
-    entry_rate = sum(plus_one) / len(plus_one) if plus_one else 0.0
-    observation_rate = (
-        sum(observation_plus_one) / len(observation_plus_one)
-        if observation_plus_one else 0.0
+
+    recent_rows = "".join(
+        "<tr>" + "".join(
+            f"<td>{html.escape(str(value if value is not None else '-'))}</td>"
+            for value in (
+                row[0], row[1], row[2],
+                "후보" if row[3] else "관찰",
+                f"{f(row[5]):.2f}%",
+                "체결" if row[6] else "미체결",
+                row[22], row[23], row[24],
+                row[7], row[8], row[9],
+                row[10] or "-", f"{f(row[11]):.2f}%",
+                round(f(row[12]),3), round(f(row[13]),3),
+            )
+        ) + "</tr>" for row in completed[:100]
     )
-    selection_lift = entry_rate - observation_rate
-    statistically_passed = bool(
-        len(plus_one) >= 100 and len(observation_plus_one) >= 100
-        and plus_one_interval and observation_interval
-        and plus_one_interval[0] >= 0.80
-        and plus_one_interval[0] > observation_interval[1]
-        and selection_lift >= 0.05
+
+    warning = (
+        "반복단타 성공률은 '반복 매수가가 실제로 체결된 표본'에서 차트 1차·2차 목표와 "
+        "손절의 선후관계를 계산합니다. +1/+2/+3% 고정 통계는 CSV 비교용으로만 유지합니다."
     )
-    if statistically_passed:
-        warning = (
-            "+1% 선도달률의 95% 신뢰하한이 80% 이상이고 관찰군보다 "
-            f"{selection_lift*100:.1f}%p 높았습니다. 그래도 다른 날짜·장세의 별도 검증이 필요합니다."
-        )
-    elif len(valid) < 100:
-        warning = "표본 100건 미만이므로 실전 판단에 사용하지 마세요. 관측 적중률이 높아도 검증 통과가 아닙니다."
-    else:
-        warning = (
-            "현재 결과는 '+1% 성공률 80%와 관찰군 대비 선별력'을 통계적으로 입증하지 못했습니다. "
-            "조건을 바꾸거나 검증을 계속해야 합니다."
-        )
     document = f"""<!doctype html><html lang='ko'><meta charset='utf-8'><title>초단타 자동검증 결과</title>
-    <style>body{{font-family:Arial,sans-serif;max-width:1200px;margin:30px auto;padding:0 16px;color:#20242c}}
-    .cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}}.card{{background:#f4f6fa;border-radius:12px;padding:16px}}
-    .card b,.card span{{display:block}}.card b{{font-size:28px;margin:8px 0}}.warn{{background:#fff4dc;padding:15px;border-radius:10px;margin:18px 0}}
-    table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:1px solid #ddd;padding:8px;text-align:left}}</style>
-    <h1>초단타 자동검증 결과</h1><p>완료 {len(completed)}건 · 유효 데이터 {len(valid)}건 · 실제 진입통과 {len(entries)}건</p>
-    <div class='warn'>{warning}<br>표시 수익률은 세금·수수료·환전비용·슬리피지 반영 전입니다.</div><div class='cards'>{card_html}</div>
-    <h2>최근 완료 신호</h2><table><thead><tr><th>시장</th><th>티커</th><th>종목</th><th>판정</th><th>데이터</th><th>+1%</th><th>+2%</th><th>+3%</th><th>손절먼저</th><th>최대상승%</th><th>최대하락%</th></tr></thead><tbody>{recent_rows}</tbody></table></html>"""
+    <style>body{{font-family:Arial,sans-serif;max-width:1350px;margin:30px auto;padding:0 16px;color:#20242c}}
+    .cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}}
+    .card{{background:#f4f6fa;border-radius:12px;padding:16px}}.card b,.card span{{display:block}}
+    .card b{{font-size:26px;margin:8px 0}}.warn{{background:#fff4dc;padding:15px;border-radius:10px;margin:18px 0}}
+    table{{border-collapse:collapse;width:100%;font-size:12px}}th,td{{border-bottom:1px solid #ddd;padding:7px;text-align:left}}</style>
+    <h1>초단타 자동검증 결과</h1>
+    <p>완료 {len(completed)}건 · 유효 {len(valid)}건 · 반복후보 {len(repeat_candidates)}건 · 실제 매수가 체결 {len(filled)}건</p>
+    <div class='warn'>{warning}</div><div class='cards'>{card_html}</div>
+    <h2>최근 완료 신호</h2>
+    <table><thead><tr><th>시장</th><th>티커</th><th>종목</th><th>구분</th><th>반복폭</th><th>매수</th><th>반복매수가</th><th>1차</th><th>2차</th><th>1차성공</th><th>2차성공</th><th>손절먼저</th><th>추가상승</th><th>추가폭</th><th>최대상승%</th><th>최대하락%</th></tr></thead>
+    <tbody>{recent_rows}</tbody></table></html>"""
     report_path.write_text(document, encoding="utf-8")
 
 
@@ -465,16 +1032,12 @@ def stop_handler(*_):
 
 
 def claim_single_instance(db: sqlite3.Connection, now_ts: int) -> bool:
-    """실수로 두 번 실행해 KIS 호출이 중복되는 것을 차단한다."""
     db.execute("BEGIN IMMEDIATE")
     row = db.execute("SELECT pid,heartbeat FROM collector_state WHERE singleton=1").fetchone()
     if row and now_ts - int(row[1] or 0) < 180 and int(row[0] or 0) != os.getpid():
         db.rollback()
         return False
-    db.execute(
-        "INSERT OR REPLACE INTO collector_state(singleton,pid,heartbeat) VALUES(1,?,?)",
-        (os.getpid(), now_ts),
-    )
+    db.execute("INSERT OR REPLACE INTO collector_state(singleton,pid,heartbeat) VALUES(1,?,?)", (os.getpid(), now_ts))
     db.commit()
     return True
 
@@ -484,15 +1047,12 @@ def heartbeat(db: sqlite3.Connection, now_ts: int) -> None:
 
 
 def keep_windows_awake(enable: bool) -> None:
-    """실행 중 Windows 자동 절전만 막고 종료 시 원래 동작으로 복구한다."""
     if sys.platform != "win32":
         return
     try:
         import ctypes
         continuous, system_required = 0x80000000, 0x00000001
-        ctypes.windll.kernel32.SetThreadExecutionState(
-            continuous | system_required if enable else continuous
-        )
+        ctypes.windll.kernel32.SetThreadExecutionState(continuous | system_required if enable else continuous)
     except Exception as exc:
         logging.warning("절전 방지 설정 실패: %s", exc)
 
@@ -510,53 +1070,44 @@ def refresh_quote_only(engine, market: str, member: tuple[str, str, str]) -> flo
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--markets", default="KR", choices=("KR", "US", "BOTH"))
-    parser.add_argument("--interval", type=int, default=60, help="종목별 재분석 간격(초)")
-    parser.add_argument("--signal-bucket", type=int, default=300, help="동일 신호 중복 방지 간격(초)")
-    parser.add_argument(
-        "--run-until", default="AUTO",
-        help="AUTO면 선택 시장의 추적 시간이 끝난 뒤 종료, KST HH:MM 지정 가능, 빈 값이면 계속",
-    )
-    parser.add_argument("--once", action="store_true", help="한 바퀴만 시험")
+    parser.add_argument("--interval", type=int, default=60)
+    parser.add_argument("--signal-bucket", type=int, default=300)
+    parser.add_argument("--run-until", default="AUTO")
+    parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
+
     setup_logging()
     signal.signal(signal.SIGINT, stop_handler)
     signal.signal(signal.SIGTERM, stop_handler)
-    logging.info("검증기 시작 DB=%s", DB_PATH)
+
     try:
         engine, policy, finalize = load_engine()
     except Exception:
         logging.exception("KIS 엔진 시작 실패")
         return 2
+
     selected = ["KR", "US"] if args.markets == "BOTH" else [args.markets]
-    seen_active: set[str] = set()
+    seen_active = set()
     with connect() as db:
         if not claim_single_instance(db, int(time.time())):
-            logging.error("검증기가 이미 실행 중입니다. 창을 하나만 유지하세요.")
             return 3
         keep_windows_awake(True)
         try:
             while not STOP:
                 started = time.time()
                 now = datetime.now(KST)
-                if args.run_until and args.run_until.upper() != "AUTO":
-                    hour, minute = map(int, args.run_until.split(":"))
-                    if now.time() >= clock_time(hour, minute):
-                        logging.info("설정 종료시각 %s 도달", args.run_until)
-                        break
                 active = [m for m in selected if market_is_open(m, now)]
                 seen_active.update(active)
-                if (
-                    args.run_until.upper() == "AUTO" and not active
-                    and set(selected).issubset(seen_active)
-                ):
-                    logging.info("선택 시장의 오늘 추적 시간이 종료되었습니다.")
+                if args.run_until.upper() == "AUTO" and not active and set(selected).issubset(seen_active):
                     break
                 if not active:
-                    logging.info("선택 시장 장외시간 - 60초 대기")
                     if args.once:
                         break
-                    heartbeat(db, int(time.time())); db.commit(); time.sleep(60)
+                    heartbeat(db, int(time.time()))
+                    db.commit()
+                    time.sleep(60)
                     continue
+
                 for market in active:
                     members = KR_UNIVERSE if market == "KR" else US_UNIVERSE
                     issuing = signal_window_open(market, now)
@@ -568,21 +1119,25 @@ def main() -> int:
                             item = analyze_one(engine, policy, finalize, market, member)
                             if item:
                                 store_result(db, market, item, timestamp, max(60, args.signal_bucket))
-                                logging.info("%s %s %.4f %s", market, member[0], f(item.get("price")), item.get("chart_verdict"))
                         else:
                             price = refresh_quote_only(engine, market, member)
                             store_quote(db, market, member[0], price, timestamp)
-                        heartbeat(db, timestamp); db.commit()
-                        time.sleep(0.35)  # 엔진 내부 제한기에 더해 종목 전환 완충
+                        heartbeat(db, timestamp)
+                        db.commit()
+                        time.sleep(0.35)
+
                 grade_pending(db, int(time.time()))
-                db.commit(); export_summary(db)
+                db.commit()
+                export_summary(db)
                 if args.once:
                     break
                 time.sleep(max(5, args.interval - (time.time() - started)))
-            grade_pending(db, int(time.time())); db.commit(); export_summary(db)
+
+            grade_pending(db, int(time.time()))
+            db.commit()
+            export_summary(db)
         finally:
             keep_windows_awake(False)
-    logging.info("검증기 정상 종료 CSV=%s", CSV_PATH)
     return 0
 
 
