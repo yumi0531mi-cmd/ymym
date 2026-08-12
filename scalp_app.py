@@ -28,22 +28,42 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-from regime_session_upgrade import (
-    _num,
-    apply_repeat_scalp_overlay,
-    box_regime_plan,
-    data_quality_plan,
-    forward_forecast_plan,
-    hourly_structure_plan,
-    intraday_regime_plan,
-    resolve_vwap_series,
-    session_for,
-    strategy_target_plan,
-    target_reach_probability_plan,
-    trade_decision_plan,
-)
+import regime_session_upgrade as _rsu
 
 st.set_page_config(page_title="초단타 VWAP 타점", page_icon="⚡", layout="wide")
+
+_REQUIRED_ENGINE_VERSION = "2026.08.13-v3"
+_REQUIRED_ENGINE_SYMBOLS = (
+    "_num", "apply_repeat_scalp_overlay", "box_regime_plan", "data_quality_plan",
+    "forward_forecast_plan", "hourly_structure_plan", "intraday_regime_plan",
+    "resolve_vwap_series", "session_for", "strategy_target_plan",
+    "target_reach_probability_plan", "trade_decision_plan",
+)
+_engine_version = str(getattr(_rsu, "SCANNER_ENGINE_VERSION", "구버전/표시없음"))
+_missing_engine_symbols = [name for name in _REQUIRED_ENGINE_SYMBOLS if not hasattr(_rsu, name)]
+if _engine_version != _REQUIRED_ENGINE_VERSION or _missing_engine_symbols:
+    st.error(
+        "공통 엔진 파일 버전이 맞지 않습니다. "
+        f"scalp_app.py 요구 버전: {_REQUIRED_ENGINE_VERSION} / "
+        f"현재 regime_session_upgrade.py: {_engine_version}"
+    )
+    if _missing_engine_symbols:
+        st.code("누락 함수: " + ", ".join(_missing_engine_symbols))
+    st.info("regime_session_upgrade.py를 이번에 함께 받은 파일로 교체한 뒤 앱을 재부팅해 주세요.")
+    st.stop()
+
+_num = _rsu._num
+apply_repeat_scalp_overlay = _rsu.apply_repeat_scalp_overlay
+box_regime_plan = _rsu.box_regime_plan
+data_quality_plan = _rsu.data_quality_plan
+forward_forecast_plan = _rsu.forward_forecast_plan
+hourly_structure_plan = _rsu.hourly_structure_plan
+intraday_regime_plan = _rsu.intraday_regime_plan
+resolve_vwap_series = _rsu.resolve_vwap_series
+session_for = _rsu.session_for
+strategy_target_plan = _rsu.strategy_target_plan
+target_reach_probability_plan = _rsu.target_reach_probability_plan
+trade_decision_plan = _rsu.trade_decision_plan
 
 
 KST = timezone(timedelta(hours=9), name="KST")
