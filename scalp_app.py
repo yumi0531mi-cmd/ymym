@@ -8,7 +8,6 @@ import ast
 import base64
 import importlib.abc
 import importlib.util
-import json
 import re
 import requests
 import sqlite3
@@ -809,10 +808,6 @@ def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -
         level_plan_valid = bool(detail.get("level_plan_valid"))
         repeat_state = str(detail.get("repeat_scalp_state", "UNAVAILABLE"))
         repeat_width = float(detail.get("repeat_scalp_range_percent", 0) or 0)
-        extended_target = float(detail.get("structural_target2", 0) or 0)
-        extended_range = float(detail.get("repeat_scalp_extended_range_percent", 0) or 0)
-        can_extend = bool(detail.get("repeat_scalp_can_extend", False))
-        extension_reason = str(detail.get("repeat_scalp_extension_reason", ""))
         verified_spread = detail.get("verified_spread_percent")
         try:
             verified_spread = float(verified_spread) if verified_spread is not None else None
@@ -822,12 +817,9 @@ def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -
         if market_code == "KR" and current_change >= 20.0:
             continue
         max_repeat_spread = 0.35 if market_code == "KR" else 0.25
-        # 반복단타 후보는 기본 폭 0.5~1.5% 구간만 확정 후보로 보여준다.
-        # 더 큰 확장 여력이 있는지는 별도 필드(extended_range/can_extend)로 표시하며,
-        # 폭 자체가 0.5~1.5%를 벗어나는 종목은 후보표에서 제외한다.
         if not (
             data_valid and level_plan_valid and risk_reward >= 1.5
-            and 0.50 <= repeat_width <= 1.5
+            and repeat_width >= 0.50
             and verified_spread is not None and verified_spread <= max_repeat_spread
         ):
             continue
@@ -847,11 +839,8 @@ def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -
             or detail.get("pullback_entry", 0)
             or 0
         )
-        # 후보로 뽑힌 종목은 모두 0.5~1.5% 구간이므로 폭 자체로는 더 이상
-        # 가점을 주지 않는다. 대신 2차 저항까지 확장 가능한 종목을 약간
-        # 우대해 "더 상승할 수 있는" 후보가 상단에 오도록 한다.
-        extend_bonus = 15 if can_extend else 0
-        rank = priority * 100 + trend_score * 12 + score + positive_count * 5 + min(rvol, 5) * 2 + min(risk_reward, 4) * 2 + extend_bonus
+        preferred_range_bonus = 30 if 0.5 <= repeat_width <= 1.5 else (10 if repeat_width > 1.5 else 0)
+        rank = priority * 100 + trend_score * 12 + score + positive_count * 5 + min(rvol, 5) * 2 + min(risk_reward, 4) * 2 + preferred_range_bonus
         candidates.append({
             "ticker": ticker, "name": name or ticker, "stage": stage,
             "price": float(price or 0), "trigger": trigger, "score": score,
@@ -860,10 +849,6 @@ def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -
             "repeat_state": repeat_state,
             "repeat_width": repeat_width,
             "target": float(detail.get("structural_target", 0) or 0),
-            "target2": extended_target,
-            "extended_range": extended_range,
-            "can_extend": can_extend,
-            "extension_reason": extension_reason,
             "support": float(detail.get("structural_support", 0) or 0),
         })
     return sorted(candidates, key=lambda x: x["rank"], reverse=True)[:limit]
@@ -1026,21 +1011,13 @@ def structural_trade_plan(item: dict, market: str) -> dict:
         highs[i] for i in range(2, len(highs) - 2)
         if highs[i] >= max(highs[i - 2:i]) and highs[i] >= max(highs[i + 1:i + 3])
     ]
-    resistance_candidates = sorted(set(x for x in swing_highs if x > price))
+    resistance_candidates = [x for x in swing_highs if x > price]
     if not resistance_candidates:
         item["level_plan_valid"] = False
         item["level_plan_reason"] = "현재가 위에서 확인된 실제 1분봉 스윙 고점이 없음"
         return item
-    resistance = resistance_candidates[0]
+    resistance = min(resistance_candidates)
     resistance_reason = "최근 1분봉에서 확인된 가장 가까운 스윙 고점"
-    # 2차 목표가: 1차 저항 위쪽에서 실제로 관측된 다음 스윙 고점만 인정한다.
-    # 임의 퍼센트로 만든 목표가가 아니라, 분봉에 실제로 찍힌 고점이 있을 때만 존재한다.
-    resistance2_candidates = [x for x in resistance_candidates if x > resistance]
-    resistance2 = resistance2_candidates[0] if resistance2_candidates else 0.0
-    resistance2_reason = (
-        "1차 저항 통과 후 관측된 다음 스윙 고점(2차 목표)"
-        if resistance2 else "1차 저항 위쪽에서 추가로 확인된 스윙 고점 없음"
-    )
 
     swing_lows = [
         lows[i] for i in range(2, len(lows) - 2)
@@ -1061,20 +1038,15 @@ def structural_trade_plan(item: dict, market: str) -> dict:
     risk = entry - stop
     reward = resistance - entry
     rr = reward / risk if risk > 0 else 0.0
-    reward2 = resistance2 - entry if resistance2 > 0 else 0.0
-    rr2 = reward2 / risk if risk > 0 and resistance2 > 0 else 0.0
 
     item.update({
         "structural_entry": entry,
         "structural_target": resistance,
-        "structural_target2": resistance2,
         "structural_support": support,
         "stop_loss": stop,
         "risk_reward": rr,
-        "risk_reward2": rr2,
         "level_plan_valid": reward > 0 and risk > 0,
         "target_basis": resistance_reason,
-        "target2_basis": resistance2_reason,
         "stop_basis": f"{support_reason} 이탈 시 상승 시나리오 무효",
         "level_plan_reason": f"{resistance_reason} {fmt(resistance)} / 지지선 {fmt(support)}",
     })
@@ -1233,23 +1205,6 @@ def repeat_scalp_plan(item: dict) -> dict:
     rsi = float(item.get("rsi", item.get("rsi14", 50)) or 50)
     prior_rsi = float(item.get("rsi_previous", item.get("previous_rsi", rsi)) or rsi)
 
-    # 기본 반복단타 폭은 0.5~1.5%이다. 1차 저항 위에서 실제로 확인된 2차
-    # 스윙 고점이 있으면, 그 지점까지의 폭을 "확장 가능 여력"으로 함께 보여준다.
-    # 임의로 폭을 늘리지 않고, 분봉에 실제로 찍힌 다음 고점이 있을 때만 인정한다.
-    target2 = float(item.get("structural_target2", 0) or 0)
-    swing_percent2 = ((target2 / support) - 1) * 100 if support > 0 and target2 > support else 0.0
-    can_extend_beyond_default = bool(target2 > 0 and swing_percent2 > 1.5)
-    if can_extend_beyond_default:
-        extension_reason = (
-            f"1차 저항 {fmt(target)} 통과 시 2차 저항 {fmt(target2)}까지 "
-            f"추가 상승 여력 약 {max(0.0, swing_percent2 - swing_percent):.2f}%p "
-            f"(총 예상폭 {swing_percent2:.2f}%)"
-        )
-    elif target2 > 0:
-        extension_reason = f"2차 저항 {fmt(target2)} 확인되었으나 기본 1.5% 구간을 크게 초과하지 않음"
-    else:
-        extension_reason = "1차 저항 위쪽에서 확인된 2차 스윙 고점이 없어 확장 근거 없음"
-
     # A repeat scalp needs a real, recently observed box.  Use the last 30
     # completed one-minute bars as the 30-minute box; never manufacture a
     # percentage target when its upper/lower boundaries are absent.
@@ -1336,10 +1291,6 @@ def repeat_scalp_plan(item: dict) -> dict:
         "repeat_box_high": box_high,
         "repeat_box_range_percent": box_range_percent,
         "repeat_rsi_recovery": rsi_recovery,
-        "repeat_scalp_extended_target": target2,
-        "repeat_scalp_extended_range_percent": swing_percent2,
-        "repeat_scalp_can_extend": can_extend_beyond_default,
-        "repeat_scalp_extension_reason": extension_reason,
         "trailing_stop_enabled": bool(state in {"HOLD_OR_BREAKOUT", "TAKE_PROFIT"}),
         "trailing_stop_percent": 0.5,
         "trailing_stop_price": (max(highs[-10:]) * 0.995 if highs else 0.0),
@@ -1350,10 +1301,8 @@ def repeat_scalp_plan(item: dict) -> dict:
 def precise_analysis(row: dict, mode: str) -> dict:
     raw = scanner().analyze(dict(row), mode)
     item = apply_mode_policy(finalize_trade_item(raw), mode)
-    # normalize_us_item() is called once below, after the bid/ask refresh loop,
-    # so the verified price reflects the freshest quote. Calling it here too
-    # (as before) just burned an extra KIS/Yahoo request per analysis cycle
-    # since this early result was always overwritten anyway.
+    if not mode.startswith("국내"):
+        item = normalize_us_item(item, row)
     # The bundled engine reads Korean total depth but historically discarded
     # level-1 bid/ask prices from the same REST response. Hydrate those exact
     # KIS fields for direct searches instead of treating them as unavailable.
@@ -1537,7 +1486,7 @@ elif auto_audit:
         pass
 
 candidate_board = [] if manual_search_active else latest_entry_candidates(market, minimum_score)
-st.subheader("실시간 진입 후보 · 기본 반복 폭 0.5~1.5%")
+st.subheader("실시간 진입 후보")
 if manual_search_active:
     st.caption("직접 검색 우선 모드 · 자동 후보 수집을 잠시 멈추고 선택 종목만 분석합니다.")
 elif candidate_board:
@@ -1545,30 +1494,17 @@ elif candidate_board:
     for candidate in candidate_board:
         support_text = fmt(candidate["support"])
         trigger_text = "현재 조건 충족" if candidate["stage"].startswith("🟢") else f"{support_text} 지지·VWAP 회복 확인"
-        target2 = candidate.get("target2", 0.0)
-        if candidate.get("can_extend"):
-            extend_text = f"🔼 2차 {fmt(target2)} (+{candidate.get('extended_range', 0.0):.2f}%)"
-        elif target2:
-            extend_text = f"2차 {fmt(target2)} (여력 제한적)"
-        else:
-            extend_text = "확인된 2차 저항 없음"
         board_rows.append({
             "판정": candidate["stage"], "종목": f"{candidate['ticker']} · {candidate['name']}",
             "현재가": candidate["price"], "진입 발동": trigger_text,
-            "1차 저항": candidate["target"], "무효 지지": candidate["support"],
-            "반복폭": f"{candidate['repeat_width']:.2f}%",
-            "확장여력(2차목표)": extend_text,
+            "실제 저항": candidate["target"], "무효 지지": candidate["support"],
             "지속상승": f"{candidate['trend_score']}/10",
             "점수": round(candidate["score"]), "RVOL": round(candidate["rvol"], 1),
             "손익비": round(candidate["risk_reward"], 2),
             "분석시각": datetime.fromtimestamp(candidate["issued"], KST).strftime("%H:%M:%S"),
         })
     st.dataframe(pd.DataFrame(board_rows), hide_index=True, use_container_width=True)
-    st.caption(
-        "표에 뜨는 후보는 실제 분봉 지지·저항으로 확인된 반복 폭이 0.5~1.5%인 종목만 표시합니다. "
-        "🔼 확장여력이 있으면 1차 저항을 넘어 2차 저항까지 추가 상승 가능성이 있다는 뜻입니다. "
-        "🟢도 주문 보장이 아니라 현재 데이터의 진입 조건 충족입니다. 표시된 발동가·손절 조건을 함께 확인하세요."
-    )
+    st.caption("🟢도 주문 보장이 아니라 현재 데이터의 진입 조건 충족입니다. 표시된 발동가·손절 조건을 함께 확인하세요.")
 else:
         if focus_only:
             st.info(
@@ -1789,14 +1725,10 @@ elif repeat_state == "RANGE_TOO_NARROW":
 else:
     action_class, action_title = "wait", "🟡 지금은 대기"
     action_line = f"{fmt(repeat_buy)} 지지 반등 또는 매수 합의가 확인될 때까지 매수하지 마세요."
-_extend_note = (
-    f" · 🔼 2차 저항 {fmt(latest.get('repeat_scalp_extended_target'))}까지 확장 가능"
-    if bool(latest.get("repeat_scalp_can_extend")) else ""
-)
 st.markdown(
     f'<div class="trade-action {action_class}"><h2>{action_title}</h2>'
     f'<p><b>{action_line}</b></p><p>손절·무효 기준: {fmt(repeat_stop)} · '
-    f'확인된 반복 폭: {repeat_width:.2f}%{_extend_note}</p></div>',
+    f'확인된 반복 폭: {repeat_width:.2f}%</p></div>',
     unsafe_allow_html=True,
 )
 # Three-minute per-symbol cool-down prevents the same actionable instruction
@@ -1842,26 +1774,6 @@ st.caption(
     f"매도가 근거: {latest.get('target_basis', '미확인')} · "
     f"손절 근거: {latest.get('stop_basis', latest.get('level_plan_reason', '미확인'))}"
 )
-
-# 1차·2차 목표가: 둘 다 임의 퍼센트가 아니라 1분봉에서 실제로 확인된
-# 스윙 고점을 그대로 사용한다. 2차 목표는 1차 저항을 통과했을 때만 의미가 있다.
-target2_value = float(latest.get("structural_target2", 0) or 0)
-extended_range = float(latest.get("repeat_scalp_extended_range_percent", 0) or 0)
-can_extend = bool(latest.get("repeat_scalp_can_extend", False))
-extension_reason = str(latest.get("repeat_scalp_extension_reason", "확인된 2차 저항 없음"))
-target_cols = st.columns(4)
-target_cols[0].metric("1차 목표가", fmt(latest.get("structural_target")), f"기본 반복폭 {repeat_width:.2f}%")
-target_cols[1].metric(
-    "2차 목표가",
-    fmt(target2_value) if target2_value > 0 else "미확인",
-    f"저항 통과 시 +{extended_range:.2f}%" if target2_value > 0 else None,
-)
-target_cols[2].metric("2차까지 예상 폭", f"{extended_range:.2f}%" if target2_value > 0 else "-")
-target_cols[3].metric("1.5% 초과 확장", "가능" if can_extend else ("여력 제한적" if target2_value > 0 else "근거 없음"))
-if can_extend:
-    st.success(f"🔼 기본 반복 폭(0.5~1.5%)을 넘어서는 확장 여력이 확인됩니다 · {extension_reason}")
-else:
-    st.caption(f"확장 여력: {extension_reason}")
 st.caption(
     f"장중 지속상승 판정 {continuous_rise_score}/10 · "
     f"5분 {'상승' if float(latest.get('trend_return_5m', 0) or 0) > 0 else '하락'} · "
