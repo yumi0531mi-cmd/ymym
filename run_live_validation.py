@@ -1067,11 +1067,67 @@ def refresh_quote_only(engine, market: str, member: tuple[str, str, str]) -> flo
         return 0.0
 
 
+
+def discover_market_members(engine, market: str, limit: int = 18) -> list[tuple[str, str, str]]:
+    """고정 유니버스 대신 KIS 엔진의 실시간 후보 순위를 사용한다.
+
+    호출 실패 시에만 기존 고정 목록으로 되돌아간다. 후보 검색은 한 루프에 1회만 수행하고
+    실제 정밀분석 종목 수는 main의 rotation/batch로 제한해 API 폭증을 막는다.
+    """
+    modes = ("국내 돌파", "국내 거래대금 급증") if market == "KR" else ("미국 30분 1% 타점", "미국 급등주")
+    ranked: dict[str, dict] = {}
+    for mode in modes:
+        try:
+            candidates = engine.candidates(mode) or []
+            for row in candidates:
+                c = dict(row or {})
+                ticker = str(c.get("ticker") or c.get("code") or "").upper().strip()
+                if not ticker:
+                    continue
+                old = ranked.get(ticker, {})
+                price = f(c.get("screen_price") or c.get("price") or old.get("screen_price"))
+                volume = int(f(c.get("screen_volume") or c.get("volume") or c.get("accumulated_volume") or old.get("screen_volume")))
+                change = f(c.get("screen_change") if c.get("screen_change") is not None else c.get("change_percent", c.get("change", old.get("screen_change", 0))))
+                # 큰 차트/원본 payload는 후보 탐색 단계에서 보존하지 않는다.
+                ranked[ticker] = {
+                    "ticker": ticker,
+                    "name": str(c.get("name") or old.get("name") or ticker),
+                    "exchange": str(c.get("exchange") or old.get("exchange") or ("KR" if market == "KR" else "NASDAQ")),
+                    "screen_price": price,
+                    "screen_volume": max(volume, int(f(old.get("screen_volume")))),
+                    "screen_change": change,
+                }
+            del candidates
+        except Exception as exc:
+            logging.debug("동적 후보 검색 실패 %s %s: %s", market, mode, exc)
+
+    rows = []
+    for c in ranked.values():
+        price = f(c.get("screen_price")); volume = int(f(c.get("screen_volume"))); change = f(c.get("screen_change")); value = price * volume
+        if market == "KR":
+            valid = 1000 <= price <= 500000 and -1.0 <= change < 18 and volume >= 50000 and value >= 8_000_000_000
+            score = min(value / 50_000_000_000, 4.0) + min(volume / 500_000, 3.0) + max(0.0, change) * 0.12
+        else:
+            valid = 0.5 <= price <= 500 and -1.5 <= change < 40 and volume >= 50000 and value >= 5_000_000
+            score = min(value / 50_000_000, 4.0) + min(volume / 1_000_000, 3.0) + max(0.0, change) * 0.10
+        if valid:
+            rows.append((score, value, (str(c["ticker"]), str(c.get("name") or c["ticker"]), str(c.get("exchange") or ("KR" if market == "KR" else "NASDAQ")))))
+    rows.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    members = [member for _, _, member in rows[:limit]]
+    if members:
+        logging.info("%s 동적 후보 %d종목 발견 (상위 %d 사용)", market, len(ranked), len(members))
+        return members
+    fallback = KR_UNIVERSE if market == "KR" else US_UNIVERSE
+    logging.warning("%s 동적 후보 없음 - 고정 안전망 %d종목 사용", market, len(fallback))
+    return list(fallback)
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--markets", default="KR", choices=("KR", "US", "BOTH"))
     parser.add_argument("--interval", type=int, default=60)
     parser.add_argument("--signal-bucket", type=int, default=300)
+    parser.add_argument("--dynamic-pool", type=int, default=24, help="실시간 1차 후보군 최대 종목 수")
+    parser.add_argument("--batch-size", type=int, default=6, help="한 루프에서 정밀분석할 동적 후보 수")
     parser.add_argument("--run-until", default="AUTO")
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
@@ -1109,8 +1165,18 @@ def main() -> int:
                     continue
 
                 for market in active:
-                    members = KR_UNIVERSE if market == "KR" else US_UNIVERSE
+                    pool = discover_market_members(engine, market, max(8, args.dynamic_pool))
                     issuing = signal_window_open(market, now)
+                    # 매 루프 전체를 정밀분석하지 않고 배치 순환해 KIS 호출 제한을 보호한다.
+                    state_key = f"rotation::{market}"
+                    try:
+                        row = db.execute("SELECT heartbeat FROM collector_state WHERE singleton=1").fetchone()
+                    except Exception:
+                        row = None
+                    rotation = int((row[0] if row else int(time.time())) // max(30, args.interval)) if pool else 0
+                    batch = max(1, min(args.batch_size, len(pool))) if pool else 0
+                    start_idx = (rotation * batch) % len(pool) if pool else 0
+                    members = [pool[(start_idx + i) % len(pool)] for i in range(batch)] if pool else []
                     for member in members:
                         if STOP:
                             break
