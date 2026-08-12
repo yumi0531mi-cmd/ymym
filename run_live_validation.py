@@ -27,8 +27,11 @@ import pandas as pd
 from datetime import datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
 
-KST = timezone(timedelta(hours=9), name="KST")
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))  # regime_session_upgrade.py를 같은 폴더에서 임포트하기 위함
+from regime_session_upgrade import session_for  # noqa: E402
+
+KST = timezone(timedelta(hours=9), name="KST")
 DB_PATH = ROOT / "validation_data" / "live_validation.sqlite3"
 LOG_PATH = ROOT / "validation_data" / "collector.log"
 CSV_PATH = ROOT / "validation_data" / "validation_summary.csv"
@@ -171,27 +174,15 @@ def f(value, default=0.0) -> float:
 
 
 def market_is_open(market: str, now: datetime) -> bool:
-    if market == "KR":
-        local = now.astimezone(KST)
-        return local.weekday() < 5 and clock_time(8, 50) <= local.time() <= clock_time(15, 35)
-    try:
-        from zoneinfo import ZoneInfo
-        ny = now.astimezone(ZoneInfo("America/New_York"))
-        return ny.weekday() < 5 and clock_time(4, 0) <= ny.time() <= clock_time(20, 0)
-    except Exception:
-        return False
+    """국내=정규장만 / 미국=주간거래+프리+정규+애프터 전부를 tradable로 본다.
+    (regime_session_upgrade.session_for()에 위임 - 시간대 정의는 그 파일 한 곳에서만 관리)
+    """
+    return session_for(market, now).tradable
 
 
 def signal_window_open(market: str, now: datetime) -> bool:
-    if market == "KR":
-        local = now.astimezone(KST)
-        return local.weekday() < 5 and clock_time(9, 0) <= local.time() <= clock_time(15, 0)
-    try:
-        from zoneinfo import ZoneInfo
-        ny = now.astimezone(ZoneInfo("America/New_York"))
-        return ny.weekday() < 5 and clock_time(4, 0) <= ny.time() <= clock_time(19, 30)
-    except Exception:
-        return False
+    # 신호 발생 창은 거래 가능 시간과 동일하게 맞춘다 (국내=정규장만, 미국=전 세션).
+    return session_for(market, now).tradable
 
 
 def row_for(ticker: str, name: str, exchange: str) -> dict:
@@ -708,6 +699,11 @@ DETAIL_KEYS = (
     "repeat_continuation_score", "repeat_continuation_checks", "repeat_preferred_range",
     "repeat_chart_box_low", "repeat_chart_box_high",
 )
+# 참고: intraday_regime_plan()/RegimeConfirmer는 현재 scalp_app.py의 precise_analysis()
+# 경로에서만 실행됩니다. 이 수집기(analyze_one)는 apply_repeat_scalp_overlay까지만 쓰므로
+# regime_state_display 계열 필드는 여기서 생성되지 않습니다. 검증 DB에도 추세 확정 이력을
+# 남기고 싶다면 scalp_app.py의 intraday_regime_plan/box_regime_plan/apply_regime_confirmation을
+# 이 파일 analyze_one()에도 동일하게 연결해야 합니다(현재는 범위 밖).
 
 
 def store_result(db: sqlite3.Connection, market: str, item: dict, now_ts: int, bucket_seconds: int) -> None:
