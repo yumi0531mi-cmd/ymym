@@ -23,41 +23,12 @@ import sys
 import time
 import zlib
 
+import pandas as pd
 from datetime import datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
 
 KST = timezone(timedelta(hours=9), name="KST")
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT))
-import regime_session_upgrade as _rsu
-
-_REQUIRED_ENGINE_VERSION = "2026.08.13-v3"
-_REQUIRED_ENGINE_SYMBOLS = (
-    "apply_repeat_scalp_overlay", "box_regime_plan", "data_quality_plan",
-    "forward_forecast_plan", "hourly_structure_plan", "intraday_regime_plan",
-    "resolve_vwap_series", "session_for", "strategy_target_plan",
-    "target_reach_probability_plan", "trade_decision_plan",
-)
-_missing_engine_symbols = [name for name in _REQUIRED_ENGINE_SYMBOLS if not hasattr(_rsu, name)]
-_engine_version = str(getattr(_rsu, "SCANNER_ENGINE_VERSION", "구버전/표시없음"))
-if _engine_version != _REQUIRED_ENGINE_VERSION or _missing_engine_symbols:
-    raise RuntimeError(
-        "regime_session_upgrade.py 버전 불일치: "
-        f"필요={_REQUIRED_ENGINE_VERSION}, 현재={_engine_version}, "
-        f"누락={','.join(_missing_engine_symbols) or '없음'}"
-    )
-
-apply_repeat_scalp_overlay = _rsu.apply_repeat_scalp_overlay
-box_regime_plan = _rsu.box_regime_plan
-data_quality_plan = _rsu.data_quality_plan
-forward_forecast_plan = _rsu.forward_forecast_plan
-hourly_structure_plan = _rsu.hourly_structure_plan
-intraday_regime_plan = _rsu.intraday_regime_plan
-resolve_vwap_series = _rsu.resolve_vwap_series
-session_for = _rsu.session_for
-strategy_target_plan = _rsu.strategy_target_plan
-target_reach_probability_plan = _rsu.target_reach_probability_plan
-trade_decision_plan = _rsu.trade_decision_plan
 DB_PATH = ROOT / "validation_data" / "live_validation.sqlite3"
 LOG_PATH = ROOT / "validation_data" / "collector.log"
 CSV_PATH = ROOT / "validation_data" / "validation_summary.csv"
@@ -156,8 +127,6 @@ def connect() -> sqlite3.Connection:
             repeat_range_percent REAL, repeat_candidate INTEGER NOT NULL DEFAULT 0,
             entry_touched INTEGER, target1_before_stop INTEGER, target2_before_stop INTEGER,
             continuation_score REAL, continuation_label TEXT, extra_after_target1 REAL,
-            target1_model_prob REAL, target1_first_prob REAL, target_prob_confidence REAL,
-            strategy_type TEXT,
             UNIQUE(market,ticker,issued)
         )
     """)
@@ -188,8 +157,6 @@ def connect() -> sqlite3.Connection:
         "continuation_label": "TEXT", "extra_after_target1": "REAL",
         "forecast15": "REAL", "forecast60": "REAL", "actual15": "REAL", "actual60": "REAL",
         "max_up60": "REAL", "max_down60": "REAL",
-        "target1_model_prob": "REAL", "target1_first_prob": "REAL",
-        "target_prob_confidence": "REAL", "strategy_type": "TEXT",
     }
     for column, definition in migrations.items():
         if column not in existing:
@@ -306,29 +273,63 @@ def _adapt_repeat_overlay_for_audit(item: dict) -> dict:
     return item
 
 
+def forward_forecast_plan_audit(item:dict):
+    price=f(item.get("price"))
+    closes=[f(x) for x in (item.get("chart_close_1m",[]) or []) if f(x)>0]
+    highs=[f(x) for x in (item.get("chart_high_1m",[]) or []) if f(x)>0]
+    lows=[f(x) for x in (item.get("chart_low_1m",[]) or []) if f(x)>0]
+    if price<=0 or len(closes)<30:
+        return item
+    import pandas as pd
+    series=pd.Series(closes,dtype=float)
+    r1=series.pct_change().dropna()*100
+    sigma=max(f(r1.tail(min(90,len(r1))).std(ddof=0)),f(r1.abs().median())*1.2,0.03)
+    def ret(m):
+        return (closes[-1]/closes[-1-m]-1)*100 if len(closes)>m and closes[-1-m]>0 else 0.0
+    r5,r15,r30=ret(5),ret(15),ret(30)
+    r60=ret(60) if len(closes)>60 else ret(min(45,len(closes)-1))
+    per_min=(r5/5)*0.15+(r15/15)*0.25+(r30/30)*0.35+(r60/60)*0.25
+    per_min=max(-sigma*0.45,min(sigma*0.45,per_min))
+    trend=int(f(item.get("repeat_trend_score",item.get("continuous_rise_score"))))
+    vwap=f(item.get("vwap")); ema9=f(item.get("ema9")); ema20=f(item.get("ema20"))
+    bullish=price>vwap>0 and ema9>=ema20>0 and trend>=6
+    bearish=0<price<vwap and 0<ema9<ema20
+    out={}
+    for h in (5,15,30,60):
+        decay={5:.95,15:.80,30:.66,60:.52}[h]
+        center=per_min*h*decay
+        if bullish: center+=sigma*(h**0.5)*0.15
+        if bearish: center-=sigma*(h**0.5)*0.18
+        band=max(sigma*(h**0.5)*1.15,0.08)*(1.12 if h==60 else 1.0)
+        low,high=center-band,center+band
+        z=center/max(band,.05)
+        prob=max(15,min(85,50+30*math.tanh(z)+(5 if bullish else -5 if bearish else 0)))
+        out[h]={"center_pct":round(center,3),"low_pct":round(low,3),"high_pct":round(high,3),"up_probability":round(prob,1)}
+    item["forward_forecasts"]=out
+    item["forecast_5m"]=out[5]["center_pct"]
+    item["forecast_15m"]=out[15]["center_pct"]
+    item["forecast_30m"]=out[30]["center_pct"]
+    item["forecast_60m"]=out[60]["center_pct"]
+    item["forecast_10m"]=(out[5]["center_pct"]+out[15]["center_pct"])/2
+    item["forecast_20m"]=(out[15]["center_pct"]+out[30]["center_pct"])/2
+    return item
+
 def analyze_one(engine, policy, finalize, market: str, member: tuple[str, str, str]) -> dict | None:
-    ticker,name,exchange=member
-    mode="국내 30분 1% 타점" if market=="KR" else "미국 30분 1% 타점"
-    market_name="국내" if market=="KR" else "미국"
+    ticker, name, exchange = member
+    mode = "국내 30분 1% 타점" if market == "KR" else "미국 30분 1% 타점"
     try:
-        result=engine.analyze(row_for(ticker,name,exchange),mode)
-        result=policy(finalize(result),mode)
-        result=resolve_vwap_series(result)
-        result=hourly_structure_plan(result,market_name)
-        result=apply_repeat_scalp_overlay(result,market)
-        result=_adapt_repeat_overlay_for_audit(result)
-        result=intraday_regime_plan(result,market_name)
-        result=box_regime_plan(result)
-        result=strategy_target_plan(result)
-        result=data_quality_plan(result,market,tradable=session_for(market).tradable)
-        result=forward_forecast_plan(result,market_name)
-        result=target_reach_probability_plan(result)
-        result=trade_decision_plan(result)
-        if f(result.get("price"))<=0:
+        result = engine.analyze(row_for(ticker, name, exchange), mode)
+        result = policy(finalize(result), mode)
+        # 검증기에서도 앱과 동일한 1분봉 지지/저항·ATR 후처리를 반드시 실행한다.
+        result = apply_repeat_scalp_overlay(result, market)
+        result = _adapt_repeat_overlay_for_audit(result)
+        result = forward_forecast_plan_audit(result)
+        result = target_reach_probability_plan(result)
+        if f(result.get("price")) <= 0:
             raise ValueError("현재가 0")
         return result
     except Exception as exc:
-        logging.warning("분석 실패 %s %s: %s",market,ticker,exc)
+        logging.warning("분석 실패 %s %s: %s", market, ticker, exc)
         return None
 
 
@@ -373,13 +374,6 @@ DETAIL_KEYS = (
     "repeat_continuation_score", "repeat_continuation_checks", "repeat_preferred_range",
     "repeat_chart_box_low", "repeat_chart_box_high",
     "forecast_5m", "forecast_15m", "forecast_30m", "forecast_60m", "forward_forecasts",
-    "target1_reach_probability", "target2_reach_probability",
-    "target1_eta_minutes", "target2_eta_minutes",
-    "stop_first_risk_probability", "target1_before_stop_probability",
-    "target_probability_confidence", "target_probability_label",
-    "strategy_type", "strategy_entry", "strategy_target1", "strategy_target2", "strategy_stop",
-    "trade_decision", "trade_decision_reasons", "final_candidate",
-
 )
 
 
@@ -407,15 +401,15 @@ def store_result(db: sqlite3.Connection, market: str, item: dict, now_ts: int, b
             and f(item.get("data_completeness"), 100.0) >= 60.0
         )
 
-    repeat_entry = f(item.get("strategy_entry", item.get("repeat_entry", item.get("repeat_scalp_buy_level"))))
-    target1 = f(item.get("strategy_target1", item.get("structural_target1", item.get("structural_target"))))
-    target2 = f(item.get("strategy_target2", item.get("structural_target2")))
-    repeat_range = f(item.get("strategy_range_percent", item.get("repeat_scalp_range_percent")))
-    repeat_candidate = int(bool(item.get("final_candidate")))
+    repeat_entry = f(item.get("repeat_entry", item.get("repeat_scalp_buy_level")))
+    target1 = f(item.get("repeat_target1", item.get("structural_target1", item.get("structural_target"))))
+    target2 = f(item.get("repeat_target2", item.get("structural_target2")))
+    repeat_range = f(item.get("repeat_width_percent", item.get("repeat_scalp_range_percent")))
+    repeat_candidate = int(bool(item.get("repeat_candidate")))
     continuation_score = f(item.get("repeat_continuation_score", item.get("upside_continuation_score")))
     continuation_label = str(item.get("repeat_continuation_label") or item.get("upside_continuation_label") or "")
     extra_after_target1 = f(item.get("repeat_extra_after_target1", item.get("additional_upside_after_target1")))
-    stop_price = f(item.get("strategy_stop", item.get("stop_loss")))
+    stop_price = f(item.get("repeat_stop", item.get("stop_loss")))
 
     duplicate = db.execute(
         "SELECT 1 FROM signals WHERE market=? AND ticker=? AND issued BETWEEN ? AND ? LIMIT 1",
@@ -429,9 +423,8 @@ def store_result(db: sqlite3.Connection, market: str, item: dict, now_ts: int, b
             market,ticker,name,issued,base_price,verdict,score,entry_ok,
             forecast5,forecast10,forecast15,forecast20,forecast30,forecast60,stop_price,data_valid,detail_json,
             repeat_entry_price,target1_price,target2_price,repeat_range_percent,repeat_candidate,
-            continuation_score,continuation_label,extra_after_target1,
-            target1_model_prob,target1_first_prob,target_prob_confidence,strategy_type
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            continuation_score,continuation_label,extra_after_target1
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         market, ticker, str(item.get("name") or ticker), now_ts, price,
         str(item.get("chart_verdict") or "WAIT"), f(item.get("score")),
@@ -441,10 +434,6 @@ def store_result(db: sqlite3.Connection, market: str, item: dict, now_ts: int, b
         stop_price, data_valid, json.dumps(detail, ensure_ascii=False, default=str),
         repeat_entry, target1, target2, repeat_range, repeat_candidate,
         continuation_score, continuation_label, extra_after_target1,
-        f(item.get("target1_reach_probability")),
-        f(item.get("target1_before_stop_probability")),
-        f(item.get("target_probability_confidence")),
-        str(item.get("strategy_type") or "NONE"),
     ))
 
 
@@ -500,11 +489,10 @@ def grade_pending(db: sqlite3.Connection, now_ts: int) -> None:
                 updates["max_up30"] = (f(extrema[0]) / base - 1) * 100
                 updates["max_down30"] = (f(extrema[1]) / base - 1) * 100
 
-        if now_ts >= issued + 60 * 60:
             path = db.execute("""
                 SELECT captured,price FROM quotes
                 WHERE market=? AND ticker=? AND captured BETWEEN ? AND ? ORDER BY captured
-            """, (market, ticker, issued, issued + 60 * 60)).fetchall()
+            """, (market, ticker, issued, issued + 30 * 60)).fetchall()
 
             stop = f(stop_price)
             repeat_entry = f(repeat_entry_price)
@@ -604,8 +592,7 @@ def export_summary(db: sqlite3.Connection) -> None:
                repeat_entry_price,target1_price,target2_price,repeat_range_percent,repeat_candidate,
                entry_touched,target1_before_stop,target2_before_stop,
                continuation_score,continuation_label,extra_after_target1,
-               hit1_before_stop,hit2_before_stop,hit3_before_stop,stop_first,
-               target1_model_prob,target1_first_prob,target_prob_confidence,strategy_type
+               hit1_before_stop,hit2_before_stop,hit3_before_stop,stop_first
         FROM signals ORDER BY issued DESC
     """).fetchall()
     headers = [
@@ -615,7 +602,6 @@ def export_summary(db: sqlite3.Connection) -> None:
         "반복매수가","차트1차목표","차트2차목표","반복폭%","반복후보",
         "매수가체결","1차선도달","2차선도달","추가상승점수","추가상승판정","1차후추가폭%",
         "+1%비교통계","+2%비교통계","+3%비교통계","손절먼저",
-        "1차모델확률","1차선도달모델확률","확률신뢰도","전략유형",
     ]
     with CSV_PATH.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle)
