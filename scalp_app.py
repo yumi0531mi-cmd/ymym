@@ -137,9 +137,6 @@ US_UNIVERSE = [
 
 
 def market_clock(market: str, now: datetime | None = None) -> dict:
-    """국내=정규장만 / 미국=주간거래+프리+정규+애프터 전부를 tradable로 판단한다.
-    (시간대 정의는 regime_session_upgrade.session_for() 한 곳에서만 관리)
-    """
     code = "KR" if market == "국내" else "US"
     sess = session_for(code, now)
     return {"session": sess.session_name, "tradable": sess.tradable, "local_time": sess.local_time}
@@ -386,8 +383,6 @@ def _intraday_ohlcv(item):
     if frame.empty:
         return frame
 
-    # 장/세션 사이의 큰 공백이 있으면 마지막 연속 분봉 구간만 사용해
-    # 전일 저항이 당일 초단타 목표에 섞이는 것을 줄인다.
     try:
         parsed = pd.to_datetime(frame["time"], errors="coerce")
         if parsed.notna().sum() >= max(12, len(frame) // 2):
@@ -535,7 +530,6 @@ def apply_repeat_scalp_overlay(item, market_code):
     support, support_basis = max(support_candidates, key=lambda x: x[0])
 
     swing_highs = _swing_levels(highs, "high")
-    # 반복단타 1차 목표는 지지선 대비 최소 +0.5% 공간이 있는 첫 의미 있는 저항만 사용한다.
     min_repeat_target = support * 1.005
     resistance_candidates = [x for x in swing_highs if x > price and x >= min_repeat_target]
     box_high = max(highs[-30:])
@@ -559,7 +553,6 @@ def apply_repeat_scalp_overlay(item, market_code):
             target2 = higher[0]
             target2_basis = "1차 위 다음 실제 1분봉 저항"
     elif trend_score >= 7:
-        # 신저가/신고가 돌파로 실제 저항이 아직 없을 때만 최근 ATR·봉폭을 투영한다.
         projection1 = max(atr14 * 1.25, median_range * 1.50)
         if box_width > 0:
             projection1 = min(projection1, max(atr14 * 2.20, box_width * 0.50))
@@ -746,24 +739,6 @@ def _adapt_repeat_overlay_for_ui(item: dict) -> dict:
         continuous_rise_score=trend_score,
         continuous_rise_checks=item.get("repeat_trend_checks") or {},
         repeat_scalp_state=legacy_state,
-        repeat_scalp_label=str(item.get("repeat_label") or ""),
-        repeat_scalp_reason=str(item.get("repeat_chart_reason") or ""),
-        repeat_scalp_buy_level=entry,
-        repeat_scalp_sell_level=target1,
-        repeat_scalp_invalidation=stop,
-        repeat_scalp_median_bar_range=_num(item.get("repeat_median_range")),
-        repeat_scalp_range_percent=width,
-        repeat_scalp_preferred_range=bool(item.get("repeat_preferred_range")),
-        repeat_scalp_can_extend=cont == "HIGH",
-        repeat_scalp_extension_label=str(item.get("repeat_continuation_label") or ""),
-        repeat_scalp_extension_reason=f"추가상승 근거 {int(_num(item.get('repeat_continuation_score')))}/10",
-        repeat_scalp_extension_percent=extra,
-        upside_continuation_state=legacy_cont,
-        upside_continuation_label=str(item.get("repeat_continuation_label") or ""),
-        upside_continuation_score=int(_num(item.get("repeat_continuation_score"))),
-        upside_continuation_checks=item.get("repeat_continuation_checks") or {},
-        additional_upside_after_target1=extra,
-        target2_total_upside=_num(item.get("repeat_target2_current_upside")),
-        verified_spread_percent=item.get("repeat_spread_percent"),
+        repeat_scalp_label=str(item.get("repeat_label") or "")
     )
     return item
