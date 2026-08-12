@@ -29,19 +29,35 @@ from pathlib import Path
 KST = timezone(timedelta(hours=9), name="KST")
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-from regime_session_upgrade import (
-    apply_repeat_scalp_overlay,
-    box_regime_plan,
-    data_quality_plan,
-    forward_forecast_plan,
-    hourly_structure_plan,
-    intraday_regime_plan,
-    resolve_vwap_series,
-    session_for,
-    strategy_target_plan,
-    target_reach_probability_plan,
-    trade_decision_plan,
+import regime_session_upgrade as _rsu
+
+_REQUIRED_ENGINE_VERSION = "2026.08.13-v3"
+_REQUIRED_ENGINE_SYMBOLS = (
+    "apply_repeat_scalp_overlay", "box_regime_plan", "data_quality_plan",
+    "forward_forecast_plan", "hourly_structure_plan", "intraday_regime_plan",
+    "resolve_vwap_series", "session_for", "strategy_target_plan",
+    "target_reach_probability_plan", "trade_decision_plan",
 )
+_missing_engine_symbols = [name for name in _REQUIRED_ENGINE_SYMBOLS if not hasattr(_rsu, name)]
+_engine_version = str(getattr(_rsu, "SCANNER_ENGINE_VERSION", "구버전/표시없음"))
+if _engine_version != _REQUIRED_ENGINE_VERSION or _missing_engine_symbols:
+    raise RuntimeError(
+        "regime_session_upgrade.py 버전 불일치: "
+        f"필요={_REQUIRED_ENGINE_VERSION}, 현재={_engine_version}, "
+        f"누락={','.join(_missing_engine_symbols) or '없음'}"
+    )
+
+apply_repeat_scalp_overlay = _rsu.apply_repeat_scalp_overlay
+box_regime_plan = _rsu.box_regime_plan
+data_quality_plan = _rsu.data_quality_plan
+forward_forecast_plan = _rsu.forward_forecast_plan
+hourly_structure_plan = _rsu.hourly_structure_plan
+intraday_regime_plan = _rsu.intraday_regime_plan
+resolve_vwap_series = _rsu.resolve_vwap_series
+session_for = _rsu.session_for
+strategy_target_plan = _rsu.strategy_target_plan
+target_reach_probability_plan = _rsu.target_reach_probability_plan
+trade_decision_plan = _rsu.trade_decision_plan
 DB_PATH = ROOT / "validation_data" / "live_validation.sqlite3"
 LOG_PATH = ROOT / "validation_data" / "collector.log"
 CSV_PATH = ROOT / "validation_data" / "validation_summary.csv"
