@@ -1,20 +1,24 @@
 # -*- coding: utf-8 -*-
-"""초단타 전용 Streamlit 앱.
+"""초단타 반복매매 전용 Streamlit 앱.
 
-GitHub 저장소 루트의 기존 app.py 안에 번들된 KIS 엔진만 읽어 사용한다.
-기존 통합 UI는 실행하지 않는다.
+같은 폴더의 app.py에 번들된 KIS 엔진을 읽어 사용한다.
+반복단타 기본 후보는 실제 차트의 지지→1차 저항 폭 0.5~1.5%만 표시한다.
+1차·2차 목표가는 임의 +1%/+2%가 아니라 실제 분봉 저항/돌파 구조로 계산한다.
 """
+from __future__ import annotations
+
 import ast
 import base64
 import importlib.abc
 import importlib.util
+import json
+import math
 import re
 import requests
 import sqlite3
-import tempfile
 import sys
+import tempfile
 import time
-import types
 import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -25,6 +29,8 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+
+st.set_page_config(page_title="초단타 VWAP 타점", page_icon="⚡", layout="wide")
 
 try:
     from run_live_validation import (
@@ -41,62 +47,14 @@ try:
         CSV_PATH as AUDIT_CSV_PATH,
     )
     AUDIT_IMPORT_ERROR = ""
-except Exception as audit_import_exception:
+except Exception as exc:
     AUDIT_KR_UNIVERSE = []
     AUDIT_US_UNIVERSE = []
-    AUDIT_IMPORT_ERROR = str(audit_import_exception)
+    AUDIT_IMPORT_ERROR = str(exc)
 
 KST = timezone(timedelta(hours=9), name="KST")
 ET = ZoneInfo("America/New_York")
 HISTORY_DB = Path(tempfile.gettempdir()) / "ymym_scalp_validation.sqlite3"
-
-
-def market_clock(market: str, now: datetime | None = None) -> dict:
-    """Return an explicit, DST-safe market session without guessing from KST."""
-    now_kst = now.astimezone(KST) if now else datetime.now(KST)
-    if market == "국내":
-        minute = now_kst.hour * 60 + now_kst.minute
-        weekday = now_kst.weekday() < 5
-        if weekday and 9 * 60 <= minute < 15 * 60 + 30:
-            session, tradable = "국내 정규장", True
-        else:
-            session, tradable = "국내 장외시간", False
-        return {"session": session, "tradable": tradable, "local_time": now_kst.strftime("%H:%M:%S KST")}
-
-    now_et = now_kst.astimezone(ET)
-    minute = now_et.hour * 60 + now_et.minute
-    weekday = now_et.weekday() < 5
-    if weekday and 4 * 60 <= minute < 9 * 60 + 30:
-        session, tradable = "미국 프리마켓", True
-    elif weekday and 9 * 60 + 30 <= minute < 16 * 60:
-        session, tradable = "미국 정규장", True
-    elif weekday and 16 * 60 <= minute < 20 * 60:
-        session, tradable = "미국 애프터마켓", True
-    else:
-        session, tradable = "미국 장외시간", False
-    return {
-        "session": session, "tradable": tradable,
-        "local_time": f"{now_et.strftime('%H:%M:%S')} ET / {now_kst.strftime('%H:%M:%S')} KST",
-    }
-
-
-def db_connect():
-    connection = sqlite3.connect(HISTORY_DB, timeout=10)
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS predictions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticker TEXT NOT NULL, issued REAL NOT NULL, base_price REAL NOT NULL,
-            f5 REAL NOT NULL, f10 REAL NOT NULL, f20 REAL NOT NULL DEFAULT 0, f30 REAL NOT NULL,
-            actual5 REAL, actual10 REAL, actual20 REAL, actual30 REAL,
-            UNIQUE(ticker, issued)
-        )
-    """)
-    existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(predictions)")}
-    for column, definition in (("f20", "REAL NOT NULL DEFAULT 0"), ("actual20", "REAL")):
-        if column not in existing_columns:
-            connection.execute(f"ALTER TABLE predictions ADD COLUMN {column} {definition}")
-    return connection
 
 KR_UNIVERSE = [
     {"ticker":"005930","name":"삼성전자","exchange":"KR","asset_type":"우량주"},
@@ -125,6 +83,7 @@ KR_UNIVERSE = [
     {"ticker":"488080","name":"TIGER 반도체TOP10레버리지","exchange":"KR","asset_type":"레버리지 ETF"},
     {"ticker":"423920","name":"TIGER 미국필라델피아반도체레버리지(합성)","exchange":"KR","asset_type":"레버리지 ETF"},
 ]
+
 US_UNIVERSE = [
     {"ticker":"AAPL","name":"애플","exchange":"NASDAQ","asset_type":"우량주"},
     {"ticker":"MSFT","name":"마이크로소프트","exchange":"NASDAQ","asset_type":"우량주"},
@@ -165,1773 +124,1007 @@ US_UNIVERSE = [
     {"ticker":"LABD","name":"미국 바이오 3배 인버스","exchange":"AMEX","asset_type":"3배 인버스 ETF"},
     {"ticker":"TNA","name":"러셀2000 3배 레버리지","exchange":"AMEX","asset_type":"3배 레버리지 ETF"},
     {"ticker":"TZA","name":"러셀2000 3배 인버스","exchange":"AMEX","asset_type":"3배 인버스 ETF"},
-    {"ticker":"URTY","name":"러셀2000 3배 레버리지","exchange":"AMEX","asset_type":"3배 레버리지 ETF"},
-    {"ticker":"SRTY","name":"러셀2000 3배 인버스","exchange":"AMEX","asset_type":"3배 인버스 ETF"},
-    {"ticker":"UDOW","name":"다우30 3배 레버리지","exchange":"AMEX","asset_type":"3배 레버리지 ETF"},
-    {"ticker":"SDOW","name":"다우30 3배 인버스","exchange":"AMEX","asset_type":"3배 인버스 ETF"},
-    {"ticker":"NUGT","name":"금광주 2배 레버리지","exchange":"AMEX","asset_type":"2배 레버리지 ETF"},
-    {"ticker":"DUST","name":"금광주 2배 인버스","exchange":"AMEX","asset_type":"2배 인버스 ETF"},
-    {"ticker":"GUSH","name":"미국 원유생산 2배 레버리지","exchange":"AMEX","asset_type":"2배 레버리지 ETF"},
-    {"ticker":"DRIP","name":"미국 원유생산 2배 인버스","exchange":"AMEX","asset_type":"2배 인버스 ETF"},
-    {"ticker":"BOIL","name":"천연가스 2배 레버리지","exchange":"AMEX","asset_type":"2배 레버리지 ETF"},
-    {"ticker":"KOLD","name":"천연가스 2배 인버스","exchange":"AMEX","asset_type":"2배 인버스 ETF"},
-    {"ticker":"UCO","name":"원유 2배 레버리지","exchange":"AMEX","asset_type":"2배 레버리지 ETF"},
-    {"ticker":"SCO","name":"원유 2배 인버스","exchange":"AMEX","asset_type":"2배 인버스 ETF"},
-    {"ticker":"BITX","name":"비트코인 선물 2배 레버리지","exchange":"AMEX","asset_type":"2배 레버리지 ETF"},
-    {"ticker":"BITI","name":"비트코인 선물 인버스","exchange":"AMEX","asset_type":"인버스 ETF"},
-    {"ticker":"MSTU","name":"마이크로스트래티지 2배 레버리지","exchange":"AMEX","asset_type":"2배 레버리지 ETF"},
-    {"ticker":"MSTZ","name":"마이크로스트래티지 2배 인버스","exchange":"AMEX","asset_type":"2배 인버스 ETF"},
-    {"ticker":"NVDL","name":"엔비디아 2배 레버리지","exchange":"NASDAQ","asset_type":"2배 레버리지 ETF"},
-    {"ticker":"NVD","name":"엔비디아 2배 인버스","exchange":"NASDAQ","asset_type":"2배 인버스 ETF"},
-    {"ticker":"TSLL","name":"테슬라 2배 레버리지","exchange":"NASDAQ","asset_type":"2배 레버리지 ETF"},
-    {"ticker":"TSLS","name":"테슬라 1배 인버스","exchange":"NASDAQ","asset_type":"인버스 ETF"},
-    {"ticker":"AMZU","name":"아마존 2배 레버리지","exchange":"NASDAQ","asset_type":"2배 레버리지 ETF"},
-    {"ticker":"AMZD","name":"아마존 2배 인버스","exchange":"NASDAQ","asset_type":"2배 인버스 ETF"},
-    {"ticker":"GGLL","name":"알파벳 2배 레버리지","exchange":"NASDAQ","asset_type":"2배 레버리지 ETF"},
-    {"ticker":"GGLS","name":"알파벳 2배 인버스","exchange":"NASDAQ","asset_type":"2배 인버스 ETF"},
-    {"ticker":"AAPU","name":"애플 2배 레버리지","exchange":"NASDAQ","asset_type":"2배 레버리지 ETF"},
-    {"ticker":"AAPD","name":"애플 2배 인버스","exchange":"NASDAQ","asset_type":"2배 인버스 ETF"},
-    {"ticker":"METU","name":"메타 2배 레버리지","exchange":"NASDAQ","asset_type":"2배 레버리지 ETF"},
-    {"ticker":"METD","name":"메타 2배 인버스","exchange":"NASDAQ","asset_type":"2배 인버스 ETF"},
 ]
+
+
+def market_clock(market: str, now: datetime | None = None) -> dict:
+    now_kst = now.astimezone(KST) if now else datetime.now(KST)
+    if market == "국내":
+        minute = now_kst.hour * 60 + now_kst.minute
+        tradable = now_kst.weekday() < 5 and 9 * 60 <= minute < 15 * 60 + 30
+        return {"session": "국내 정규장" if tradable else "국내 장외시간", "tradable": tradable, "local_time": now_kst.strftime("%H:%M:%S KST")}
+    now_et = now_kst.astimezone(ET)
+    minute = now_et.hour * 60 + now_et.minute
+    weekday = now_et.weekday() < 5
+    if weekday and 4*60 <= minute < 9*60+30:
+        session, tradable = "미국 프리마켓", True
+    elif weekday and 9*60+30 <= minute < 16*60:
+        session, tradable = "미국 정규장", True
+    elif weekday and 16*60 <= minute < 20*60:
+        session, tradable = "미국 애프터마켓", True
+    else:
+        session, tradable = "미국 장외시간", False
+    return {"session":session,"tradable":tradable,"local_time":f"{now_et.strftime('%H:%M:%S')} ET / {now_kst.strftime('%H:%M:%S')} KST"}
+
+
+def db_connect():
+    con = sqlite3.connect(HISTORY_DB, timeout=10)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("""CREATE TABLE IF NOT EXISTS predictions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,ticker TEXT NOT NULL,issued REAL NOT NULL,
+        base_price REAL NOT NULL,f5 REAL NOT NULL,f10 REAL NOT NULL,f20 REAL NOT NULL DEFAULT 0,
+        f30 REAL NOT NULL,actual5 REAL,actual10 REAL,actual20 REAL,actual30 REAL,
+        UNIQUE(ticker,issued))""")
+    return con
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def kr_name_map() -> dict:
-    def norm(text: str) -> str:
-        return re.sub(r"[^0-9a-z가-힣]", "", str(text).casefold())
-    mapping = {norm(row["name"]): (row["ticker"], row["name"]) for row in KR_UNIVERSE}
+    def norm(text): return re.sub(r"[^0-9a-z가-힣]", "", str(text).casefold())
+    mapping = {norm(r["name"]):(r["ticker"],r["name"]) for r in KR_UNIVERSE}
     try:
         from pykrx import stock as krx_stock
-        for market_name in ("KOSPI", "KOSDAQ"):
+        for market_name in ("KOSPI","KOSDAQ"):
             for code in krx_stock.get_market_ticker_list(market=market_name):
                 name = krx_stock.get_market_ticker_name(code)
-                if name:
-                    mapping[norm(name)] = (str(code), str(name))
+                if name: mapping[norm(name)] = (str(code),str(name))
     except Exception:
         pass
-    try:
-        import FinanceDataReader as fdr
-        listing = fdr.StockListing("KRX")
-        code_col = "Code" if "Code" in listing.columns else "Symbol"
-        name_col = "Name" if "Name" in listing.columns else "MarketName"
-        for _, row in listing.iterrows():
-            code, name = str(row.get(code_col, "")), str(row.get(name_col, ""))
-            if code and name and name != "nan":
-                mapping[norm(name)] = (code.zfill(6), name)
-    except Exception:
-        pass
-    mapping.update({
-        norm("SK텔레콤"): ("017670", "SK텔레콤"),
-        norm("LG전자"): ("066570", "LG전자"),
-        norm("KB금융"): ("105560", "KB금융"),
-        norm("신한지주"): ("055550", "신한지주"),
-        norm("셀트리온"): ("068270", "셀트리온"),
-        norm("기아"): ("000270", "기아"),
-        norm("포스코홀딩스"): ("005490", "POSCO홀딩스"),
-    })
     return mapping
+
+
+def normalize_us_exchange(raw: str) -> str:
+    raw = str(raw or "").upper().strip()
+    if raw in {"NMS","NGM","NCM","NAS","NASDAQ"}: return "NASDAQ"
+    if raw in {"NYQ","NYS","NYSE"}: return "NYSE"
+    if raw in {"ASE","PCX","AMEX"}: return "AMEX"
+    return ""
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def yahoo_symbol_search(query: str) -> dict | None:
-    """Resolve an arbitrary US ticker or company name without restricting asset type."""
-    try:
-        quotes = []
-        for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
-            try:
-                response = requests.get(
-                    f"https://{host}/v1/finance/search",
-                    params={"q": query, "quotesCount": 10, "newsCount": 0},
-                    headers={"User-Agent": "Mozilla/5.0"}, timeout=8,
-                )
-                response.raise_for_status()
-                quotes = response.json().get("quotes") or []
-                if quotes:
-                    break
-            except Exception:
-                continue
-        allowed = [q for q in quotes if str(q.get("quoteType", "")).upper() in {"EQUITY", "ETF"}]
-        us = [q for q in allowed if str(q.get("exchange", "")).upper() not in {"KSC", "KOE"}]
-        q = (us or allowed or [None])[0]
-        if not q:
-            return None
-        ticker = str(q.get("symbol", "")).upper()
-        exchange_raw = str(q.get("exchange", "")).upper()
-        exchange = "AMEX" if exchange_raw in {"ASE", "PCX", "NYQ"} else "NASDAQ" if exchange_raw in {"NMS", "NGM", "NCM"} else "NYSE"
-        return {"ticker": ticker, "name": str(q.get("shortname") or q.get("longname") or ticker),
-                "exchange": exchange, "asset_type": "직접 검색"}
-    except Exception:
-        return None
+    quotes=[]
+    for host in ("query1.finance.yahoo.com","query2.finance.yahoo.com"):
+        try:
+            r=requests.get(f"https://{host}/v1/finance/search",params={"q":query,"quotesCount":10,"newsCount":0},headers={"User-Agent":"Mozilla/5.0"},timeout=8)
+            r.raise_for_status(); quotes=r.json().get("quotes") or []
+            if quotes: break
+        except Exception: continue
+    allowed=[q for q in quotes if str(q.get("quoteType","")).upper() in {"EQUITY","ETF"}]
+    us=[q for q in allowed if str(q.get("exchange","")).upper() not in {"KSC","KOE"}]
+    q=(us or allowed or [None])[0]
+    if not q: return None
+    ticker=str(q.get("symbol","")).upper().strip(); exchange=normalize_us_exchange(q.get("exchange",""))
+    if not ticker or not exchange: return None
+    return {"ticker":ticker,"name":str(q.get("shortname") or q.get("longname") or ticker),"exchange":exchange,"asset_type":"직접 검색"}
 
 
 def resolve_manual(value: str, market: str) -> dict | None:
-    value = value.strip()
-    if not value:
+    value=value.strip()
+    if not value: return None
+    if market=="국내":
+        if value.isdigit(): return {"ticker":value.zfill(6),"name":value.zfill(6),"exchange":"KR","asset_type":"직접 검색"}
+        norm=re.sub(r"[^0-9a-z가-힣]","",value.casefold()); mapping=kr_name_map()
+        if norm in mapping:
+            code,name=mapping[norm]; return {"ticker":code,"name":name,"exchange":"KR","asset_type":"직접 검색"}
+        partial=next(((c,n) for k,(c,n) in mapping.items() if norm in k),None)
+        if partial: return {"ticker":partial[0],"name":partial[1],"exchange":"KR","asset_type":"직접 검색"}
         return None
-    if market == "국내":
-        if value.isdigit():
-            return {"ticker": value.zfill(6), "name": value.zfill(6), "exchange": "KR", "asset_type": "직접 검색"}
-        normalized = re.sub(r"[^0-9a-z가-힣]", "", value.casefold())
-        mapping = kr_name_map()
-        exact = mapping.get(normalized)
-        if exact:
-            return {"ticker": exact[0], "name": exact[1], "exchange": "KR", "asset_type": "직접 검색"}
-        partial = next(((code, name) for key, (code, name) in mapping.items() if normalized in key), None)
-        if partial:
-            return {"ticker": partial[0], "name": partial[1], "exchange": "KR", "asset_type": "직접 검색"}
-        return None
-    ticker = re.sub(r"[^A-Z0-9.\-]", "", value.upper())
-    known = next((dict(row) for row in US_UNIVERSE if row["ticker"] == ticker), None)
-    if known:
-        known["asset_type"] = "직접 검색"
-        return known
-    found = yahoo_symbol_search(value)
-    if found:
-        return found
-    if ticker:
-        return {"ticker": ticker, "name": ticker, "exchange": "NASDAQ", "asset_type": "직접 검색"}
-    return None
+    ticker=re.sub(r"[^A-Z0-9.\-]","",value.upper())
+    known=next((dict(r) for r in US_UNIVERSE if r["ticker"]==ticker),None)
+    if known: known["asset_type"]="직접 검색"; return known
+    return yahoo_symbol_search(value)
 
 
 def _load_bundled_sources() -> dict:
-    source_path = Path(__file__).with_name("app.py")
+    source_path=Path(__file__).with_name("app.py")
     if not source_path.exists():
-        development_copy = Path(__file__).resolve().parent.parent / "ymym_stock_scanner_fixed" / "app.py"
-        if development_copy.exists():
-            source_path = development_copy
-    if not source_path.exists():
-        st.error("같은 폴더에 기존 app.py가 필요합니다.")
-        st.stop()
-    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        dev=Path(__file__).resolve().parent.parent/"ymym_stock_scanner_fixed"/"app.py"
+        if dev.exists(): source_path=dev
+    if not source_path.exists(): st.error("같은 폴더에 기존 app.py가 필요합니다."); st.stop()
+    tree=ast.parse(source_path.read_text(encoding="utf-8"))
     for node in tree.body:
-        if isinstance(node, ast.Assign):
-            if any(isinstance(target, ast.Name) and target.id == "_BUNDLED" for target in node.targets):
-                value = ast.literal_eval(node.value)
-                if isinstance(value, dict):
-                    return value
+        if isinstance(node,ast.Assign) and any(isinstance(t,ast.Name) and t.id=="_BUNDLED" for t in node.targets):
+            val=ast.literal_eval(node.value)
+            if isinstance(val,dict): return val
     raise RuntimeError("app.py에서 번들 엔진을 찾지 못했습니다.")
 
-
-_BUNDLED = _load_bundled_sources()
-
+_BUNDLED=_load_bundled_sources()
 
 class _Loader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-    PACKAGES = {"scanner", "utils", "config", "engine", "data", "ui"}
-
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname in _BUNDLED:
-            return importlib.util.spec_from_loader(fullname, self, is_package=False)
-        if fullname in self.PACKAGES:
-            return importlib.util.spec_from_loader(fullname, self, is_package=True)
+    PACKAGES={"scanner","utils","config","engine","data","ui"}
+    def find_spec(self,fullname,path=None,target=None):
+        if fullname in _BUNDLED: return importlib.util.spec_from_loader(fullname,self,is_package=False)
+        if fullname in self.PACKAGES: return importlib.util.spec_from_loader(fullname,self,is_package=True)
         return None
-
-    def create_module(self, spec):
-        return None
-
-    def exec_module(self, module):
-        name = module.__name__
+    def create_module(self,spec): return None
+    def exec_module(self,module):
+        name=module.__name__
         if name in self.PACKAGES:
-            module.__path__ = []
-            module.__package__ = name
-            module.__file__ = str(Path.cwd() / name / "__init__.py")
-            return
-        code = zlib.decompress(base64.b64decode(_BUNDLED[name])).decode("utf-8")
-        module.__file__ = str(Path.cwd().joinpath(*name.split(".")).with_suffix(".py"))
-        module.__package__ = name.rpartition(".")[0]
-        exec(compile(code, module.__file__, "exec"), module.__dict__)
+            module.__path__=[]; module.__package__=name; module.__file__=str(Path.cwd()/name/"__init__.py"); return
+        code=zlib.decompress(base64.b64decode(_BUNDLED[name])).decode("utf-8")
+        module.__file__=str(Path.cwd().joinpath(*name.split(".")).with_suffix(".py")); module.__package__=name.rpartition(".")[0]
+        exec(compile(code,module.__file__,"exec"),module.__dict__)
 
-
-sys.meta_path.insert(0, _Loader())
-
-from scanner.kis_engine import (  # noqa: E402
-    KISUnifiedScanner,
-    apply_mode_policy,
-    finalize_trade_item,
-)
-
-st.set_page_config(page_title="초단타 VWAP 타점", page_icon="⚡", layout="wide")
-st.markdown("""
-<style>
-  .block-container {padding-top: 1rem; max-width: 1500px;}
-  [data-testid="stMetric"] {background:#f7f8fb;border:1px solid #e6e8ee;border-radius:12px;padding:8px;}
-  [data-testid="stMetricValue"] {font-size:clamp(1.25rem,2.2vw,2.15rem) !important; line-height:1.15; overflow-wrap:anywhere;}
-  [data-testid="stMetricLabel"] {font-size:.88rem !important;}
-  .trade-action {border-radius:14px;padding:15px 18px;margin:.45rem 0 .8rem 0;border:2px solid #d8dce6;background:#f7f8fb;}
-  .trade-action.buy {border-color:#19a15f;background:#ecfbf3}.trade-action.sell {border-color:#e45656;background:#fff0f0}
-  .trade-action.wait {border-color:#dcae32;background:#fff9e8}.trade-action.stop {border-color:#b93838;background:#ffe9e9}
-  .trade-action h2 {font-size:1.45rem;margin:0 0 .35rem 0}.trade-action p {font-size:1rem;margin:.12rem 0}
-  .forecast-card {background:#f7f8fb;border:1px solid #e6e8ee;border-radius:12px;padding:12px;min-height:118px;}
-  .forecast-card .title {font-size:.9rem;line-height:1.25;margin-bottom:9px;}
-  .forecast-card .price {font-size:1.45rem;font-weight:650;line-height:1.15;white-space:normal;overflow-wrap:anywhere;}
-  .forecast-card .basis {font-size:.78rem;color:#777;margin-top:8px;line-height:1.25;}
-  @media(max-width:700px){
-    .block-container{padding:.45rem}
-    [data-testid="stMetric"]{padding:6px}
-    [data-testid="stMetricValue"]{font-size:1.22rem !important}
-    [data-testid="stMetricLabel"]{font-size:.76rem !important}
-    .trade-action h2{font-size:1.2rem}.trade-action p{font-size:.9rem}
-    .forecast-card{padding:9px;min-height:105px}.forecast-card .price{font-size:1.05rem}.forecast-card .title{font-size:.76rem}
-  }
-</style>
-""", unsafe_allow_html=True)
-
+if not any(isinstance(x,_Loader) for x in sys.meta_path): sys.meta_path.insert(0,_Loader())
+from scanner.kis_engine import KISUnifiedScanner,apply_mode_policy,finalize_trade_item  # noqa:E402
 
 @st.cache_resource
-def scanner() -> KISUnifiedScanner:
-    return KISUnifiedScanner()
+def scanner(): return KISUnifiedScanner()
 
-
-def fmt(value) -> str:
+def fmt(value):
     try:
-        number = float(value)
-        if number >= 1000:
-            return f"{number:,.0f}"
-        if number >= 10:
-            return f"{number:,.2f}"
-        return f"{number:,.4f}"
-    except Exception:
-        return "-"
+        x=float(value)
+        if not math.isfinite(x): return "-"
+        if x>=1000: return f"{x:,.0f}"
+        if x>=10: return f"{x:,.2f}"
+        return f"{x:,.4f}"
+    except Exception: return "-"
 
 
-def verdict_text(item: dict) -> tuple[str, str]:
-    verdict = str(item.get("chart_verdict", "WAIT"))
-    if verdict == "BUY_READY" and item.get("entry_checks_passed"):
-        return "🟢 매수 검토", "success"
-    if verdict == "BUY_READY":
-        return "🟡 차트 매수 준비·위험확인 필요", "warning"
-    if verdict == "NO_ENTRY":
-        return "🔴 매수 금지·매도 검토", "error"
-    return "🟡 대기", "warning"
+def verified_us_change(quote:dict,fallback_price:float=0.0):
+    price=float(quote.get("price",fallback_price) or fallback_price or 0)
+    previous=float(quote.get("previous",quote.get("previous_close",quote.get("base",0))) or 0)
+    raw=float(quote.get("change",quote.get("change_percent",0)) or 0)
+    if price>0 and previous>0: return price,previous,round((price/previous-1)*100,4),"현재가·전일종가 재계산"
+    return price,previous,raw,"KIS 원본 등락률"
 
 
-def forecast_label(percent: float) -> str:
-    if percent >= 0.35:
-        return "상승 우세"
-    if percent <= -0.35:
-        return "하락 위험"
-    return "횡보·불확실"
-
-
-def strategy_consensus(item: dict) -> tuple[list[dict], int, int, int]:
-    """Major intraday methods vote independently; contradictory methods stay visible."""
-    price = float(item.get("price", 0) or 0)
-    vwap = float(item.get("vwap", 0) or 0)
-    ema9 = float(item.get("ema9", 0) or 0)
-    ema20 = float(item.get("ema20", 0) or 0)
-    rsi = float(item.get("rsi", 50) or 50)
-    macd = float(item.get("macd_histogram", 0) or 0)
-    stoch = float(item.get("stochastic_k", 50) or 50)
-    rvol = float(item.get("rvol", 0) or 0)
-    f5 = float(item.get("forecast_5m", 0) or 0)
-    f10 = float(item.get("forecast_10m", 0) or 0)
-    f30 = float(item.get("forecast_30m", 0) or 0)
-    orderbook = str(item.get("orderbook_signal", ""))
-    obv = str(item.get("obv_trend", ""))
-    patterns = " ".join(map(str, item.get("pattern_signals", []) or []))
-    trend_text = " ".join(str(item.get(key, "")) for key in ("trend_5m", "trend_15m", "trend_30m"))
-
-    votes = []
-    def add(name: str, buy: bool, sell: bool, reason: str):
-        signal = "매수" if buy and not sell else "매도" if sell and not buy else "대기"
-        votes.append({"기법": name, "판정": signal, "근거": reason})
-
-    add("VWAP 추세", price > vwap > 0, 0 < price < vwap, f"현재가 {('위' if price > vwap else '아래')}·VWAP {fmt(vwap)}")
-    add("EMA 추세", ema9 > ema20 > 0 and price >= ema9, 0 < ema9 < ema20 and price <= ema9, f"EMA9 {fmt(ema9)} / EMA20 {fmt(ema20)}")
-    add("MACD 모멘텀", macd > 0, macd < 0, f"히스토그램 {macd:+.4f}")
-    add("RSI·스토캐스틱", 42 <= rsi <= 68 and stoch < 80, rsi >= 75 or stoch >= 90, f"RSI {rsi:.1f} / %K {stoch:.1f}")
-    add("거래량·RVOL", rvol >= 1.5 and f5 > 0, rvol < 0.7 or (rvol >= 1.5 and f5 < 0), f"RVOL {rvol:.1f}배")
-    add("OBV 수급", "상승" in obv, "하락" in obv, obv or "미확인")
-    add("호가·체결", "매수" in orderbook, "매도" in orderbook, orderbook or "미확인")
-    add("캔들 패턴", any(x in patterns for x in ("상승", "망치", "돌파", "장악")), any(x in patterns for x in ("하락", "유성", "윗꼬리")), patterns or "뚜렷한 패턴 없음")
-    add("다중 시간봉", all(x > 0 for x in (f5, f10, f30)), any(x < 0 for x in (f5, f10, f30)), f"5분 {f5:+.2f}% / 10분 {f10:+.2f}% / 30분 {f30:+.2f}%")
-    add("추세 정렬", trend_text.count("상승") >= 2, trend_text.count("하락") >= 2, trend_text or "추세 계산 중")
-    buys = sum(row["판정"] == "매수" for row in votes)
-    sells = sum(row["판정"] == "매도" for row in votes)
-    waits = len(votes) - buys - sells
-    return votes, buys, sells, waits
-
-
-def data_quality_gate(item: dict, market: str) -> tuple[list[dict], bool, float | None]:
-    price = float(item.get("price", 0) or 0)
-    bars = int(item.get("intraday_bar_count", 0) or len(item.get("chart_close_1m", []) or []))
-    vwap = float(item.get("vwap", 0) or 0)
-    ema9 = float(item.get("ema9", 0) or 0)
-    rvol = float(item.get("rvol", 0) or 0)
-    bid = float(item.get("best_bid", 0) or 0)
-    ask = float(item.get("best_ask", 0) or 0)
-    spread = ((ask - bid) / ((ask + bid) / 2) * 100) if ask > 0 and bid > 0 and ask >= bid else None
-    last_bar_age = None
+def normalize_us_item(item:dict,row:dict|None=None):
+    if not item: return item
+    ticker=str((row or {}).get("ticker") or item.get("ticker") or "").upper(); exchange=str((row or {}).get("exchange") or item.get("exchange") or "")
+    if not ticker or not exchange: return item
     try:
-        times = item.get("chart_time_1m", []) or []
-        last_bar = pd.Timestamp(pd.to_datetime(times[-1]))
-        # KIS may return either timezone-aware timestamps or naive Korean
-        # exchange timestamps. Treating a naive KST value as UTC made stale
-        # bars look fresh for nine hours.
-        if last_bar.tzinfo is None:
-            last_bar = last_bar.tz_localize(KST)
-        last_bar = last_bar.tz_convert("UTC")
-        last_bar_age = max(0.0, (pd.Timestamp.now(tz="UTC") - last_bar).total_seconds())
-    except Exception:
-        pass
-    checks = [
-        {"검문": "현재가", "통과": price > 0, "내용": fmt(price)},
-        {"검문": "1분봉 수", "통과": bars >= 20, "내용": f"{bars}개"},
-        {"검문": "VWAP·EMA", "통과": vwap > 0 and ema9 > 0, "내용": f"VWAP {fmt(vwap)} / EMA9 {fmt(ema9)}"},
-        {"검문": "분봉 출처", "통과": not bool(item.get("intraday_fallback")), "내용": str(item.get("intraday_source", "미확인"))},
-        {"검문": "마지막 분봉 시각", "통과": last_bar_age is not None and last_bar_age <= 180,
-         "내용": f"{last_bar_age:.0f}초 전" if last_bar_age is not None else "시각 없음"},
-        {"검문": "RVOL 정상범위", "통과": 0.05 <= rvol <= 20, "내용": f"{rvol:.1f}배"},
-        {"검문": "실시간 호가", "통과": spread is not None, "내용": f"{spread:.3f}%" if spread is not None else "미수신"},
-    ]
-    max_spread = 0.35 if "레버리지" in str(item.get("asset_type", "")) else 0.25
-    if spread is not None:
-        checks.append({"검문": "스프레드", "통과": spread <= max_spread, "내용": f"기준 {max_spread:.2f}% 이하"})
-    # Only chart-critical evidence can make the whole analysis unavailable.
-    # KIS occasionally omits an order-book snapshot and RVOL can be distorted
-    # early in a session; those remain visible warnings but must not erase a
-    # valid current price, fresh one-minute bars, VWAP and EMA analysis.
-    critical_checks = checks[:5]
-    return checks, all(bool(row["통과"]) for row in critical_checks), spread
-
-
-def market_regime(item: dict) -> tuple[str, str]:
-    price = float(item.get("price", 0) or 0)
-    vwap = float(item.get("vwap", 0) or 0)
-    ema9 = float(item.get("ema9", 0) or 0)
-    ema20 = float(item.get("ema20", 0) or 0)
-    rvol = float(item.get("rvol", 0) or 0)
-    if rvol >= 3:
-        return "변동성 급증장", "돌파·호가·거래량 기법 우선"
-    if price > vwap > 0 and ema9 > ema20 > 0:
-        return "상승 추세장", "눌림목·VWAP 지지·추세추종 우선"
-    if 0 < price < vwap and 0 < ema9 < ema20:
-        return "하락 추세장", "신규 매수 금지·반등 확인 우선"
-    return "횡보장", "VWAP 평균회귀·박스 돌파 확인 우선"
-
-
-def weighted_strategy_score(rows: list[dict], regime: str) -> tuple[float, float]:
-    weights = {row["기법"]: 1.0 for row in rows}
-    if regime == "상승 추세장":
-        for name in ("VWAP 추세", "EMA 추세", "MACD 모멘텀", "다중 시간봉", "추세 정렬"):
-            weights[name] = 1.6
-    elif regime == "횡보장":
-        for name in ("VWAP 추세", "RSI·스토캐스틱", "캔들 패턴", "호가·체결"):
-            weights[name] = 1.6
-    elif regime == "변동성 급증장":
-        for name in ("거래량·RVOL", "호가·체결", "VWAP 추세", "다중 시간봉"):
-            weights[name] = 1.8
-    elif regime == "하락 추세장":
-        for name in ("VWAP 추세", "EMA 추세", "다중 시간봉", "추세 정렬"):
-            weights[name] = 2.0
-    total = sum(weights.values()) or 1.0
-    signed = sum(weights[row["기법"]] * (1 if row["판정"] == "매수" else -1 if row["판정"] == "매도" else 0) for row in rows)
-    buy_weight = sum(weights[row["기법"]] for row in rows if row["판정"] == "매수")
-    return round(signed / total * 100, 1), round(buy_weight / total * 100, 1)
-
-
-@st.cache_data(ttl=20, show_spinner=False)
-def benchmark_context(market: str, ticker: str) -> dict:
-    try:
-        if market == "미국":
-            mapping = {
-                "SOXL": ("SOXX", "NASDAQ", 1), "SOXS": ("SOXX", "NASDAQ", -1),
-                "TQQQ": ("QQQ", "NASDAQ", 1), "SQQQ": ("QQQ", "NASDAQ", -1),
-            }
-            bench, exchange, direction = mapping.get(ticker, ("QQQ", "NASDAQ", 1))
-            quote = scanner().client.us_quote(bench, exchange)
-            _, _, verified_change, _ = verified_us_change(quote)
-            change = verified_change * direction
-            bars = scanner().client.us_intraday(bench, exchange, minutes=1)
-            intraday = ((float(bars["close"].iloc[-1]) / float(bars["close"].iloc[-6]) - 1) * 100 * direction) if len(bars) >= 6 else 0.0
-            return {"name": bench, "change": change, "intraday": intraday, "confirmed": len(bars) >= 20}
-        mapping = {
-            "488080": [("005930", 0.5), ("000660", 0.5)],
-            "396500": [("005930", 0.5), ("000660", 0.5)],
-        }
-        members = mapping.get(ticker, [("069500", 1.0)])
-        change = 0.0
-        intraday = 0.0
-        enough = True
-        for code, weight in members:
-            change += float(scanner().client.kr_quote(code).get("change", 0) or 0) * weight
-            bars = scanner().client.kr_intraday(code)
-            enough = enough and len(bars) >= 20
-            if len(bars) >= 6:
-                intraday += (float(bars["close"].iloc[-1]) / float(bars["close"].iloc[-6]) - 1) * 100 * weight
-        return {"name": "+".join(code for code, _ in members), "change": change, "intraday": intraday, "confirmed": enough}
-    except Exception as error:
-        return {"name": "시장지표", "change": 0.0, "confirmed": False, "error": type(error).__name__}
-
-
-def verified_us_change(quote: dict, fallback_price: float = 0.0) -> tuple[float, float, float, str]:
-    """Return a cross-checked US price/change instead of trusting KIS ``rate``.
-
-    Some overseas quote responses have exposed the previous close in the field
-    that older response schemas labelled ``rate``.  Treating that number as a
-    percentage produced values such as SOXL +132.71%.  The previous close and
-    current price are independent fields, so their arithmetic return is the
-    authoritative value whenever both are present.
-    """
-    price = float(quote.get("price", fallback_price) or fallback_price or 0)
-    previous = float(
-        quote.get("previous", quote.get("previous_close", quote.get("base", 0))) or 0
-    )
-    raw_change = float(quote.get("change", quote.get("change_percent", 0)) or 0)
-    if price > 0 and previous > 0:
-        calculated = (price / previous - 1.0) * 100.0
-        return price, previous, round(calculated, 4), "현재가·전일종가 재계산"
-    return price, previous, raw_change, "KIS 원본 등락률(전일종가 미수신)"
-
-
-def normalize_us_item(item: dict, row: dict | None = None) -> dict:
-    """Apply the same verified US change to cards, scores and candidate filters."""
-    if not item:
-        return item
-    ticker = str((row or {}).get("ticker") or item.get("ticker") or "").upper()
-    exchange = str((row or {}).get("exchange") or item.get("exchange") or "NASDAQ")
-    if not ticker:
-        return item
-    try:
-        quote = scanner().client.us_quote(ticker, exchange)
-        price, previous, change, source = verified_us_change(
-            quote, float(item.get("price", 0) or 0)
-        )
-        if price > 0:
-            item["price"] = price
-        item["previous_close"] = previous
-        item["raw_kis_change_percent"] = float(
-            quote.get("change", quote.get("change_percent", 0)) or 0
-        )
-        item["change_percent"] = change
-        item["screen_change"] = change
-        item["change_validation_source"] = source
-    except Exception as error:
-        item["change_validation_error"] = f"{type(error).__name__}: {error}"
+        q=scanner().client.us_quote(ticker,exchange); price,prev,change,source=verified_us_change(q,float(item.get("price",0) or 0))
+        if price>0: item["price"]=price
+        item.update(previous_close=prev,change_percent=change,screen_change=change,change_validation_source=source)
+    except Exception as e: item["change_validation_error"]=f"{type(e).__name__}: {e}"
     return item
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def live_filtered_universe(market: str) -> list[dict]:
-    """거래소 전체 순위에서 상승·유동성 후보를 만든다.
+def data_quality_gate(item:dict,market:str):
+    price=float(item.get("price",0) or 0); bars=int(item.get("intraday_bar_count",0) or len(item.get("chart_close_1m",[]) or []))
+    vwap=float(item.get("vwap",0) or 0); ema9=float(item.get("ema9",0) or 0); rvol=float(item.get("rvol",0) or 0)
+    bid=float(item.get("best_bid",0) or 0); ask=float(item.get("best_ask",0) or 0)
+    spread=((ask-bid)/((ask+bid)/2)*100) if ask>0 and bid>0 and ask>=bid else None
+    last_bar_age=None
+    try:
+        times=item.get("chart_time_1m",[]) or []; last=pd.Timestamp(pd.to_datetime(times[-1]))
+        if last.tzinfo is None: last=last.tz_localize(KST if market=="국내" else ET)
+        last=last.tz_convert("UTC"); last_bar_age=max(0.0,(pd.Timestamp.now(tz="UTC")-last).total_seconds())
+    except Exception: pass
+    checks=[
+        {"검문":"현재가","통과":price>0,"내용":fmt(price)},
+        {"검문":"1분봉 수","통과":bars>=20,"내용":f"{bars}개"},
+        {"검문":"VWAP·EMA","통과":vwap>0 and ema9>0,"내용":f"VWAP {fmt(vwap)} / EMA9 {fmt(ema9)}"},
+        {"검문":"분봉 출처","통과":not bool(item.get("intraday_fallback")),"내용":str(item.get("intraday_source","미확인"))},
+        {"검문":"마지막 분봉 시각","통과":last_bar_age is not None and last_bar_age<=180,"내용":f"{last_bar_age:.0f}초 전" if last_bar_age is not None else "시각 없음"},
+        {"검문":"RVOL 정상범위","통과":0.05<=rvol<=20,"내용":f"{rvol:.1f}배"},
+        {"검문":"실시간 호가","통과":spread is not None,"내용":f"{spread:.3f}%" if spread is not None else "미수신"},
+    ]
+    max_spread=0.35 if "레버리지" in str(item.get("asset_type","")) else 0.25
+    if spread is not None: checks.append({"검문":"스프레드","통과":spread<=max_spread,"내용":f"기준 {max_spread:.2f}% 이하"})
+    return checks,all(bool(r["통과"]) for r in checks[:5]),spread
 
-    종목마다 현재가를 순차 조회하지 않는다. 한국은 KIS 거래소 순위,
-    미국은 Yahoo/TradingView/Nasdaq의 전시장 스크리너 결과를 합친 뒤
-    화면에 보여줄 소수만 남긴다. 고정 목록은 모든 순위 소스가 실패했을
-    때만 쓰는 장애 대비용이다.
-    """
-    source = KR_UNIVERSE if market == "국내" else US_UNIVERSE
-    limit = 300000 if market == "국내" else 200
-    accepted: list[dict] = []
-    ranked_rows: dict[str, dict] = {}
-    modes = (
-        ("국내 돌파", "국내 거래대금 급증")
-        if market == "국내"
-        else ("미국 30분 1% 타점", "미국 급등주")
+
+def _dedupe_price_levels(levels:list[float],tol=0.08):
+    result=[]
+    for level in sorted(float(x) for x in levels if float(x or 0)>0):
+        if not result: result.append(level); continue
+        if abs(level/result[-1]-1)*100<=tol: result[-1]=max(result[-1],level)
+        else: result.append(level)
+    return result
+
+
+def _num(value, default=0.0):
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else default
+    except Exception:
+        return default
+
+def _numeric_list(item, key):
+    values = item.get(key, []) or []
+    result = []
+    for value in values:
+        number = _num(value, float("nan"))
+        if math.isfinite(number):
+            result.append(number)
+    return result
+
+def _dedupe_levels(levels, tolerance_pct=0.06):
+    clean = sorted(x for x in (_num(v) for v in levels) if x > 0)
+    result = []
+    for level in clean:
+        if not result:
+            result.append(level)
+            continue
+        if abs(level / result[-1] - 1.0) * 100 <= tolerance_pct:
+            result[-1] = max(result[-1], level)
+        else:
+            result.append(level)
+    return result
+
+def _intraday_ohlcv(item):
+    opens = _numeric_list(item, "chart_open_1m")
+    highs = _numeric_list(item, "chart_high_1m")
+    lows = _numeric_list(item, "chart_low_1m")
+    closes = _numeric_list(item, "chart_close_1m")
+    raw_volumes = item.get("chart_volume_1m", []) or []
+    n = min(len(opens), len(highs), len(lows), len(closes))
+    if n < 12:
+        return pd.DataFrame()
+
+    opens, highs, lows, closes = opens[-n:], highs[-n:], lows[-n:], closes[-n:]
+    volumes = [_num(v) for v in raw_volumes[-n:]]
+    if len(volumes) < n:
+        volumes = [0.0] * (n - len(volumes)) + volumes
+
+    times = list(item.get("chart_time_1m", []) or [])
+    if len(times) >= n:
+        times = times[-n:]
+    else:
+        times = list(range(n))
+
+    frame = pd.DataFrame({
+        "time": times,
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+        "volume": volumes,
+    })
+    frame = frame[
+        (frame["open"] > 0)
+        & (frame["high"] > 0)
+        & (frame["low"] > 0)
+        & (frame["close"] > 0)
+        & (frame["high"] >= frame[["open", "close", "low"]].max(axis=1))
+        & (frame["low"] <= frame[["open", "close", "high"]].min(axis=1))
+    ].copy()
+    if frame.empty:
+        return frame
+
+    # 장/세션 사이의 큰 공백이 있으면 마지막 연속 분봉 구간만 사용해
+    # 전일 저항이 당일 초단타 목표에 섞이는 것을 줄인다.
+    try:
+        parsed = pd.to_datetime(frame["time"], errors="coerce")
+        if parsed.notna().sum() >= max(12, len(frame) // 2):
+            frame["_parsed_time"] = parsed
+            frame = frame.sort_values("_parsed_time").reset_index(drop=True)
+            gaps = frame["_parsed_time"].diff().dt.total_seconds().fillna(0)
+            gap_rows = frame.index[gaps > 45 * 60].tolist()
+            if gap_rows:
+                frame = frame.iloc[gap_rows[-1]:].copy()
+    except Exception:
+        pass
+
+    return frame.tail(180).reset_index(drop=True)
+
+def _atr_and_range(frame):
+    if frame.empty:
+        return 0.0, 0.0
+    prev = frame["close"].shift(1)
+    tr = pd.concat(
+        [
+            frame["high"] - frame["low"],
+            (frame["high"] - prev).abs(),
+            (frame["low"] - prev).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr14 = _num(tr.tail(14).mean())
+    median_range = _num((frame["high"] - frame["low"]).tail(20).median())
+    return atr14, median_range
+
+def _swing_levels(values, kind="high"):
+    levels = []
+    if len(values) < 7:
+        return levels
+    for i in range(2, len(values) - 2):
+        window = values[i - 2:i + 3]
+        value = values[i]
+        if kind == "high" and value >= max(window):
+            levels.append(value)
+        elif kind == "low" and value <= min(window):
+            levels.append(value)
+    return _dedupe_levels(levels)
+
+def apply_repeat_scalp_overlay(item, market_code):
+    """기존 엔진 결과를 보존하면서 반복단타 전용 차트 레벨만 추가한다."""
+    if not isinstance(item, dict):
+        return item
+    item = dict(item)
+    price = _num(item.get("price"))
+    frame = _intraday_ohlcv(item)
+    if price <= 0 or len(frame) < 20:
+        item.update(
+            repeat_chart_valid=False,
+            repeat_chart_reason="현재가 또는 연속 1분봉 20개 미만",
+            repeat_candidate=False,
+        )
+        return item
+
+    highs = frame["high"].tolist()
+    lows = frame["low"].tolist()
+    closes = frame["close"].tolist()
+    volumes = frame["volume"].tolist()
+    atr14, median_range = _atr_and_range(frame)
+    if atr14 <= 0:
+        atr14 = median_range
+    if median_range <= 0:
+        median_range = atr14
+
+    vwap = _num(item.get("vwap"))
+    ema9 = _num(item.get("ema9"))
+    ema20 = _num(item.get("ema20"))
+    rsi = _num(item.get("rsi"), 50.0)
+    macd = _num(item.get("macd_histogram"))
+    rvol = _num(item.get("rvol"))
+    f10 = _num(item.get("forecast_10m"))
+    f30 = _num(item.get("forecast_30m"))
+
+    bid = _num(item.get("best_bid"))
+    ask = _num(item.get("best_ask"))
+    spread = ((ask - bid) / ((ask + bid) / 2) * 100) if ask >= bid > 0 else None
+    spread_limit = 0.35 if "레버리지" in str(item.get("asset_type", "")) else 0.25
+    quality_checks = {
+        "분봉 실데이터": not bool(item.get("intraday_fallback")),
+        "VWAP 확인": vwap > 0,
+        "EMA9·20 확인": ema9 > 0 and ema20 > 0,
+        "호가 스프레드": spread is None or spread <= spread_limit,
+    }
+    quality_pass = all(quality_checks.values())
+
+    ret5 = (closes[-1] / closes[-6] - 1) * 100 if len(closes) >= 6 and closes[-6] > 0 else 0.0
+    ret15 = (closes[-1] / closes[-16] - 1) * 100 if len(closes) >= 16 and closes[-16] > 0 else 0.0
+    ret30 = (closes[-1] / closes[-31] - 1) * 100 if len(closes) >= 31 and closes[-31] > 0 else 0.0
+
+    recent_hi = max(highs[-6:])
+    previous_hi = max(highs[-12:-6]) if len(highs) >= 12 else recent_hi
+    recent_lo = min(lows[-6:])
+    previous_lo = min(lows[-12:-6]) if len(lows) >= 12 else recent_lo
+
+    up_volume = down_volume = 0.0
+    start = max(1, len(closes) - 20)
+    for i in range(start, len(closes)):
+        vol = volumes[i] if i < len(volumes) else 0.0
+        if closes[i] > closes[i - 1]:
+            up_volume += vol
+        elif closes[i] < closes[i - 1]:
+            down_volume += vol
+    volume_ratio = up_volume / down_volume if down_volume > 0 else (2.0 if up_volume > 0 else 0.0)
+
+    trend_checks = {
+        "VWAP 위": price > vwap > 0,
+        "EMA 정배열": price >= ema9 >= ema20 > 0,
+        "5분 상승": ret5 > 0,
+        "15분 상승": ret15 >= 0,
+        "30분 상승": ret30 >= -0.15,
+        "고점 상승": recent_hi >= previous_hi,
+        "저점 상승": recent_lo >= previous_lo,
+        "상승봉 거래량 우세": volume_ratio >= 1.05,
+        "RSI 과열 아님": rsi < (82 if market_code == "US" else 78),
+        "10분 전망 급락 아님": f10 > -0.40,
+    }
+    trend_score = sum(bool(v) for v in trend_checks.values())
+
+    swing_lows = _swing_levels(lows, "low")
+    support_candidates = [(x, "1분봉 스윙 저점") for x in swing_lows if 0 < x < price]
+    recent_low = min(lows[-20:])
+    if 0 < recent_low < price:
+        support_candidates.append((recent_low, "최근 20분 저점"))
+    if 0 < vwap < price:
+        support_candidates.append((vwap, "VWAP"))
+    if 0 < ema9 < price:
+        support_candidates.append((ema9, "EMA9"))
+    if 0 < ema20 < price:
+        support_candidates.append((ema20, "EMA20"))
+
+    if not support_candidates:
+        item.update(
+            repeat_chart_valid=False,
+            repeat_chart_reason="현재가 아래 차트 지지선 미확인",
+            repeat_candidate=False,
+            repeat_trend_score=trend_score,
+            repeat_trend_checks=trend_checks,
+        )
+        return item
+
+    support, support_basis = max(support_candidates, key=lambda x: x[0])
+
+    swing_highs = _swing_levels(highs, "high")
+    # 반복단타 1차 목표는 지지선 대비 최소 +0.5% 공간이 있는 첫 의미 있는 저항만 사용한다.
+    min_repeat_target = support * 1.005
+    resistance_candidates = [x for x in swing_highs if x > price and x >= min_repeat_target]
+    box_high = max(highs[-30:])
+    box_low = min(lows[-30:])
+    box_width = max(0.0, box_high - box_low)
+    prior_high = max(highs[-30:-1]) if len(highs) >= 31 else max(highs[:-1])
+    for level in (box_high, prior_high):
+        if level > price and level >= min_repeat_target:
+            resistance_candidates.append(level)
+    resistance_candidates = _dedupe_levels(resistance_candidates)
+
+    target1 = 0.0
+    target2 = 0.0
+    target1_basis = ""
+    target2_basis = ""
+    if resistance_candidates:
+        target1 = resistance_candidates[0]
+        target1_basis = "현재가 위 가장 가까운 실제 1분봉 저항"
+        higher = [x for x in resistance_candidates[1:] if x > target1 * 1.0005]
+        if higher:
+            target2 = higher[0]
+            target2_basis = "1차 위 다음 실제 1분봉 저항"
+    elif trend_score >= 7:
+        # 신저가/신고가 돌파로 실제 저항이 아직 없을 때만 최근 ATR·봉폭을 투영한다.
+        projection1 = max(atr14 * 1.25, median_range * 1.50)
+        if box_width > 0:
+            projection1 = min(projection1, max(atr14 * 2.20, box_width * 0.50))
+        target1 = price + projection1
+        target1_basis = "신고가 구간 · 최근 1분봉 ATR/박스폭 투영"
+
+    if target1 > price and target2 <= target1 and trend_score >= 6:
+        projection2 = max(atr14 * 1.35, median_range * 1.75, (target1 - price) * 0.80)
+        if box_width > 0:
+            projection2 = min(projection2, max(atr14 * 2.40, box_width * 0.60))
+        target2 = target1 + projection2
+        target2_basis = "다음 저항 미형성 · ATR/최근 박스폭 보수 투영"
+
+    if not (0 < support < price < target1):
+        item.update(
+            repeat_chart_valid=False,
+            repeat_chart_reason="지지 < 현재가 < 1차 목표 가격순서 불충족",
+            repeat_candidate=False,
+            repeat_support=support,
+            repeat_trend_score=trend_score,
+            repeat_trend_checks=trend_checks,
+        )
+        return item
+
+    stop_buffer = max(atr14 * 0.35, median_range * 0.45)
+    if stop_buffer <= 0:
+        stop_buffer = support * 0.0025
+    stop_buffer = min(stop_buffer, support * 0.0060)
+    stop = max(0.0, support - stop_buffer)
+    entry = support
+
+    repeat_width = (target1 / entry - 1) * 100 if target1 > entry > 0 else 0.0
+    t1_from_current = (target1 / price - 1) * 100
+    t2_from_current = (target2 / price - 1) * 100 if target2 > price else 0.0
+    extra_after_t1 = (target2 / target1 - 1) * 100 if target2 > target1 > 0 else 0.0
+    risk = entry - stop
+    reward = target1 - entry
+    repeat_rr = reward / risk if risk > 0 else 0.0
+
+    continuation_checks = {
+        "2차 차트 목표 존재": target2 > target1,
+        "VWAP 위 유지": price > vwap > 0,
+        "EMA 정배열": ema9 >= ema20 > 0,
+        "15분 실제 상승": ret15 > 0,
+        "30분 약세 아님": ret30 >= -0.10,
+        "상승봉 거래량 우세": volume_ratio >= 1.05,
+        "MACD 비약세": macd >= 0,
+        "RVOL 확보": rvol >= 0.80,
+        "10분 전망 약세 아님": f10 > -0.25,
+        "30분 전망 약세 아님": f30 > -0.35,
+    }
+    continuation_score = sum(bool(v) for v in continuation_checks.values())
+    if target2 <= target1:
+        continuation_state = "NONE"
+        continuation_label = "⚪ 2차 목표 미확인"
+    elif continuation_score >= 8:
+        continuation_state = "HIGH"
+        continuation_label = "🟢 추가상승 가능성 높음"
+    elif continuation_score >= 6:
+        continuation_state = "MID"
+        continuation_label = "🟡 추가상승 가능·1차 후 확인"
+    else:
+        continuation_state = "LOW"
+        continuation_label = "🔴 1차 부근 상승 제한 가능"
+
+    near = max(median_range * 0.75, atr14 * 0.35)
+    if price <= support:
+        repeat_state = "BREAKDOWN"
+        repeat_label = "🔴 지지 이탈"
+    elif price >= target1 - near:
+        repeat_state = "TAKE_PROFIT"
+        repeat_label = "🟠 1차 매도구간 근접"
+    elif price <= support + near and trend_score >= 6:
+        repeat_state = "BUY_ZONE"
+        repeat_label = "🟢 반복 매수구간 근접"
+    elif trend_score >= 6:
+        repeat_state = "WAIT_PULLBACK"
+        repeat_label = "🟡 지지 눌림 대기"
+    else:
+        repeat_state = "WAIT_TREND"
+        repeat_label = "⚪ 추세 재확인"
+
+    preferred = 0.50 <= repeat_width <= 1.50
+    candidate = bool(
+        preferred
+        and trend_score >= 6
+        and repeat_state not in {"BREAKDOWN", "TAKE_PROFIT"}
+        and repeat_rr >= 1.20
+        and quality_pass
     )
+
+    item.update(
+        repeat_chart_valid=True,
+        repeat_chart_reason="연속 1분봉 지지·저항/ATR 계산 완료",
+        repeat_candidate=candidate,
+        repeat_entry=entry,
+        repeat_support=support,
+        repeat_stop=stop,
+        repeat_target1=target1,
+        repeat_target2=target2,
+        repeat_width_percent=repeat_width,
+        repeat_target1_current_upside=t1_from_current,
+        repeat_target2_current_upside=t2_from_current,
+        repeat_extra_after_target1=extra_after_t1,
+        repeat_risk_reward=repeat_rr,
+        repeat_state=repeat_state,
+        repeat_label=repeat_label,
+        repeat_trend_score=trend_score,
+        repeat_trend_checks=trend_checks,
+        repeat_support_basis=support_basis,
+        repeat_target1_basis=target1_basis,
+        repeat_target2_basis=target2_basis,
+        repeat_atr14=atr14,
+        repeat_median_range=median_range,
+        repeat_volume_ratio=volume_ratio,
+        repeat_continuation_state=continuation_state,
+        repeat_continuation_label=continuation_label,
+        repeat_continuation_score=continuation_score,
+        repeat_continuation_checks=continuation_checks,
+        repeat_preferred_range=preferred,
+        repeat_quality_pass=quality_pass,
+        repeat_quality_checks=quality_checks,
+        repeat_spread_percent=spread,
+        repeat_spread_limit=spread_limit,
+        repeat_chart_box_low=box_low,
+        repeat_chart_box_high=box_high,
+    )
+    return item
+
+def _adapt_repeat_overlay_for_ui(item: dict) -> dict:
+    """반복단타 전용 계산값을 기존 초단타 화면 필드와 동기화한다."""
+    if not isinstance(item, dict):
+        return item
+    width = _num(item.get("repeat_width_percent"))
+    state = str(item.get("repeat_state") or "WAIT_TREND")
+    if width < 0.50 and item.get("repeat_chart_valid"):
+        legacy_state = "RANGE_TOO_NARROW"
+    elif width > 1.50 and item.get("repeat_chart_valid"):
+        legacy_state = "RANGE_TOO_WIDE"
+    else:
+        legacy_state = {
+            "BUY_ZONE": "BUY_PULLBACK",
+            "WAIT_PULLBACK": "WAIT_PULLBACK",
+            "TAKE_PROFIT": "TAKE_PROFIT",
+            "BREAKDOWN": "EXIT",
+            "WAIT_TREND": "WAIT_TREND",
+        }.get(state, "WAIT_TREND")
+
+    cont = str(item.get("repeat_continuation_state") or "NONE")
+    legacy_cont = {
+        "HIGH": "STRONG", "MID": "WATCH", "LOW": "LIMITED", "NONE": "NO_TARGET2"
+    }.get(cont, "NO_TARGET2")
+
+    entry = _num(item.get("repeat_entry"))
+    support = _num(item.get("repeat_support"))
+    stop = _num(item.get("repeat_stop"))
+    target1 = _num(item.get("repeat_target1"))
+    target2 = _num(item.get("repeat_target2"))
+    extra = _num(item.get("repeat_extra_after_target1"))
+    rr = _num(item.get("repeat_risk_reward"))
+    trend_score = int(_num(item.get("repeat_trend_score")))
+
+    item.update(
+        structural_entry=entry,
+        structural_support=support,
+        structural_target=target1,
+        structural_target1=target1,
+        structural_target2=target2,
+        stop_loss=stop,
+        target1_upside_percent=_num(item.get("repeat_target1_current_upside")),
+        target2_upside_percent=_num(item.get("repeat_target2_current_upside")),
+        risk_reward=rr,
+        risk_reward_target1=rr,
+        level_plan_valid=bool(item.get("repeat_chart_valid")),
+        level_plan_reason=str(item.get("repeat_chart_reason") or ""),
+        target_basis=str(item.get("repeat_target1_basis") or ""),
+        target1_basis=str(item.get("repeat_target1_basis") or ""),
+        target2_basis=str(item.get("repeat_target2_basis") or ""),
+        stop_basis=f"{item.get('repeat_support_basis', '차트 지지')} 아래 ATR 완충 손절",
+        chart_box_high=_num(item.get("repeat_chart_box_high")),
+        chart_box_low=_num(item.get("repeat_chart_box_low")),
+        chart_box_width=max(0.0, _num(item.get("repeat_chart_box_high")) - _num(item.get("repeat_chart_box_low"))),
+        continuous_rise=trend_score >= 7,
+        continuous_rise_score=trend_score,
+        continuous_rise_checks=item.get("repeat_trend_checks") or {},
+        repeat_scalp_state=legacy_state,
+        repeat_scalp_label=str(item.get("repeat_label") or ""),
+        repeat_scalp_reason=str(item.get("repeat_chart_reason") or ""),
+        repeat_scalp_buy_level=entry,
+        repeat_scalp_sell_level=target1,
+        repeat_scalp_invalidation=stop,
+        repeat_scalp_median_bar_range=_num(item.get("repeat_median_range")),
+        repeat_scalp_range_percent=width,
+        repeat_scalp_preferred_range=bool(item.get("repeat_preferred_range")),
+        repeat_scalp_can_extend=cont == "HIGH",
+        repeat_scalp_extension_label=str(item.get("repeat_continuation_label") or ""),
+        repeat_scalp_extension_reason=f"추가상승 근거 {int(_num(item.get('repeat_continuation_score')))}/10",
+        repeat_scalp_extension_percent=extra,
+        upside_continuation_state=legacy_cont,
+        upside_continuation_label=str(item.get("repeat_continuation_label") or ""),
+        upside_continuation_score=int(_num(item.get("repeat_continuation_score"))),
+        upside_continuation_checks=item.get("repeat_continuation_checks") or {},
+        additional_upside_after_target1=extra,
+        target2_total_upside=_num(item.get("repeat_target2_current_upside")),
+        verified_spread_percent=item.get("repeat_spread_percent"),
+    )
+    return item
+
+
+def structural_trade_plan(item:dict,market:str):
+    price=float(item.get("price",0) or 0)
+    highs=[float(x) for x in (item.get("chart_high_1m",[]) or []) if float(x or 0)>0]
+    lows=[float(x) for x in (item.get("chart_low_1m",[]) or []) if float(x or 0)>0]
+    closes=[float(x) for x in (item.get("chart_close_1m",[]) or []) if float(x or 0)>0]
+    volumes=[float(x or 0) for x in (item.get("chart_volume_1m",[]) or [])]
+    if price<=0 or len(highs)<12 or len(lows)<12 or len(closes)<12:
+        item.update(level_plan_valid=False,level_plan_reason="분봉 고가·저가 자료 부족"); return item
+    vwap=float(item.get("vwap",0) or 0); ema9=float(item.get("ema9",0) or 0); ema20=float(item.get("ema20",0) or 0)
+    ret5=(closes[-1]/closes[-6]-1)*100 if len(closes)>=6 else 0; ret15=(closes[-1]/closes[-16]-1)*100 if len(closes)>=16 else 0; ret30=(closes[-1]/closes[-31]-1)*100 if len(closes)>=31 else 0
+    higher_high=len(highs)>=12 and max(highs[-6:])>max(highs[-12:-6]); higher_low=len(lows)>=12 and min(lows[-6:])>min(lows[-12:-6])
+    up=down=0.0
+    for i in range(max(1,len(closes)-20),len(closes)):
+        vol=volumes[i] if i<len(volumes) else 0
+        if closes[i]>closes[i-1]: up+=vol
+        elif closes[i]<closes[i-1]: down+=vol
+    volume_dom=up/down if down>0 else (2.0 if up>0 else 0.0); vgap=(price/vwap-1)*100 if vwap>0 else 99
+    checks={"VWAP 위":price>vwap>0,"EMA 정배열":price>=ema9>ema20>0,"5분 상승":ret5>0,"15분 상승":ret15>0,"30분 상승":ret30>0,"고점 상승":higher_high,"저점 상승":higher_low,"상승봉 거래량 우세":volume_dom>=1.05,"VWAP 과대이격 아님":0<=vgap<=(2.5 if market=="국내" else 3.0),"최근 고가권 유지":price>=max(highs[-30:])*0.97}
+    trend_score=sum(map(bool,checks.values()))
+    swing_highs=[highs[i] for i in range(2,len(highs)-2) if highs[i]>=max(highs[i-2:i]) and highs[i]>=max(highs[i+1:i+3])]
+    resistances=_dedupe_price_levels(swing_highs); above=[x for x in resistances if x>price]
+    swing_lows=[lows[i] for i in range(2,len(lows)-2) if lows[i]<=min(lows[i-2:i]) and lows[i]<=min(lows[i+1:i+3])]
+    supports=[(x,"최근 실제 1분봉 스윙 저점") for x in swing_lows if 0<x<price]
+    if 0<vwap<price: supports.append((vwap,"VWAP"))
+    if 0<ema9<price: supports.append((ema9,"EMA9"))
+    if 0<ema20<price: supports.append((ema20,"EMA20"))
+    if not supports: item.update(level_plan_valid=False,level_plan_reason="현재가 아래 실제 지지선 없음"); return item
+    support,support_reason=max(supports,key=lambda x:x[0])
+    lookback=min(30,len(highs)); box_high=max(highs[-lookback:]); box_low=min(lows[-lookback:]); box_width=max(0,box_high-box_low); prior_high=max(highs[-lookback:-1]) if lookback>=2 else box_high; breakout=price>prior_high>0
+    t1=t2=0.0; b1=b2=""
+    if above:
+        t1=above[0]; b1="현재가 위 가장 가까운 실제 1분봉 스윙 저항"
+        if len(above)>=2: t2=above[1]; b2="1차 위 다음 실제 1분봉 스윙 저항"
+        elif box_width>0 and trend_score>=7: t2=t1+box_width; b2="다음 저항 미형성 · 최근 실제 30분 박스폭 투영"
+    elif breakout and box_width>0:
+        t1=prior_high+box_width; t2=t1+box_width; b1="기존 고점 돌파 · 최근 실제 박스폭 1회 투영"; b2="돌파 유지 시 실제 박스폭 2회 투영"
+    if t1<=price: item.update(level_plan_valid=False,level_plan_reason="현재가 위 차트 기반 1차 목표 미확인"); return item
+    if t2<=t1: t2=0.0
+    risk=price-support; reward1=t1-price; reward2=t2-price if t2>price else 0
+    rr1=reward1/risk if risk>0 else 0; rr2=reward2/risk if risk>0 and reward2>0 else 0
+    t1pct=(t1/price-1)*100; t2pct=(t2/price-1)*100 if t2>price else 0; repeat_width=(t1/support-1)*100 if t1>support>0 else 0
+    item.update(continuous_rise=trend_score>=7 and ret15>0 and ret30>0,continuous_rise_score=trend_score,continuous_rise_checks=checks,trend_return_5m=ret5,trend_return_15m=ret15,trend_return_30m=ret30,up_down_volume_ratio=volume_dom,structural_entry=price,structural_support=support,stop_loss=support,structural_target=t1,structural_target1=t1,structural_target2=t2,target1_upside_percent=t1pct,target2_upside_percent=t2pct,risk_reward=rr1,risk_reward_target1=rr1,risk_reward_target2=rr2,level_plan_valid=risk>0 and reward1>0,target_basis=b1,target1_basis=b1,target2_basis=b2,stop_basis=f"{support_reason} 이탈 시 상승 시나리오 무효",level_plan_reason=f"1차 {fmt(t1)} ({t1pct:+.2f}%) / 2차 {fmt(t2) if t2 else '-'} / 지지 {fmt(support)}",chart_resistance_levels=resistances,chart_box_high=box_high,chart_box_low=box_low,chart_box_width=box_width,breakout_active=breakout,repeat_scalp_range_percent=repeat_width,repeat_scalp_preferred_range=0.50<=repeat_width<=1.50)
+    return item
+
+
+def _aggregate_ohlcv(item:dict,minutes:int,market:str):
+    times=item.get("chart_time_1m",[]) or []; opens=item.get("chart_open_1m",[]) or []; highs=item.get("chart_high_1m",[]) or []; lows=item.get("chart_low_1m",[]) or []; closes=item.get("chart_close_1m",[]) or []; volumes=item.get("chart_volume_1m",[]) or []
+    n=min(len(times),len(opens),len(highs),len(lows),len(closes))
+    if n<minutes: return []
+    if len(volumes)<n: volumes=list(volumes)+[0]*(n-len(volumes))
+    df=pd.DataFrame({"time":pd.to_datetime(times[:n],errors="coerce"),"open":[float(x or 0) for x in opens[:n]],"high":[float(x or 0) for x in highs[:n]],"low":[float(x or 0) for x in lows[:n]],"close":[float(x or 0) for x in closes[:n]],"volume":[float(x or 0) for x in volumes[:n]]}).dropna(subset=["time"])
+    df=df[(df.open>0)&(df.high>0)&(df.low>0)&(df.close>0)].sort_values("time").set_index("time")
+    if df.empty: return []
+    offset="30min" if market=="미국" and minutes in (60,) else "0min"
+    grouped=df.resample(f"{minutes}min",origin="start_day",offset=offset,closed="left",label="left")
+    bars=grouped.agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}); bars["count"]=grouped["close"].count(); bars=bars.dropna()
+    if bars.empty: return []
+    bars=bars[bars.index+pd.Timedelta(minutes=minutes)<=df.index[-1]+pd.Timedelta(minutes=1)]
+    bars=bars[bars["count"]>=max(2,math.ceil(minutes*0.8))]
+    return [{"time":idx,"open":float(r.open),"high":float(r.high),"low":float(r.low),"close":float(r.close),"volume":float(r.volume)} for idx,r in bars.iterrows()]
+
+
+def multi_timeframe_plan(item:dict,market:str):
+    price=float(item.get("price",0) or 0); previous=float(item.get("previous_close",item.get("prev_close",0)) or 0); day_open=float(item.get("open",item.get("day_open",0)) or 0)
+    day_change=(price/previous-1)*100 if price>0 and previous>0 else float(item.get("change_percent",item.get("change",0)) or 0)
+    daily_bullish=day_change>=-0.30 and (day_open<=0 or price>=day_open*0.995); daily_bearish=day_change<=-1 and day_open>0 and price<day_open
+    results={}
+    for m in (5,15,60):
+        bars=_aggregate_ohlcv(item,m,market); c=[r["close"] for r in bars]; h=[r["high"] for r in bars]; l=[r["low"] for r in bars]; v=[r["volume"] for r in bars]
+        avail=len(bars)>=2; ret=(c[-1]/c[-2]-1)*100 if avail and c[-2]>0 else 0; ema=pd.Series(c).ewm(span=min(5,max(2,len(c))),adjust=False).mean() if c else pd.Series(dtype=float); ema_up=len(ema)>=2 and float(ema.iloc[-1])>=float(ema.iloc[-2]); lower=len(bars)>=3 and h[-1]<h[-2] and l[-1]<l[-2]; prior_vol=float(pd.Series(v[:-1]).median()) if len(v)>=2 else 0; vok=not v or prior_vol<=0 or v[-1]>=prior_vol*0.7; bull=avail and ret>=0 and ema_up and not lower and vok; bear=avail and ret<0 and (not ema_up or lower)
+        results[m]={"available":avail,"bars":len(bars),"return":ret,"bullish":bool(bull),"bearish":bool(bear)}
+    five,fifteen,hourly=results[5],results[15],results[60]; hourly_allows=hourly["bullish"] if hourly["available"] else (daily_bullish and fifteen["bullish"]); alignment=daily_bullish and hourly_allows and fifteen["bullish"] and five["bullish"]
+    mtf_exit=(fifteen["bearish"] and (hourly["bearish"] or daily_bearish)) or (five["bearish"] and fifteen["bearish"] and price<float(item.get("vwap",0) or 0)); higher=daily_bullish and fifteen["bullish"] and (hourly["bullish"] or not hourly["available"])
+    def status(d): return "자료 형성 중" if not d["available"] else "상승 · 허용" if d["bullish"] else "하락 · 차단" if d["bearish"] else "중립 · 대기"
+    item.update(mtf_alignment=bool(alignment),mtf_exit=bool(mtf_exit),mtf_higher_trend=bool(higher),mtf_short_pullback=bool(higher and five["bearish"]),mtf_checks={"일봉·당일 큰 방향":daily_bullish,"60분봉 방향 허용":hourly_allows,"15분봉 상승":fifteen["bullish"],"5분봉 상승":five["bullish"]},mtf_status={"60분봉":status(hourly),"15분봉":status(fifteen),"5분봉":status(five)},mtf_detail={str(k):v for k,v in results.items()},daily_direction_change=day_change)
+    return item
+
+
+def upside_continuation_plan(item:dict):
+    price=float(item.get("price",0) or 0); t1=float(item.get("structural_target1",0) or 0); t2=float(item.get("structural_target2",0) or 0); vwap=float(item.get("vwap",0) or 0); ema9=float(item.get("ema9",0) or 0); ema20=float(item.get("ema20",0) or 0); macd=float(item.get("macd_histogram",0) or 0); vol=float(item.get("up_down_volume_ratio",0) or 0); ret15=float(item.get("trend_return_15m",0) or 0); ret30=float(item.get("trend_return_30m",0) or 0); trend=int(item.get("continuous_rise_score",0) or 0); f20=float(item.get("forecast_20m",0) or 0); f30=float(item.get("forecast_30m",0) or 0)
+    checks={"차트상 2차 목표 존재":t2>t1>price,"VWAP 위 유지":price>vwap>0,"EMA 정배열":ema9>ema20>0,"15분 실제 상승":ret15>0,"30분 실제 상승":ret30>0,"상승봉 거래량 우세":vol>=1.05,"MACD 비약세":macd>=0,"지속상승 7점 이상":trend>=7,"20분 예측 약세 아님":f20>-0.35,"30분 예측 약세 아님":f30>-0.35}
+    score=sum(map(bool,checks.values())); extra=(t2/t1-1)*100 if t2>t1>0 else 0; total=(t2/price-1)*100 if t2>price>0 else 0
+    if t2<=t1: state,label,reason="NO_TARGET2","⚪ 2차 차트 목표 미확인","1차 위 신뢰할 목표 없음"
+    elif score>=8: state,label,reason="STRONG","🟢 1차 돌파 후 추가상승 가능",f"근거 {score}/10"
+    elif score>=6: state,label,reason="WATCH","🟡 1차 도달 후 추세 확인",f"근거 {score}/10"
+    else: state,label,reason="LIMITED","🔴 1차 목표 부근 상승 제한 가능",f"근거 {score}/10"
+    item.update(upside_continuation_state=state,upside_continuation_label=label,upside_continuation_score=score,upside_continuation_checks=checks,additional_upside_after_target1=extra,target2_total_upside=total,repeat_scalp_can_extend=state=="STRONG",repeat_scalp_extension_label=label,repeat_scalp_extension_reason=reason,repeat_scalp_extension_percent=extra)
+    return item
+
+
+def repeat_scalp_plan(item:dict):
+    price=float(item.get("price",0) or 0); support=float(item.get("structural_support",0) or 0); target=float(item.get("structural_target1",item.get("structural_target",0)) or 0); vwap=float(item.get("vwap",0) or 0); ema9=float(item.get("ema9",0) or 0); ema20=float(item.get("ema20",0) or 0)
+    closes=[float(x) for x in (item.get("chart_close_1m",[]) or []) if float(x or 0)>0]; highs=[float(x) for x in (item.get("chart_high_1m",[]) or []) if float(x or 0)>0]; lows=[float(x) for x in (item.get("chart_low_1m",[]) or []) if float(x or 0)>0]; volumes=[float(x or 0) for x in (item.get("chart_volume_1m",[]) or [])]
+    if not item.get("level_plan_valid") or min(price,support,target)<=0 or len(closes)<12: item.update(repeat_scalp_state="UNAVAILABLE",repeat_scalp_label="⚪ 반복단타 판정 대기",repeat_scalp_reason="실제 지지·저항 확인 대기"); return item
+    ranges=[max(0,highs[i]-lows[i]) for i in range(max(0,len(highs)-20),len(highs))]; median_range=float(pd.Series(ranges).median()) if ranges else 0; median_vol=float(pd.Series(volumes[-20:]).median()) if volumes else 0; last_vol=volumes[-1] if volumes else 0
+    trend=int(item.get("continuous_rise_score",0) or 0); ret15=float(item.get("trend_return_15m",0) or 0); width=(target/support-1)*100 if target>support>0 else 0; mtf=bool(item.get("mtf_alignment")); mtf_exit=bool(item.get("mtf_exit")); rsi=float(item.get("rsi",50) or 50); prior_rsi=float(item.get("rsi_previous",rsi) or rsi)
+    box_high=max(highs[-30:]) if len(highs)>=30 else 0; box_low=min(lows[-30:]) if len(lows)>=30 else 0; box_range=(box_high/box_low-1)*100 if box_high>box_low>0 else 0; box_valid=0.5<=box_range<=4; lower_zone=box_low>0 and price<=box_low+(box_high-box_low)*0.35; upper_zone=box_high>0 and price>=box_low+(box_high-box_low)*0.75; rsi_recovery=(prior_rsi<=35 and rsi>prior_rsi) or 40<=rsi<=68; trend_intact=mtf and price>=vwap>0 and ema9>=ema20>0 and trend>=6 and ret15>=0; near_support=support<=price<=support+max(median_range,1e-9); near_target=target>=price and target-price<=max(median_range,1e-9); bounce=len(closes)>=2 and closes[-1]>closes[-2] and lows[-1]<=support+max(median_range,1e-9); volume_returns=median_vol<=0 or last_vol>=median_vol
+    recent_high=max(highs[-6:]); prior_high=max(highs[-12:-6]); recent_low=min(lows[-6:]); prior_low=min(lows[-12:-6]); lower_structure=recent_high<prior_high and recent_low<prior_low; vwap_break=len(closes)>=3 and vwap>0 and all(x<vwap for x in closes[-3:]); ema_bear=ema9<ema20 and ema20>0; macd_bear=float(item.get("macd_histogram",0) or 0)<0
+    down=up=0
+    for i in range(max(1,len(closes)-12),len(closes)):
+        vol=volumes[i] if i<len(volumes) else 0
+        if closes[i]<closes[i-1]: down+=vol
+        elif closes[i]>closes[i-1]: up+=vol
+    reversal_checks={"VWAP 아래 3개 봉":vwap_break,"EMA9·EMA20 하락 정렬":ema_bear,"고점·저점 동시 하락":lower_structure,"MACD 음전환":macd_bear,"하락봉 거래량 우세":down>up*1.15}; reversal=sum(map(bool,reversal_checks.values())); breakdown=price<support or reversal>=3 or mtf_exit
+    if breakdown: state,label,reason="EXIT","🔴 추세 꺾임·매도",f"하락 전환 {reversal}/5"
+    elif width<0.5: state,label,reason="RANGE_TOO_NARROW",f"⚪ 반복폭 부족 +{width:.2f}%","0.5% 미만"
+    elif width>1.5: state,label,reason="RANGE_TOO_WIDE",f"🔵 반복폭 넓음 +{width:.2f}%","상승여력은 있으나 기본 반복후보 범위 밖"
+    elif price>=target or near_target or upper_zone: state,label,reason="TAKE_PROFIT","🟠 1차 목표 접근·분할매도",f"실제 차트 저항 {fmt(target)}"
+    elif trend_intact and box_valid and (near_support or lower_zone) and bounce and volume_returns and rsi_recovery: state,label,reason="BUY_PULLBACK","🟢 눌림 반등 매수",f"지지 {fmt(support)} 반등"
+    elif trend_intact and box_valid and price>ema9 and volume_returns: state,label,reason="HOLD_OR_BREAKOUT","🟢 보유·돌파 매수 검토",f"1차 {fmt(target)}까지 공간"
+    elif trend_intact: state,label,reason="WAIT_PULLBACK","🟡 눌림목 재매수 대기",f"지지 {fmt(support)} 대기"
+    else: state,label,reason="WAIT_TREND","🔵 추세 재확인 대기","상위시간대 정렬 대기"
+    item.update(repeat_scalp_state=state,repeat_scalp_label=label,repeat_scalp_reason=reason,repeat_scalp_buy_level=support,repeat_scalp_sell_level=target,repeat_scalp_invalidation=support,repeat_scalp_median_bar_range=median_range,repeat_scalp_reversal_score=reversal,repeat_scalp_reversal_checks=reversal_checks,repeat_scalp_range_percent=width,repeat_scalp_preferred_range=0.5<=width<=1.5,repeat_box_valid=box_valid,repeat_box_low=box_low,repeat_box_high=box_high,repeat_box_range_percent=box_range,repeat_rsi_recovery=rsi_recovery,trailing_stop_enabled=state in {"HOLD_OR_BREAKOUT","TAKE_PROFIT"},trailing_stop_percent=0.5,trailing_stop_price=max(highs[-10:])*0.995 if highs else 0)
+    return item
+
+
+def strategy_consensus(item:dict):
+    price=float(item.get("price",0) or 0); vwap=float(item.get("vwap",0) or 0); ema9=float(item.get("ema9",0) or 0); ema20=float(item.get("ema20",0) or 0); rsi=float(item.get("rsi",50) or 50); macd=float(item.get("macd_histogram",0) or 0); stoch=float(item.get("stochastic_k",50) or 50); rvol=float(item.get("rvol",0) or 0)
+    f5=float(item.get("forecast_5m",0) or 0); f10=float(item.get("forecast_10m",0) or 0); f20=float(item.get("forecast_20m",0) or 0); f30=float(item.get("forecast_30m",0) or 0); orderbook=str(item.get("orderbook_signal","")); obv=str(item.get("obv_trend","")); patterns=" ".join(map(str,item.get("pattern_signals",[]) or [])); trend_text=" ".join(str(item.get(k,"")) for k in ("trend_5m","trend_15m","trend_30m"))
+    votes=[]
+    def add(name,buy,sell,reason): votes.append({"기법":name,"판정":"매수" if buy and not sell else "매도" if sell and not buy else "대기","근거":reason})
+    add("VWAP 추세",price>vwap>0,0<price<vwap,f"VWAP {fmt(vwap)}")
+    add("EMA 추세",ema9>ema20>0 and price>=ema9,0<ema9<ema20 and price<=ema9,f"EMA9 {fmt(ema9)} / EMA20 {fmt(ema20)}")
+    add("MACD 모멘텀",macd>0,macd<0,f"히스토그램 {macd:+.4f}")
+    add("RSI·스토캐스틱",42<=rsi<=68 and stoch<80,rsi>=75 or stoch>=90,f"RSI {rsi:.1f} / %K {stoch:.1f}")
+    add("거래량·RVOL",rvol>=1.5 and f5>=0.35,rvol<0.7 or (rvol>=1.5 and f5<=-0.35),f"RVOL {rvol:.1f}배")
+    add("OBV 수급","상승" in obv,"하락" in obv,obv or "미확인")
+    add("호가·체결","매수" in orderbook,"매도" in orderbook,orderbook or "미확인")
+    add("캔들 패턴",any(x in patterns for x in ("상승","망치","돌파","장악")),any(x in patterns for x in ("하락","유성","윗꼬리")),patterns or "뚜렷한 패턴 없음")
+    forecasts=(f5,f10,f20,f30); add("다중 시간봉",all(x>=0.35 for x in forecasts),any(x<=-0.35 for x in forecasts),f"5 {f5:+.2f}% / 10 {f10:+.2f}% / 20 {f20:+.2f}% / 30 {f30:+.2f}%")
+    add("추세 정렬",trend_text.count("상승")>=2,trend_text.count("하락")>=2,trend_text or "추세 계산 중")
+    buys=sum(r["판정"]=="매수" for r in votes); sells=sum(r["판정"]=="매도" for r in votes); return votes,buys,sells,len(votes)-buys-sells
+
+
+def market_regime(item:dict):
+    price=float(item.get("price",0) or 0); vwap=float(item.get("vwap",0) or 0); ema9=float(item.get("ema9",0) or 0); ema20=float(item.get("ema20",0) or 0); rvol=float(item.get("rvol",0) or 0)
+    if rvol>=3: return "변동성 급증장","돌파·호가·거래량 기법 우선"
+    if price>vwap>0 and ema9>ema20>0: return "상승 추세장","눌림목·VWAP 지지·추세추종 우선"
+    if 0<price<vwap and 0<ema9<ema20: return "하락 추세장","신규 매수 금지·반등 확인 우선"
+    return "횡보장","VWAP 평균회귀·박스 돌파 확인 우선"
+
+
+def weighted_strategy_score(rows,regime):
+    weights={r["기법"]:1.0 for r in rows}
+    names=("VWAP 추세","EMA 추세","MACD 모멘텀","다중 시간봉","추세 정렬") if regime=="상승 추세장" else ("VWAP 추세","RSI·스토캐스틱","캔들 패턴","호가·체결") if regime=="횡보장" else ("거래량·RVOL","호가·체결","VWAP 추세","다중 시간봉") if regime=="변동성 급증장" else ("VWAP 추세","EMA 추세","다중 시간봉","추세 정렬")
+    mult=1.6 if regime in {"상승 추세장","횡보장"} else 1.8 if regime=="변동성 급증장" else 2.0
+    for n in names: weights[n]=mult
+    total=sum(weights.values()) or 1; signed=sum(weights[r["기법"]]*(1 if r["판정"]=="매수" else -1 if r["판정"]=="매도" else 0) for r in rows); buy=sum(weights[r["기법"]] for r in rows if r["판정"]=="매수")
+    return round(signed/total*100,1),round(buy/total*100,1)
+
+
+@st.cache_data(ttl=20,show_spinner=False)
+def benchmark_context(market:str,ticker:str):
+    try:
+        if market=="미국":
+            mapping={"SOXL":("SOXX","NASDAQ",1),"SOXS":("SOXX","NASDAQ",-1),"SMH":("SOXX","NASDAQ",1),"TQQQ":("QQQ","NASDAQ",1),"SQQQ":("QQQ","NASDAQ",-1),"QLD":("QQQ","NASDAQ",1),"QID":("QQQ","AMEX",-1),"FAS":("XLF","AMEX",1),"FAZ":("XLF","AMEX",-1),"LABU":("XBI","AMEX",1),"LABD":("XBI","AMEX",-1),"TNA":("IWM","AMEX",1),"TZA":("IWM","AMEX",-1),"XOM":("XLE","AMEX",1),"JPM":("XLF","AMEX",1),"BAC":("XLF","AMEX",1)}
+            bench,exchange,direction=mapping.get(ticker,("SPY","AMEX",1)); q=scanner().client.us_quote(bench,exchange); _,_,change,_=verified_us_change(q); bars=scanner().client.us_intraday(bench,exchange,minutes=1); intraday=((float(bars["close"].iloc[-1])/float(bars["close"].iloc[-6])-1)*100*direction) if len(bars)>=6 else 0
+            return {"name":bench,"change":change*direction,"intraday":intraday,"confirmed":len(bars)>=20}
+        members={"488080":[("005930",0.5),("000660",0.5)],"396500":[("005930",0.5),("000660",0.5)]}.get(ticker,[("069500",1.0)]); change=intraday=0; enough=True
+        for code,w in members:
+            change+=float(scanner().client.kr_quote(code).get("change",0) or 0)*w; bars=scanner().client.kr_intraday(code); enough=enough and len(bars)>=20
+            if len(bars)>=6: intraday+=(float(bars["close"].iloc[-1])/float(bars["close"].iloc[-6])-1)*100*w
+        return {"name":"+".join(c for c,_ in members),"change":change,"intraday":intraday,"confirmed":enough}
+    except Exception as e: return {"name":"시장지표","change":0.0,"intraday":0.0,"confirmed":False,"error":type(e).__name__}
+
+
+@st.cache_data(ttl=60,show_spinner=False)
+def live_filtered_universe(market:str):
+    source=KR_UNIVERSE if market=="국내" else US_UNIVERSE; accepted=[]; ranked={}; modes=("국내 돌파","국내 거래대금 급증") if market=="국내" else ("미국 30분 1% 타점","미국 급등주")
     for mode in modes:
         try:
             for row in scanner().candidates(mode):
-                candidate = dict(row)
-                ticker = str(candidate.get("ticker") or candidate.get("code") or "").upper().strip()
-                if not ticker:
-                    continue
-                old = ranked_rows.get(ticker, {})
-                # 같은 종목이 상승률/거래량 순위 양쪽에 있으면 더 완전한 값을 보존한다.
-                merged = {**old, **candidate}
-                merged["screen_price"] = float(candidate.get("screen_price") or old.get("screen_price") or candidate.get("price") or 0)
-                merged["screen_change"] = float(candidate.get("screen_change") if candidate.get("screen_change") is not None else old.get("screen_change", candidate.get("change_percent", candidate.get("change", 0))) or 0)
-                merged["screen_volume"] = max(int(float(old.get("screen_volume", 0) or 0)), int(float(candidate.get("screen_volume", candidate.get("volume", 0)) or 0)))
-                merged["ticker"] = ticker
-                ranked_rows[ticker] = merged
-        except Exception:
-            continue
-
-    blocked_words = ("스팩", "우선주", "관리", "정리매매", "인버스")
-    for candidate in ranked_rows.values():
-        ticker = str(candidate.get("ticker", "")).upper()
-        # 거래소 실시간 순위의 전 종목을 1차 검사한다. 고정 우량주·ETF
-        # 목록은 API 순위가 비었을 때만 쓰는 장애 대비용이며, 정상 후보를
-        # 가로막는 화이트리스트로 사용하지 않는다. 아래 유동성·상승률 필터와
-        # 이후 분봉/지지·저항/손익비 검문을 모두 통과해야 화면에 표시된다.
-        price = float(candidate.get("screen_price", 0) or 0)
-        change = float(candidate.get("screen_change", 0) or 0)
-        volume = int(candidate.get("screen_volume", 0) or 0)
-        name = str(candidate.get("name", ""))
-        trading_value = price * volume
-        screen_high = float(candidate.get("high", candidate.get("screen_high", 0)) or 0)
-        screen_low = float(candidate.get("low", candidate.get("screen_low", 0)) or 0)
-        observed_range = (
-            (screen_high / screen_low - 1) * 100
-            if screen_high > screen_low > 0 else None
-        )
-        if market == "국내":
-            # 반복단타는 단순 급등률보다 체결 가능한 유동성과 남은 움직임이
-            # 중요하다. 상한가 근접주·동전주·거래대금 부족주는 제외한다.
-            valid = (
-                2_000 <= price <= limit
-                and 0.30 <= change < 15.0
-                and volume >= 100_000
-                and trading_value >= 30_000_000_000
-                and (observed_range is None or observed_range >= 0.50)
-                and not any(word in name for word in blocked_words)
-            )
-        else:
-            # 미국 자동 후보에서도 저가 소형 급등주를 제거한다. 충분한 거래량과
-            # 거래대금을 동시에 충족해야 여러 차례 진입·청산할 가능성이 있다.
-            # 직접 검색은 이 제한을 받지 않는다.
-            valid = (
-                3.0 <= price <= limit
-                and 0.20 <= change < 12.0
-                and volume >= 100_000
-                and trading_value >= 30_000_000
-                and (observed_range is None or observed_range >= 0.50)
-                and not any(word in name.upper() for word in ("WARRANT", "RIGHT", "UNIT"))
-            )
-        if valid:
-            candidate["screen_observed_range_percent"] = observed_range
-            candidate["asset_type"] = "정밀검증 대기·후보 확정 전"
-            accepted.append(candidate)
-    # The ranked market response is one bulk call. Do not follow it with an
-    # unbounded sequence of per-symbol calls: that was the main reason the UI
-    # looked frozen. Static blue-chip/ETF fallbacks are deliberately bounded.
-    # If the bulk rising-rank endpoint returned anything, use it immediately.
-    # Blue chips/ETFs remain available through direct search. Only when the
-    # bulk endpoint is empty do we make a very small four-symbol fallback.
-    # 전체시장 순위가 모두 실패했을 때만 작은 고정 목록으로 장애를 완화한다.
-    # 정상 상황에서는 이 경로가 실행되지 않으므로 화면 속도에 영향이 없다.
-    fallback_source = [] if accepted else source[:12]
-
-    def fetch_candidate(row: dict) -> dict | None:
+                c=dict(row); ticker=str(c.get("ticker") or c.get("code") or "").upper().strip()
+                if not ticker: continue
+                old=ranked.get(ticker,{}); merged={**old,**c}; merged["screen_price"]=float(c.get("screen_price") or old.get("screen_price") or c.get("price") or 0); merged["screen_change"]=float(c.get("screen_change") if c.get("screen_change") is not None else old.get("screen_change",c.get("change_percent",c.get("change",0))) or 0); merged["screen_volume"]=max(int(float(old.get("screen_volume",0) or 0)),int(float(c.get("screen_volume",c.get("volume",0)) or 0))); merged["ticker"]=ticker; ranked[ticker]=merged
+        except Exception: pass
+    for c in ranked.values():
+        price=float(c.get("screen_price",0) or 0); change=float(c.get("screen_change",0) or 0); volume=int(c.get("screen_volume",0) or 0); value=price*volume
+        valid=(2000<=price<=300000 and 0.3<=change<15 and volume>=100000 and value>=30_000_000_000) if market=="국내" else (3<=price<=200 and 0.2<=change<12 and volume>=100000 and value>=30_000_000)
+        if valid: accepted.append(c)
+    fallback=[] if accepted else source[:12]
+    def fetch(row):
         try:
-            quote = (scanner().client.kr_quote(row["ticker"]) if market == "국내"
-                     else scanner().client.us_quote(row["ticker"], row["exchange"]))
-            candidate = dict(row)
-            candidate["screen_price"] = float(quote.get("price", 0) or 0)
-            candidate["screen_volume"] = int(float(
-                quote.get("volume", quote.get("accumulated_volume", quote.get("acml_vol", 0))) or 0
-            ))
-            if market == "미국":
-                price, previous, verified_change, source_name = verified_us_change(quote)
-                candidate["screen_price"] = price
-                candidate["previous_close"] = previous
-                candidate["screen_change"] = verified_change
-                candidate["change_validation_source"] = source_name
-            else:
-                candidate["screen_change"] = float(quote.get("change", 0) or 0)
-            change = candidate["screen_change"]
-            # Korean automatic candidates need room before the +30% ceiling.
-            # At +25% or above, remaining upside is too small for a fresh scalp
-            # and execution can freeze near the limit-up queue.
-            price = candidate["screen_price"]
-            volume = candidate["screen_volume"]
-            trading_value = price * volume
-            change_ok = 0.30 <= change < 15.0 if market == "국내" else 0.20 <= change < 12.0
-            # 일부 KIS 현재가 응답은 누적 거래량을 주지 않는다. 핵심 우량주
-            # 풀에서는 이 경우 예비후보로만 통과시키고, 이후 정밀분석의 분봉
-            # 거래량·호가·반복 폭 검문에서 실제 진입 가능 여부를 결정한다.
-            liquidity_ok = volume <= 0 or (
-                volume >= 100_000 and trading_value >= 10_000_000_000
-                if market == "국내"
-                else volume >= 100_000 and trading_value >= 10_000_000
-            )
-            if 0 < price <= limit and change_ok and liquidity_ok:
-                candidate["asset_type"] = str(candidate.get("asset_type") or "상승 후보")
-                return candidate
-        except Exception:
-            return None
-        return None
-
-    if fallback_source:
-        # 제한된 핵심 풀만 병렬 조회해 화면 정지를 피하고 개인 KIS 호출 한도를
-        # 넘지 않는다. 전 종목 개별 조회는 절대 실행하지 않는다.
+            q=scanner().client.kr_quote(row["ticker"]) if market=="국내" else scanner().client.us_quote(row["ticker"],row["exchange"]); c=dict(row); c["screen_price"]=float(q.get("price",0) or 0); c["screen_volume"]=int(float(q.get("volume",q.get("accumulated_volume",0)) or 0)); c["screen_change"]=float(q.get("change",0) or 0) if market=="국내" else verified_us_change(q)[2]; return c if c["screen_price"]>0 else None
+        except Exception: return None
+    if fallback:
         with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = [pool.submit(fetch_candidate, row) for row in fallback_source]
-            for future in as_completed(futures):
-                candidate = future.result()
-                if candidate:
-                    accepted.append(candidate)
-    else:
-        for row in fallback_source:
-            candidate = fetch_candidate(row)
-            if candidate:
-                accepted.append(candidate)
-    deduped = {row["ticker"]: row for row in accepted}
-    return sorted(
-        deduped.values(),
-        # 상승률이 가장 큰 종목보다 거래대금이 크고 과열되지 않은 종목을
-        # 우선한다. 정밀분석에서 실제 반복 폭·VWAP·호가를 다시 검증한다.
-        key=lambda row: (
-            0 if "레버리지" in str(row.get("asset_type", "")) or "인버스" in str(row.get("asset_type", "")) else 1,
-            float(row.get("screen_price", 0) or 0) * int(row.get("screen_volume", 0) or 0),
-            -abs(float(row.get("screen_change", 0) or 0) - 3.0),
-        ),
-        reverse=True,
-    )[:12]
+            for fut in as_completed([pool.submit(fetch,r) for r in fallback]):
+                c=fut.result();
+                if c: accepted.append(c)
+    dedup={r["ticker"]:r for r in accepted}; return sorted(dedup.values(),key=lambda r:float(r.get("screen_price",0) or 0)*int(r.get("screen_volume",0) or 0),reverse=True)[:12]
 
 
-@st.cache_data(ttl=5, show_spinner=False)
-def latest_entry_candidates(market: str, minimum_score: float, limit: int = 5) -> list[dict]:
-    """이미 자동검증기가 수집한 최신 분석을 재사용해 추가 API 호출 없이 후보를 정렬한다."""
-    market_code = "KR" if market == "국내" else "US"
-    cutoff = int(time.time()) - 3 * 60
+@st.cache_data(ttl=5,show_spinner=False)
+def latest_entry_candidates(market:str,minimum_score:float,limit:int=5):
+    if AUDIT_IMPORT_ERROR: return []
+    code="KR" if market=="국내" else "US"; cutoff=int(time.time())-15*60
     try:
         with audit_connect() as db:
-            rows = db.execute("""
-                SELECT s.ticker,s.name,s.issued,s.base_price,s.verdict,s.score,
-                       s.entry_ok,s.data_valid,s.forecast5,s.forecast10,
-                       s.forecast20,s.forecast30,s.detail_json
-                FROM signals s
-                JOIN (
-                    SELECT ticker,MAX(issued) AS issued FROM signals
-                    WHERE market=? AND issued>=? GROUP BY ticker
-                ) latest ON latest.ticker=s.ticker AND latest.issued=s.issued
-                WHERE s.market=?
-            """, (market_code, cutoff, market_code)).fetchall()
-    except Exception:
-        return []
-    candidates = []
-    for ticker, name, issued, price, verdict, score, entry_ok, data_valid, f5, f10, f20, f30, detail_json in rows:
-        try:
-            detail = json.loads(detail_json or "{}")
-        except Exception:
-            detail = {}
-        forecasts = [float(x or 0) for x in (f5, f10, f20, f30)]
-        positive_count = sum(x > 0 for x in forecasts)
-        rvol = float(detail.get("rvol", 0) or 0)
-        risk_reward = float(detail.get("risk_reward", 0) or 0)
-        current_change = float(
-            detail.get("screen_change", detail.get("change_percent", detail.get("change", 0))) or 0
-        )
-        trend_score = int(detail.get("continuous_rise_score", 0) or 0)
-        continuous_rise = bool(detail.get("continuous_rise"))
-        level_plan_valid = bool(detail.get("level_plan_valid"))
-        repeat_state = str(detail.get("repeat_scalp_state", "UNAVAILABLE"))
-        repeat_width = float(detail.get("repeat_scalp_range_percent", 0) or 0)
-        verified_spread = detail.get("verified_spread_percent")
-        try:
-            verified_spread = float(verified_spread) if verified_spread is not None else None
-        except (TypeError, ValueError):
-            verified_spread = None
-        score = float(score or 0)
-        if market_code == "KR" and current_change >= 20.0:
-            continue
-        max_repeat_spread = 0.35 if market_code == "KR" else 0.25
-        if not (
-            data_valid and level_plan_valid and risk_reward >= 1.5
-            and repeat_width >= 0.50
-            and verified_spread is not None and verified_spread <= max_repeat_spread
-        ):
-            continue
-        if repeat_state in {"UNAVAILABLE", "EXIT", "TAKE_PROFIT"}:
-            continue
-        if repeat_state == "BUY_PULLBACK":
-            stage, priority = "🟢 눌림 반등 매수", 4
-        elif repeat_state == "HOLD_OR_BREAKOUT":
-            stage, priority = "🟢 돌파 매수 검토", 3
-        elif repeat_state == "WAIT_PULLBACK":
-            stage, priority = "🟡 눌림목 재매수 대기", 2
-        else:
-            stage, priority = "🔵 추세 재확인 대기", 1
-        trigger = float(
-            detail.get("structural_entry", 0)
-            or detail.get("breakout_entry", 0)
-            or detail.get("pullback_entry", 0)
-            or 0
-        )
-        preferred_range_bonus = 30 if 0.5 <= repeat_width <= 1.5 else (10 if repeat_width > 1.5 else 0)
-        rank = priority * 100 + trend_score * 12 + score + positive_count * 5 + min(rvol, 5) * 2 + min(risk_reward, 4) * 2 + preferred_range_bonus
-        candidates.append({
-            "ticker": ticker, "name": name or ticker, "stage": stage,
-            "price": float(price or 0), "trigger": trigger, "score": score,
-            "rvol": rvol, "risk_reward": risk_reward, "issued": int(issued), "rank": rank,
-            "trend_score": trend_score,
-            "repeat_state": repeat_state,
-            "repeat_width": repeat_width,
-            "target": float(detail.get("structural_target", 0) or 0),
-            "support": float(detail.get("structural_support", 0) or 0),
-        })
-    return sorted(candidates, key=lambda x: x["rank"], reverse=True)[:limit]
+            rows=db.execute("""SELECT s.ticker,s.name,s.issued,s.base_price,s.verdict,s.score,s.entry_ok,s.data_valid,s.forecast5,s.forecast10,s.forecast20,s.forecast30,s.detail_json FROM signals s JOIN(SELECT ticker,MAX(issued) issued FROM signals WHERE market=? AND issued>=? GROUP BY ticker) x ON x.ticker=s.ticker AND x.issued=s.issued WHERE s.market=?""",(code,cutoff,code)).fetchall()
+    except Exception: return []
+    out=[]
+    for ticker,name,issued,price,verdict,score,entry_ok,data_valid,f5,f10,f20,f30,detail_json in rows:
+        try: d=json.loads(detail_json or "{}")
+        except Exception: d={}
+        score=float(score or 0)
+        if score<minimum_score: continue
+        width=float(d.get("repeat_scalp_range_percent",0) or 0); rr=float(d.get("risk_reward",0) or 0); spread=d.get("verified_spread_percent")
+        try: spread=float(spread) if spread is not None else None
+        except Exception: spread=None
+        if not (data_valid and d.get("level_plan_valid") and d.get("repeat_candidate") and rr>=1.2 and 0.5<=width<=1.5 and (spread is None or spread<=(0.35 if code=="KR" else 0.25))): continue
+        state=str(d.get("repeat_scalp_state","UNAVAILABLE"))
+        if state in {"UNAVAILABLE","EXIT","TAKE_PROFIT","RANGE_TOO_NARROW","RANGE_TOO_WIDE"}: continue
+        stage,priority=("🟢 눌림 반등 매수",4) if state=="BUY_PULLBACK" else ("🟢 돌파 매수 검토",3) if state=="HOLD_OR_BREAKOUT" else ("🟡 눌림목 재매수 대기",2) if state=="WAIT_PULLBACK" else ("🔵 추세 재확인 대기",1)
+        t1=float(d.get("structural_target1",d.get("structural_target",0)) or 0); t2=float(d.get("structural_target2",0) or 0); ext=str(d.get("upside_continuation_label",d.get("repeat_scalp_extension_label","⚪ 추가상승 미확인"))); extpct=float(d.get("additional_upside_after_target1",d.get("repeat_scalp_extension_percent",0)) or 0); trend=int(d.get("continuous_rise_score",0) or 0); rvol=float(d.get("rvol",0) or 0); positive=sum(float(x or 0)>=0.35 for x in (f5,f10,f20,f30)); rank=priority*100+trend*12+score+positive*5+min(rvol,5)*2+min(rr,4)*2+(25 if d.get("upside_continuation_state")=="STRONG" else 0)
+        out.append({"ticker":ticker,"name":name or ticker,"stage":stage,"price":float(price or 0),"score":score,"rvol":rvol,"risk_reward":rr,"issued":int(issued),"rank":rank,"trend_score":trend,"repeat_width":width,"support":float(d.get("structural_support",0) or 0),"target1":t1,"target2":t2,"extension_label":ext,"extension_percent":extpct})
+    return sorted(out,key=lambda x:x["rank"],reverse=True)[:limit]
 
 
-def update_prediction_audit(ticker: str, price: float, item: dict, now_ts: float) -> list[dict]:
-    bucket = float(int(now_ts // 300) * 300)
-    with db_connect() as db:
-        if price > 0:
-            db.execute(
-                "INSERT OR IGNORE INTO predictions(ticker,issued,base_price,f5,f10,f20,f30) VALUES(?,?,?,?,?,?,?)",
-                (ticker, bucket, price, float(item.get("forecast_5m", 0) or 0),
-                 float(item.get("forecast_10m", 0) or 0), float(item.get("forecast_20m", 0) or 0),
-                 float(item.get("forecast_30m", 0) or 0)),
-            )
-        pending = db.execute(
-            "SELECT id,issued,base_price,f5,f10,f20,f30,actual5,actual10,actual20,actual30 FROM predictions WHERE ticker=? AND issued>=?",
-            (ticker, now_ts - 86400),
-        ).fetchall()
-        for row in pending:
-            record_id, issued, base, f5, f10, f20, f30, a5, a10, a20, a30 = row
-            elapsed = now_ts - issued
-            updates = {}
-            if elapsed >= 300 and a5 is None:
-                updates["actual5"] = (price / base - 1) * 100
-            if elapsed >= 600 and a10 is None:
-                updates["actual10"] = (price / base - 1) * 100
-            if elapsed >= 1200 and a20 is None:
-                updates["actual20"] = (price / base - 1) * 100
-            if elapsed >= 1800 and a30 is None:
-                updates["actual30"] = (price / base - 1) * 100
-            for column, value in updates.items():
-                db.execute(f"UPDATE predictions SET {column}=? WHERE id=?", (value, record_id))
-        rows = db.execute(
-            "SELECT issued,base_price,f5,f10,f20,f30,actual5,actual10,actual20,actual30 FROM predictions WHERE ticker=? ORDER BY issued DESC LIMIT 100",
-            (ticker,),
-        ).fetchall()
-    records = []
-    for issued, base, f5, f10, f20, f30, a5, a10, a20, a30 in rows:
-        record = {"ticker": ticker, "issued": issued, "기준시각": datetime.fromtimestamp(issued, KST).strftime("%m-%d %H:%M"),
-                  "기준가": base, "예상5분": f5, "예상10분": f10, "예상20분": f20, "예상30분": f30}
-        for minutes, expected, actual in ((5, f5, a5), (10, f10, a10), (20, f20, a20), (30, f30, a30)):
-            if actual is not None:
-                record[f"실제{minutes}분"] = round(actual, 3)
-                record[f"적중{minutes}분"] = (expected >= 0) == (actual >= 0)
-        records.append(record)
-    return records
-
-
-@st.cache_data(ttl=10, show_spinner=False)
-def calibration_stats(ticker: str) -> dict:
-    stats = {}
-    with db_connect() as db:
-        for minutes in (5, 10, 20, 30):
-            rows = db.execute(
-                f"SELECT f{minutes},actual{minutes} FROM predictions WHERE ticker=? AND actual{minutes} IS NOT NULL ORDER BY issued DESC LIMIT 300",
-                (ticker,),
-            ).fetchall()
-            if not rows:
-                stats[minutes] = {"samples": 0, "accuracy": 0.0, "bias": 0.0, "mae": 0.0}
-                continue
-            errors = [float(expected) - float(actual) for expected, actual in rows]
-            accuracy = sum((float(expected) >= 0) == (float(actual) >= 0) for expected, actual in rows) / len(rows) * 100
-            stats[minutes] = {"samples": len(rows), "accuracy": accuracy,
-                              "bias": sum(errors) / len(errors), "mae": sum(abs(x) for x in errors) / len(errors)}
-    return stats
-
-
-def render_chart(item: dict) -> None:
-    times = item.get("chart_time_1m", [])
-    closes = item.get("chart_close_1m", [])
-    if not times or len(times) != len(closes):
-        st.info("1분봉을 수집 중입니다.")
-        return
-    frame = pd.DataFrame({
-        "시간": pd.to_datetime(times, errors="coerce"),
-        "시가": item.get("chart_open_1m", []),
-        "고가": item.get("chart_high_1m", []),
-        "저가": item.get("chart_low_1m", []),
-        "종가": closes,
-        "VWAP": item.get("chart_vwap_1m", []),
-        "EMA9": item.get("chart_ema9_1m", []),
-        "EMA20": item.get("chart_ema20_1m", []),
-        "신호": item.get("chart_signal_1m", []),
-    }).dropna(subset=["시간"])
-    frame["색상"] = frame.apply(lambda row: "상승" if row["종가"] >= row["시가"] else "하락", axis=1)
-    color_scale = alt.Scale(domain=["상승", "하락"], range=["#ef5350", "#2962ff"])
-    base = alt.Chart(frame).encode(x=alt.X("시간:T", title=None))
-    wick = base.mark_rule().encode(
-        y=alt.Y("저가:Q", scale=alt.Scale(zero=False), title="가격"), y2="고가:Q",
-        color=alt.Color("색상:N", scale=color_scale, legend=None))
-    body = base.mark_bar(size=7).encode(
-        y="시가:Q", y2="종가:Q", color=alt.Color("색상:N", scale=color_scale, legend=None))
-    lines = alt.Chart(frame).transform_fold(
-        ["VWAP", "EMA9", "EMA20"], as_=["지표", "값"]
-    ).mark_line(strokeWidth=2).encode(
-        x="시간:T", y=alt.Y("값:Q", scale=alt.Scale(zero=False)),
-        color=alt.Color("지표:N", scale=alt.Scale(
-            domain=["VWAP", "EMA9", "EMA20"], range=["#f9a825", "#00a86b", "#8e44ad"]), title=None))
-    buy = alt.Chart(frame[frame["신호"] == "BUY"]).mark_point(
-        shape="triangle-up", filled=True, size=180, color="#00a86b").encode(x="시간:T", y="저가:Q")
-    sell = alt.Chart(frame[frame["신호"] == "SELL"]).mark_point(
-        shape="triangle-down", filled=True, size=180, color="#d32f2f").encode(x="시간:T", y="고가:Q")
-    st.altair_chart((wick + body + lines + buy + sell).properties(height=430), use_container_width=True)
-
-
-def structural_trade_plan(item: dict, market: str) -> dict:
-    """실제 분봉 스윙 고저점과 VWAP·EMA로만 진입/매도/무효가를 만든다."""
-    price = float(item.get("price", 0) or 0)
-    highs = [float(x) for x in (item.get("chart_high_1m", []) or []) if float(x or 0) > 0]
-    lows = [float(x) for x in (item.get("chart_low_1m", []) or []) if float(x or 0) > 0]
-    closes = [float(x) for x in (item.get("chart_close_1m", []) or []) if float(x or 0) > 0]
-    volumes = [float(x or 0) for x in (item.get("chart_volume_1m", []) or [])]
-    if price <= 0 or len(highs) < 10 or len(lows) < 10:
-        item["level_plan_valid"] = False
-        item["level_plan_reason"] = "분봉 고가·저가가 부족해 지지·저항을 확정하지 못함"
-        return item
-
-    vwap = float(item.get("vwap", 0) or 0)
-    ema9 = float(item.get("ema9", 0) or 0)
-    ema20 = float(item.get("ema20", 0) or 0)
-    ret5 = (closes[-1] / closes[-6] - 1) * 100 if len(closes) >= 6 else 0.0
-    ret15 = (closes[-1] / closes[-16] - 1) * 100 if len(closes) >= 16 else 0.0
-    ret30 = (closes[-1] / closes[-31] - 1) * 100 if len(closes) >= 31 else 0.0
-    higher_high = len(highs) >= 12 and max(highs[-6:]) > max(highs[-12:-6])
-    higher_low = len(lows) >= 12 and min(lows[-6:]) > min(lows[-12:-6])
-    up_volume = down_volume = 0.0
-    for index in range(max(1, len(closes) - 20), len(closes)):
-        volume = volumes[index] if index < len(volumes) else 0.0
-        if closes[index] > closes[index - 1]:
-            up_volume += volume
-        elif closes[index] < closes[index - 1]:
-            down_volume += volume
-    volume_dominance = up_volume / down_volume if down_volume > 0 else (2.0 if up_volume > 0 else 0.0)
-    vwap_gap = ((price / vwap) - 1) * 100 if vwap > 0 else 99.0
-    trend_checks = {
-        "VWAP 위": price > vwap > 0,
-        "EMA 정배열": price >= ema9 > ema20 > 0,
-        "5분 상승": ret5 > 0,
-        "15분 상승": ret15 > 0,
-        "30분 상승": ret30 > 0,
-        "고점 상승": higher_high,
-        "저점 상승": higher_low,
-        "상승봉 거래량 우세": volume_dominance >= 1.05,
-        "VWAP 과대이격 아님": 0 <= vwap_gap <= (2.5 if market == "국내" else 3.0),
-        "당일 고가권 유지": price >= max(highs) * 0.97,
-    }
-    trend_score = sum(bool(value) for value in trend_checks.values())
-    item.update({
-        "continuous_rise": trend_score >= 7 and ret15 > 0 and ret30 > 0,
-        "continuous_rise_score": trend_score,
-        "continuous_rise_checks": trend_checks,
-        "trend_return_5m": ret5,
-        "trend_return_15m": ret15,
-        "trend_return_30m": ret30,
-        "up_down_volume_ratio": volume_dominance,
-    })
-
-    swing_highs = [
-        highs[i] for i in range(2, len(highs) - 2)
-        if highs[i] >= max(highs[i - 2:i]) and highs[i] >= max(highs[i + 1:i + 3])
-    ]
-    resistance_candidates = [x for x in swing_highs if x > price]
-    if not resistance_candidates:
-        item["level_plan_valid"] = False
-        item["level_plan_reason"] = "현재가 위에서 확인된 실제 1분봉 스윙 고점이 없음"
-        return item
-    resistance = min(resistance_candidates)
-    resistance_reason = "최근 1분봉에서 확인된 가장 가까운 스윙 고점"
-
-    swing_lows = [
-        lows[i] for i in range(2, len(lows) - 2)
-        if lows[i] <= min(lows[i - 2:i]) and lows[i] <= min(lows[i + 1:i + 3])
-    ]
-    support_candidates = [(x, "최근 1분봉 스윙 저점") for x in swing_lows if x < price]
-    if 0 < vwap < price:
-        support_candidates.append((vwap, "실제 체결량 가중 VWAP"))
-    if 0 < ema9 < price:
-        support_candidates.append((ema9, "1분봉 EMA9"))
-    if not support_candidates:
-        item["level_plan_valid"] = False
-        item["level_plan_reason"] = "현재가 아래에서 확인된 실제 스윙 저점·VWAP·EMA 지지가 없음"
-        return item
-    support, support_reason = max(support_candidates, key=lambda value: value[0])
-    stop = support
-    entry = price
-    risk = entry - stop
-    reward = resistance - entry
-    rr = reward / risk if risk > 0 else 0.0
-
-    item.update({
-        "structural_entry": entry,
-        "structural_target": resistance,
-        "structural_support": support,
-        "stop_loss": stop,
-        "risk_reward": rr,
-        "level_plan_valid": reward > 0 and risk > 0,
-        "target_basis": resistance_reason,
-        "stop_basis": f"{support_reason} 이탈 시 상승 시나리오 무효",
-        "level_plan_reason": f"{resistance_reason} {fmt(resistance)} / 지지선 {fmt(support)}",
-    })
-    return item
-
-
-def _aggregate_ohlcv(item: dict, minutes: int) -> list[dict]:
-    """Build completed multi-minute OHLCV bars from the one-minute source."""
-    opens = [float(x or 0) for x in (item.get("chart_open_1m", []) or [])]
-    highs = [float(x or 0) for x in (item.get("chart_high_1m", []) or [])]
-    lows = [float(x or 0) for x in (item.get("chart_low_1m", []) or [])]
-    closes = [float(x or 0) for x in (item.get("chart_close_1m", []) or [])]
-    volumes = [float(x or 0) for x in (item.get("chart_volume_1m", []) or [])]
-    size = min(len(opens), len(highs), len(lows), len(closes))
-    if size < minutes:
-        return []
-    start = size % minutes
-    bars: list[dict] = []
-    for index in range(start, size, minutes):
-        end = min(index + minutes, size)
-        if end - index < minutes:
-            continue
-        chunk_high = highs[index:end]
-        chunk_low = lows[index:end]
-        chunk_close = closes[index:end]
-        if min(opens[index], *chunk_high, *chunk_low, *chunk_close) <= 0:
-            continue
-        bars.append({
-            "open": opens[index], "high": max(chunk_high), "low": min(chunk_low),
-            "close": chunk_close[-1], "volume": sum(volumes[index:end]) if volumes else 0.0,
-        })
-    return bars
-
-
-def multi_timeframe_plan(item: dict, market: str) -> dict:
-    """Use 60/15/5-minute direction as filters; keep 1-minute data for execution."""
-    price = float(item.get("price", 0) or 0)
-    previous = float(item.get("previous_close", item.get("prev_close", 0)) or 0)
-    day_open = float(item.get("open", item.get("day_open", 0)) or 0)
-    day_change = ((price / previous) - 1) * 100 if price > 0 and previous > 0 else float(
-        item.get("change_percent", item.get("change", 0)) or 0
-    )
-    daily_bullish = day_change >= -0.30 and (day_open <= 0 or price >= day_open * 0.995)
-    daily_bearish = day_change <= -1.0 and day_open > 0 and price < day_open
-
-    results: dict[int, dict] = {}
-    for minutes in (5, 15, 60):
-        bars = _aggregate_ohlcv(item, minutes)
-        closes = [row["close"] for row in bars]
-        highs = [row["high"] for row in bars]
-        lows = [row["low"] for row in bars]
-        volumes = [row["volume"] for row in bars]
-        available = len(bars) >= 2
-        ret = ((closes[-1] / closes[-2]) - 1) * 100 if available and closes[-2] > 0 else 0.0
-        ema = pd.Series(closes).ewm(span=min(5, max(2, len(closes))), adjust=False).mean() if closes else pd.Series(dtype=float)
-        ema_up = len(ema) >= 2 and float(ema.iloc[-1]) >= float(ema.iloc[-2])
-        higher_structure = (
-            len(bars) >= 3 and highs[-1] >= highs[-2] and lows[-1] >= lows[-2]
-        )
-        lower_structure = (
-            len(bars) >= 3 and highs[-1] < highs[-2] and lows[-1] < lows[-2]
-        )
-        prior_volume = float(pd.Series(volumes[:-1]).median()) if len(volumes) >= 2 else 0.0
-        volume_ok = not volumes or prior_volume <= 0 or volumes[-1] >= prior_volume * 0.70
-        bullish = available and ret >= 0 and ema_up and not lower_structure and volume_ok
-        bearish = available and ret < 0 and (not ema_up or lower_structure)
-        results[minutes] = {
-            "available": available, "bars": len(bars), "return": ret,
-            "ema_up": bool(ema_up), "higher_structure": bool(higher_structure),
-            "lower_structure": bool(lower_structure), "volume_ok": bool(volume_ok),
-            "bullish": bool(bullish), "bearish": bool(bearish),
-        }
-
-    five = results[5]
-    fifteen = results[15]
-    hourly = results[60]
-    # A missing/neutral 60-minute comparison is not a bullish approval.  The
-    # shorter 15/5-minute trend may still be shown, but a green entry requires
-    # an actually confirmed hourly direction.
-    hourly_allows = hourly["bullish"]
-    alignment = daily_bullish and hourly_allows and fifteen["bullish"] and five["bullish"]
-    higher_timeframe_exit = (
-        fifteen["bearish"] and (hourly["bearish"] or daily_bearish)
-    ) or (five["bearish"] and fifteen["bearish"] and price < float(item.get("vwap", 0) or 0))
-    checks = {
-        "일봉·당일 큰 방향": daily_bullish,
-        "60분봉 방향 허용": hourly_allows,
-        "15분봉 상승": fifteen["bullish"],
-        "5분봉 상승": five["bullish"],
-        "1분봉은 실행 타점으로 사용": True,
-    }
-    def timeframe_status(detail: dict) -> str:
-        if not detail.get("available"):
-            return "자료 형성 중 · 승인 아님"
-        if detail.get("bullish"):
-            return "상승 · 매매 방향 허용"
-        if detail.get("bearish"):
-            return "하락 · 신규매수 차단"
-        return "중립 · 기다림"
-
-    higher_trend = bool(
-        daily_bullish and fifteen["bullish"]
-        and (hourly["bullish"] or not hourly["available"])
-    )
-    short_pullback = bool(higher_trend and five["bearish"])
-    statuses = {
-        "일봉·오늘 큰 방향": "상승 허용" if daily_bullish else "하락·약세 차단",
-        "60분봉·장 전체 방향": timeframe_status(hourly),
-        "15분봉·몇 시간 방향": timeframe_status(fifteen),
-        "5분봉·반복단타 구간": timeframe_status(five),
-        "1분봉·실제 주문 타점": "상위 시간대 승인 후 매수·매도 확인",
-    }
-    item.update({
-        "mtf_alignment": bool(alignment),
-        "mtf_exit": bool(higher_timeframe_exit),
-        "mtf_checks": checks,
-        "mtf_status": statuses,
-        "mtf_higher_trend": higher_trend,
-        "mtf_short_pullback": short_pullback,
-        "mtf_detail": {str(key): value for key, value in results.items()},
-        "daily_direction_change": day_change,
-        "daily_direction_bullish": daily_bullish,
-    })
-    return item
-
-
-def repeat_scalp_plan(item: dict) -> dict:
-    """Classify a repeatable trend scalp using only observed one-minute levels."""
-    price = float(item.get("price", 0) or 0)
-    support = float(item.get("structural_support", 0) or 0)
-    target = float(item.get("structural_target", 0) or 0)
-    vwap = float(item.get("vwap", 0) or 0)
-    ema9 = float(item.get("ema9", 0) or 0)
-    ema20 = float(item.get("ema20", 0) or 0)
-    closes = [float(x) for x in (item.get("chart_close_1m", []) or []) if float(x or 0) > 0]
-    highs = [float(x) for x in (item.get("chart_high_1m", []) or []) if float(x or 0) > 0]
-    lows = [float(x) for x in (item.get("chart_low_1m", []) or []) if float(x or 0) > 0]
-    volumes = [float(x or 0) for x in (item.get("chart_volume_1m", []) or [])]
-    if not item.get("level_plan_valid") or min(price, support, target) <= 0 or len(closes) < 12:
-        item.update({
-            "repeat_scalp_state": "UNAVAILABLE",
-            "repeat_scalp_label": "⚪ 반복단타 판정 대기",
-            "repeat_scalp_reason": "실제 지지선과 위쪽 저항선이 모두 확인될 때까지 대기",
-        })
-        return item
-
-    ranges = [max(0.0, highs[i] - lows[i]) for i in range(max(0, len(highs) - 20), len(highs))]
-    median_range = float(pd.Series(ranges).median()) if ranges else 0.0
-    median_volume = float(pd.Series(volumes[-20:]).median()) if volumes else 0.0
-    last_volume = volumes[-1] if volumes else 0.0
-    trend_score = int(item.get("continuous_rise_score", 0) or 0)
-    ret15 = float(item.get("trend_return_15m", 0) or 0)
-    swing_percent = ((target / support) - 1) * 100 if support > 0 and target > support else 0.0
-    mtf_alignment = bool(item.get("mtf_alignment"))
-    mtf_exit = bool(item.get("mtf_exit"))
-    rsi = float(item.get("rsi", item.get("rsi14", 50)) or 50)
-    prior_rsi = float(item.get("rsi_previous", item.get("previous_rsi", rsi)) or rsi)
-
-    # A repeat scalp needs a real, recently observed box.  Use the last 30
-    # completed one-minute bars as the 30-minute box; never manufacture a
-    # percentage target when its upper/lower boundaries are absent.
-    box_high = max(highs[-30:]) if len(highs) >= 30 else 0.0
-    box_low = min(lows[-30:]) if len(lows) >= 30 else 0.0
-    box_range_percent = ((box_high / box_low) - 1) * 100 if box_high > box_low > 0 else 0.0
-    box_valid = 0.50 <= box_range_percent <= 4.0
-    box_lower_zone = box_low > 0 and price <= box_low + (box_high - box_low) * 0.35
-    box_upper_zone = box_high > 0 and price >= box_low + (box_high - box_low) * 0.75
-    rsi_recovery = (prior_rsi <= 35 and rsi > prior_rsi) or (rsi >= 40 and rsi <= 68)
-    trend_intact = (
-        mtf_alignment and price >= vwap > 0 and ema9 >= ema20 > 0
-        and trend_score >= 6 and ret15 >= 0
-    )
-    near_support = support <= price <= support + max(median_range, 1e-9)
-    near_target = target >= price and target - price <= max(median_range, 1e-9)
-    bounce = len(closes) >= 2 and closes[-1] > closes[-2] and lows[-1] <= support + max(median_range, 1e-9)
-    volume_returns = median_volume <= 0 or last_volume >= median_volume
-    recent_high = max(highs[-6:]) if len(highs) >= 12 else price
-    prior_high = max(highs[-12:-6]) if len(highs) >= 12 else recent_high
-    recent_low = min(lows[-6:]) if len(lows) >= 12 else price
-    prior_low = min(lows[-12:-6]) if len(lows) >= 12 else recent_low
-    lower_structure = recent_high < prior_high and recent_low < prior_low
-    vwap_break_persistent = len(closes) >= 3 and vwap > 0 and all(value < vwap for value in closes[-3:])
-    ema_bearish = ema9 < ema20 and ema20 > 0
-    macd_bearish = float(item.get("macd_histogram", 0) or 0) < 0
-    down_volume = up_volume = 0.0
-    for index in range(max(1, len(closes) - 12), len(closes)):
-        volume = volumes[index] if index < len(volumes) else 0.0
-        if closes[index] < closes[index - 1]:
-            down_volume += volume
-        elif closes[index] > closes[index - 1]:
-            up_volume += volume
-    sell_volume_dominant = down_volume > up_volume * 1.15
-    reversal_checks = {
-        "VWAP 아래 3개 봉": vwap_break_persistent,
-        "EMA9·EMA20 하락 정렬": ema_bearish,
-        "고점·저점 동시 하락": lower_structure,
-        "MACD 음전환": macd_bearish,
-        "하락봉 거래량 우세": sell_volume_dominant,
-    }
-    reversal_score = sum(bool(value) for value in reversal_checks.values())
-    breakdown = price < support or reversal_score >= 3 or mtf_exit
-
-    if breakdown:
-        state, label = "EXIT", "🔴 추세 꺾임·전량매도·재진입 금지"
-        reason = (
-            f"확인된 지지 {fmt(support)} 이탈 또는 하락 전환 근거 "
-            f"{reversal_score}/5 동시 발생"
-        )
-    elif swing_percent < 0.5:
-        state, label = "RANGE_TOO_NARROW", f"⚪ 이번 반복 예상 범위 약 +{swing_percent:.2f}%"
-        reason = f"분봉에서 확인된 매수 {fmt(support)} 부근 → 매도 {fmt(target)} 부근"
-    elif price >= target or near_target or box_upper_zone:
-        state, label = "TAKE_PROFIT", "🟠 매도 접근·분할매도"
-        reason = f"실제 1분봉 저항 {fmt(target)} 도달 구간"
-    elif trend_intact and box_valid and (near_support or box_lower_zone) and bounce and volume_returns and rsi_recovery:
-        state, label = "BUY_PULLBACK", "🟢 눌림 반등 매수"
-        reason = f"일봉·60·15·5분 방향 허용 후 30분 박스 하단·실제 지지 {fmt(support)}에서 1분봉 반등"
-    elif trend_intact and box_valid and price > ema9 and volume_returns:
-        state, label = "HOLD_OR_BREAKOUT", "🟢 보유·돌파 매수 검토"
-        reason = f"다중 시간대 상승 정렬·VWAP 유지, 실제 저항 {fmt(target)}까지 공간 확인"
-    elif trend_intact:
-        state, label = "WAIT_PULLBACK", "🟡 눌림목 재매수 대기"
-        reason = f"추격하지 말고 실제 지지 {fmt(support)} 반등을 기다림"
-    else:
-        state, label = "WAIT_TREND", "🔵 추세 재확인 대기"
-        reason = "일봉·60분·15분·5분 방향이 다시 정렬될 때까지 1분봉 매수 신호 차단"
-
-    item.update({
-        "repeat_scalp_state": state,
-        "repeat_scalp_label": label,
-        "repeat_scalp_reason": reason,
-        "repeat_scalp_buy_level": support,
-        "repeat_scalp_sell_level": target,
-        "repeat_scalp_invalidation": support,
-        "repeat_scalp_median_bar_range": median_range,
-        "repeat_scalp_reversal_score": reversal_score,
-        "repeat_scalp_reversal_checks": reversal_checks,
-        "repeat_scalp_range_percent": swing_percent,
-        "repeat_scalp_preferred_range": 0.5 <= swing_percent <= 1.5,
-        "repeat_box_valid": box_valid,
-        "repeat_box_low": box_low,
-        "repeat_box_high": box_high,
-        "repeat_box_range_percent": box_range_percent,
-        "repeat_rsi_recovery": rsi_recovery,
-        "trailing_stop_enabled": bool(state in {"HOLD_OR_BREAKOUT", "TAKE_PROFIT"}),
-        "trailing_stop_percent": 0.5,
-        "trailing_stop_price": (max(highs[-10:]) * 0.995 if highs else 0.0),
-    })
-    return item
-
-
-def precise_analysis(row: dict, mode: str) -> dict:
-    raw = scanner().analyze(dict(row), mode)
-    item = apply_mode_policy(finalize_trade_item(raw), mode)
-    if not mode.startswith("국내"):
-        item = normalize_us_item(item, row)
-    # The bundled engine reads Korean total depth but historically discarded
-    # level-1 bid/ask prices from the same REST response. Hydrate those exact
-    # KIS fields for direct searches instead of treating them as unavailable.
-    if mode.startswith("국내") and "직접" in str(row.get("asset_type", "")):
-        try:
-            payload = scanner().client._get(
-                "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn",
-                "FHKST01010200",
-                {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": str(row.get("ticker", ""))},
-            )
-            depth = payload.get("output1") or payload.get("output") or {}
-            item["best_ask"] = float(depth.get("askp1", 0) or 0)
-            item["best_bid"] = float(depth.get("bidp1", 0) or 0)
-            item["ask_total"] = float(depth.get("total_askp_rsqn", item.get("ask_total", 0)) or 0)
-            item["bid_total"] = float(depth.get("total_bidp_rsqn", item.get("bid_total", 0)) or 0)
-            item["orderbook_source"] = "한국투자증권 REST 1호가"
-        except Exception as error:
-            item["orderbook_fetch_error"] = f"{type(error).__name__}: {error}"
-    # The quote endpoint and the minute-bar endpoint do not always complete at
-    # the same instant. Retry the lightweight quote/order-book refresh before
-    # declaring depth data missing; never request a new OAuth token here.
+def precise_analysis(row:dict,mode:str):
+    raw=scanner().analyze(dict(row),mode)
+    item=apply_mode_policy(finalize_trade_item(raw),mode)
+    market="국내" if mode.startswith("국내") else "미국"
     for _ in range(2):
-        bid = float(item.get("best_bid", 0) or 0)
-        ask = float(item.get("best_ask", 0) or 0)
-        if bid > 0 and ask > 0:
+        if float(item.get("best_bid",0) or 0)>0 and float(item.get("best_ask",0) or 0)>0:
             break
         try:
-            refreshed = scanner().refresh_quotes([item], mode)
+            refreshed=scanner().refresh_quotes([item],mode)
             if refreshed:
                 item.update(refreshed[0])
         except Exception:
             pass
         time.sleep(0.2)
-    market = "국내" if mode.startswith("국내") else "미국"
-    if market == "미국":
-        item = normalize_us_item(item, row)
-    item = repeat_scalp_plan(multi_timeframe_plan(structural_trade_plan(item, market), market))
-    _, gate_ok, spread = data_quality_gate(item, market)
-    item["data_gate_passed"] = bool(gate_ok)
-    item["verified_spread_percent"] = spread
+    if market=="미국":
+        item=normalize_us_item(item,row)
+
+    # 상위시간대는 방향 필터용으로 유지하고, 반복단타 가격은 별도 1분봉 차트 엔진으로 계산한다.
+    item=multi_timeframe_plan(item,market)
+    item=apply_repeat_scalp_overlay(item,"KR" if market=="국내" else "US")
+    item=_adapt_repeat_overlay_for_ui(item)
+    _,gate,spread=data_quality_gate(item,market)
+    item["data_gate_passed"]=bool(gate and item.get("repeat_quality_pass",False))
+    if spread is not None:
+        item["verified_spread_percent"]=spread
     return item
 
 
-def background_audit_tick(enabled: bool, now_ts: float, ui_market: str) -> None:
-    """열어 둔 앱 안에서 토큰을 공유하며 선택 시장 종목을 순환 검증한다."""
-    market_code = "KR" if ui_market == "국내" else "US"
-    base_members = AUDIT_KR_UNIVERSE if market_code == "KR" else AUDIT_US_UNIVERSE
-    if not enabled or AUDIT_IMPORT_ERROR or not base_members:
-        return
-    now_dt = datetime.fromtimestamp(now_ts, KST)
-    if not audit_market_is_open(market_code, now_dt):
-        return
-    last_key = f"audit_last_tick::{market_code}"
-    index_key = f"audit_member_index::{market_code}"
-    last = float(st.session_state.get(last_key, 0.0))
-    # Heavy full-minute-bar validation must not monopolize the interactive app.
-    # Candidate discovery remains cached and lightweight; validation samples
-    # one symbol per minute while the user can search and trade immediately.
-    if now_ts - last < 60:
-        return
-    dynamic_rows = live_filtered_universe(ui_market)
-    dynamic_members = [
-        (str(row.get("ticker")), str(row.get("name") or row.get("ticker")), str(row.get("exchange") or "KR"))
-        for row in dynamic_rows if row.get("ticker")
-    ]
-    audit_members = dynamic_members or base_members
-    index = int(st.session_state.get(index_key, 0)) % len(audit_members)
-    ticker, name, exchange_name = audit_members[index]
-    row = {"ticker": ticker, "name": name, "exchange": exchange_name, "asset_type": "검증대상"}
+def background_audit_tick(enabled:bool,now_ts:float,ui_market:str):
+    code="KR" if ui_market=="국내" else "US"; base=AUDIT_KR_UNIVERSE if code=="KR" else AUDIT_US_UNIVERSE
+    if not enabled or AUDIT_IMPORT_ERROR or not base: return
+    now_dt=datetime.fromtimestamp(now_ts,KST)
+    if not audit_market_is_open(code,now_dt): return
+    last_key=f"audit_last_tick::{code}"; idx_key=f"audit_member_index::{code}"
+    if now_ts-float(st.session_state.get(last_key,0))<60: return
+    dynamic=live_filtered_universe(ui_market); members=[(str(r.get("ticker")),str(r.get("name") or r.get("ticker")),str(r.get("exchange") or "KR")) for r in dynamic if r.get("ticker")] or base; idx=int(st.session_state.get(idx_key,0))%len(members); ticker,name,exchange=members[idx]; row={"ticker":ticker,"name":name,"exchange":exchange,"asset_type":"검증대상"}
     try:
         with audit_connect() as db:
-            if audit_signal_window_open(market_code, now_dt):
-                audit_mode = "국내 30분 1% 타점" if market_code == "KR" else "미국 30분 1% 타점"
-                item = precise_analysis(row, audit_mode)
-                audit_store_result(db, market_code, item, int(now_ts), 60)
+            if audit_signal_window_open(code,now_dt): item=precise_analysis(row,"국내 30분 1% 타점" if code=="KR" else "미국 30분 1% 타점"); audit_store_result(db,code,item,int(now_ts),60)
             else:
-                quote = (scanner().client.kr_quote(ticker) if market_code == "KR"
-                         else scanner().client.us_quote(ticker, exchange_name))
-                audit_store_quote(db, market_code, ticker, float(quote.get("price", 0) or 0), int(now_ts))
-            audit_grade_pending(db, int(now_ts))
-            db.commit()
-            audit_export_summary(db)
-        st.session_state["audit_last_ok"] = f"{market_code} {ticker} · {now_dt.strftime('%H:%M:%S')}"
-        st.session_state.pop("audit_last_error", None)
-    except Exception as error:
-        st.session_state["audit_last_error"] = f"{ticker}: {type(error).__name__} · {error}"
-    finally:
-        st.session_state[last_key] = now_ts
-        st.session_state[index_key] = index + 1
+                q=scanner().client.kr_quote(ticker) if code=="KR" else scanner().client.us_quote(ticker,exchange); audit_store_quote(db,code,ticker,float(q.get("price",0) or 0),int(now_ts))
+            audit_grade_pending(db,int(now_ts)); db.commit(); audit_export_summary(db)
+        st.session_state["audit_last_ok"]=f"{code} {ticker} · {now_dt.strftime('%H:%M:%S')}"; st.session_state.pop("audit_last_error",None)
+    except Exception as e: st.session_state["audit_last_error"]=f"{ticker}: {type(e).__name__} · {e}"
+    finally: st.session_state[last_key]=now_ts; st.session_state[idx_key]=idx+1
 
+
+def render_chart(item:dict):
+    times=item.get("chart_time_1m",[]) or []; closes=item.get("chart_close_1m",[]) or []; opens=item.get("chart_open_1m",[]) or []; highs=item.get("chart_high_1m",[]) or []; lows=item.get("chart_low_1m",[]) or []; vw=item.get("chart_vwap_1m",[]) or []; e9=item.get("chart_ema9_1m",[]) or []; e20=item.get("chart_ema20_1m",[]) or []; sig=item.get("chart_signal_1m",[]) or []
+    n=min(map(len,(times,closes,opens,highs,lows,vw,e9,e20,sig))) if times else 0
+    if n<=0: st.info("1분봉 수집 중"); return
+    df=pd.DataFrame({"시간":pd.to_datetime(times[:n],errors="coerce"),"시가":opens[:n],"고가":highs[:n],"저가":lows[:n],"종가":closes[:n],"VWAP":vw[:n],"EMA9":e9[:n],"EMA20":e20[:n],"신호":sig[:n]}).dropna(subset=["시간"]); df["색상"]=df.apply(lambda r:"상승" if r["종가"]>=r["시가"] else "하락",axis=1); color=alt.Scale(domain=["상승","하락"],range=["#ef5350","#2962ff"]); base=alt.Chart(df).encode(x=alt.X("시간:T",title=None)); wick=base.mark_rule().encode(y=alt.Y("저가:Q",scale=alt.Scale(zero=False)),y2="고가:Q",color=alt.Color("색상:N",scale=color,legend=None)); body=base.mark_bar(size=7).encode(y="시가:Q",y2="종가:Q",color=alt.Color("색상:N",scale=color,legend=None)); lines=alt.Chart(df).transform_fold(["VWAP","EMA9","EMA20"],as_=["지표","값"]).mark_line().encode(x="시간:T",y=alt.Y("값:Q",scale=alt.Scale(zero=False)),color="지표:N"); chart=wick+body+lines
+    levels=[]; entry=float(item.get("structural_entry",0) or 0); support=float(item.get("structural_support",0) or 0); stop=float(item.get("stop_loss",0) or 0); t1=float(item.get("structural_target1",item.get("structural_target",0)) or 0); t2=float(item.get("structural_target2",0) or 0)
+    if entry>0: levels.append({"가격":entry,"구간":"반복 매수가"})
+    if support>0 and abs(support-entry)/max(entry,1e-9)>0.0001: levels.append({"가격":support,"구간":"차트 지지"})
+    if stop>0: levels.append({"가격":stop,"구간":"손절가"})
+    if t1>0: levels.append({"가격":t1,"구간":"1차 목표"})
+    if t2>0: levels.append({"가격":t2,"구간":"2차 목표"})
+    if levels:
+        lf=pd.DataFrame(levels); chart=chart+alt.Chart(lf).mark_rule(strokeWidth=2,strokeDash=[6,4]).encode(y=alt.Y("가격:Q",scale=alt.Scale(zero=False)),color=alt.Color("구간:N",title=None))+alt.Chart(lf).mark_text(align="left",dx=5,dy=-5,fontWeight="bold").encode(y="가격:Q",text="구간:N",color=alt.Color("구간:N",legend=None))
+    st.altair_chart(chart.properties(height=430),use_container_width=True)
+
+
+def calibration_stats(ticker:str):
+    stats={}
+    with db_connect() as db:
+        for m in (5,10,20,30):
+            rows=db.execute(f"SELECT f{m},actual{m} FROM predictions WHERE ticker=? AND actual{m} IS NOT NULL ORDER BY issued DESC LIMIT 300",(ticker,)).fetchall()
+            if not rows: stats[m]={"samples":0,"accuracy":0,"bias":0,"mae":0}; continue
+            errors=[float(e)-float(a) for e,a in rows]; accuracy=sum((float(e)>=0)==(float(a)>=0) for e,a in rows)/len(rows)*100; stats[m]={"samples":len(rows),"accuracy":accuracy,"bias":sum(errors)/len(errors),"mae":sum(abs(x) for x in errors)/len(errors)}
+    return stats
+
+
+def update_prediction_audit(ticker,price,item,now_ts):
+    bucket=float(int(now_ts//300)*300)
+    with db_connect() as db:
+        if price>0: db.execute("INSERT OR IGNORE INTO predictions(ticker,issued,base_price,f5,f10,f20,f30) VALUES(?,?,?,?,?,?,?)",(ticker,bucket,price,float(item.get("forecast_5m",0) or 0),float(item.get("forecast_10m",0) or 0),float(item.get("forecast_20m",0) or 0),float(item.get("forecast_30m",0) or 0)))
+    return []
 
 st.title("⚡ 초단타 VWAP 매수타점")
-st.caption("집중 모드에서는 약 1.5초마다 현재가를 갱신하고, 5초마다 분봉·VWAP·이동평균·거래량·호가를 정밀 재분석합니다.")
-
-
+st.caption("반복단타 후보는 실제 차트의 지지→1차 저항 폭 0.5~1.5%만 기본 표시합니다. 1차·2차 목표는 실제 차트 저항으로 계산합니다.")
 with st.sidebar:
-    st.header("초단타 설정")
-    market = st.radio("시장", ["국내", "미국"], horizontal=True)
-    session_info = market_clock(market)
-    st.caption(f"{session_info['session']} · {session_info['local_time']}")
-    mode = "국내 30분 1% 타점" if market == "국내" else "미국 30분 1% 타점"
-    exchange = "KR" if market == "국내" else "자동 판별"
-    minimum_score = st.slider("최소 점수", 30, 90, 50, 5)
-    manual_ticker = st.text_input("종목명 또는 종목코드 검색", placeholder="현대차, 005380, SOXL").strip()
-    run_mode = st.radio(
-        "실행 모드",
-        ["가벼운 현재가", "선택 종목 집중", "시장 자동검증"],
-        horizontal=False,
-        key="scalp_run_mode",
-        help="한 번에 하나의 모드만 실행해 API 과호출과 상태 충돌을 막습니다.",
-    )
-    focus_only = run_mode == "선택 종목 집중"
-    auto_audit = run_mode == "시장 자동검증"
-    require_validation = st.toggle("실전 검증 잠금", True, help="해당 종목의 실제 5·10분 검증표본이 쌓이기 전에는 초록색 매수 신호를 차단합니다.")
-    st.caption("분석 대상: 우량주·ETF·레버리지 ETF")
+    market=st.radio("시장",["국내","미국"],horizontal=True); session_info=market_clock(market); st.caption(f"{session_info['session']} · {session_info['local_time']}"); mode="국내 30분 1% 타점" if market=="국내" else "미국 30분 1% 타점"; minimum_score=st.slider("최소 점수",30,90,50,5); manual_ticker=st.text_input("종목명 또는 종목코드 검색",placeholder="현대차, 005380, SOXL").strip(); run_mode=st.radio("실행 모드",["가벼운 현재가","선택 종목 집중","시장 자동검증"],key="scalp_run_mode"); focus_only=run_mode=="선택 종목 집중"; auto_audit=run_mode=="시장 자동검증"; require_validation=st.toggle("실전 검증 잠금",True); st.caption("반복단타 기본폭 0.5~1.5%")
+now=time.time(); live_refresh_active=focus_only or auto_audit; st_autorefresh(interval=1500 if focus_only else 10000 if auto_audit else 8000,key="scalp_tick")
+if auto_audit and not AUDIT_IMPORT_ERROR and not manual_ticker: background_audit_tick(True,now,market)
 
-now = time.time()
-manual_search_active = bool(manual_ticker)
-# 두 실시간 기능을 모두 꺼도 현재가만 가볍게 움직이도록 5초 타이머를
-# 유지한다. 무거운 후보·분봉·지수 계산은 아래에서 live_refresh_active로
-# 별도 차단한다.
-live_refresh_active = bool(focus_only or auto_audit)
-st_autorefresh(
-    # 직접 종목은 가벼운 현재가만 빠르게 갱신한다. 분봉 정밀분석은 아래의
-    # 별도 5초 주기를 사용하므로 1.5초 화면 갱신이 전체 차트 API를 재호출하지 않는다.
-    interval=1500 if focus_only else 10000 if auto_audit else 8000,
-    key="scalp_tick",
-)
-if AUDIT_IMPORT_ERROR:
-    st.sidebar.error("자동검증 파일이 없습니다: run_live_validation.py")
-elif auto_audit:
-    # Direct search has priority over the background universe collector.
-    # The collector resumes automatically as soon as the search box is empty.
-    audit_paused_for_focus = manual_search_active or focus_only
-    if not audit_paused_for_focus:
-        background_audit_tick(True, now, market)
-    audit_now = datetime.fromtimestamp(now, KST)
-    audit_minute = audit_now.hour * 60 + audit_now.minute
-    if market == "미국":
-        if session_info["tradable"]:
-            audit_phase = f"{session_info['session']} · 신호 수집·사후 채점 중"
-        else:
-            audit_phase = f"{session_info['session']} · 다음 미국 세션 대기"
-    elif audit_now.weekday() >= 5:
-        audit_phase = "휴장일 · 다음 영업일 대기"
-    elif audit_minute < 8 * 60 + 50:
-        audit_phase = "준비 완료 · 08:50 자동 시작"
-    elif audit_minute < 9 * 60:
-        audit_phase = "사전 시세 확인 중 · 09:00 신호 시작"
-    elif audit_minute < 15 * 60:
-        audit_phase = "한국 정규장 · 신호 수집·사후 채점 중"
-    elif audit_minute <= 15 * 60 + 35:
-        audit_phase = "신규 신호 종료 · 30분 사후 채점 중"
-    else:
-        audit_phase = "한국장 검증 완료 · 결과를 내려받으세요"
-    last_audit_ok = st.session_state.get("audit_last_ok")
-    displayed_phase = "집중분석 우선 · 후보 수집 일시정지" if audit_paused_for_focus else audit_phase
-    st.sidebar.success(
-        "자동검증 · " + displayed_phase
-        + (f"\n\n최근 처리: {last_audit_ok}" if last_audit_ok else "")
-    )
-    if st.session_state.get("audit_last_error"):
-        st.sidebar.warning(st.session_state["audit_last_error"])
-    if AUDIT_CSV_PATH.exists():
-        st.sidebar.download_button(
-            "검증 CSV 내려받기", AUDIT_CSV_PATH.read_bytes(),
-            file_name="validation_summary.csv", mime="text/csv", key="audit_csv_download",
-        )
-    audit_report_path = AUDIT_DB_PATH.parent / "validation_report.html"
-    if audit_report_path.exists():
-        st.sidebar.download_button(
-            "검증 보고서 내려받기", audit_report_path.read_bytes(),
-            file_name="validation_report.html", mime="text/html", key="audit_report_download",
-        )
-    try:
-        with audit_connect() as audit_db:
-            total_signals = int(audit_db.execute("SELECT COUNT(*) FROM signals").fetchone()[0])
-            completed_signals = int(audit_db.execute("SELECT COUNT(*) FROM signals WHERE result_done=1").fetchone()[0])
-        st.sidebar.caption(f"저장 {total_signals}건 · 30분 채점완료 {completed_signals}건")
-    except Exception:
-        pass
+candidate_board=[] if manual_ticker else latest_entry_candidates(market,minimum_score)
+st.subheader("실시간 반복단타 후보")
+if candidate_board:
+    st.dataframe(pd.DataFrame([{"판정":c["stage"],"종목":f"{c['ticker']} · {c['name']}","현재가":c["price"],"반복 매수":c["support"],"반복 매도/1차":c["target1"],"반복폭":f"{c['repeat_width']:.2f}%","2차 목표":c["target2"] if c["target2"]>0 else None,"추가상승":c["extension_label"],"1차→2차":f"+{c['extension_percent']:.2f}%" if c["extension_percent"]>0 else "-","점수":round(c["score"]),"RVOL":round(c["rvol"],1),"손익비":round(c["risk_reward"],2)} for c in candidate_board]),hide_index=True,use_container_width=True)
+else: st.info("현재 0.5~1.5% 반복폭과 필수 조건을 동시에 통과한 후보가 없습니다.")
 
-candidate_board = [] if manual_search_active else latest_entry_candidates(market, minimum_score)
-st.subheader("실시간 진입 후보")
-if manual_search_active:
-    st.caption("직접 검색 우선 모드 · 자동 후보 수집을 잠시 멈추고 선택 종목만 분석합니다.")
-elif candidate_board:
-    board_rows = []
-    for candidate in candidate_board:
-        support_text = fmt(candidate["support"])
-        trigger_text = "현재 조건 충족" if candidate["stage"].startswith("🟢") else f"{support_text} 지지·VWAP 회복 확인"
-        board_rows.append({
-            "판정": candidate["stage"], "종목": f"{candidate['ticker']} · {candidate['name']}",
-            "현재가": candidate["price"], "진입 발동": trigger_text,
-            "실제 저항": candidate["target"], "무효 지지": candidate["support"],
-            "지속상승": f"{candidate['trend_score']}/10",
-            "점수": round(candidate["score"]), "RVOL": round(candidate["rvol"], 1),
-            "손익비": round(candidate["risk_reward"], 2),
-            "분석시각": datetime.fromtimestamp(candidate["issued"], KST).strftime("%H:%M:%S"),
-        })
-    st.dataframe(pd.DataFrame(board_rows), hide_index=True, use_container_width=True)
-    st.caption("🟢도 주문 보장이 아니라 현재 데이터의 진입 조건 충족입니다. 표시된 발동가·손절 조건을 함께 확인하세요.")
-else:
-        if focus_only:
-            st.info(
-                "정밀 검증을 통과한 진입 후보가 없습니다. 집중 모드에서는 아래 상승·유동성 목록에서 "
-                "선택한 한 종목만 빠르게 정밀 분석합니다."
-            )
-        else:
-            st.info("현재 진입 조건에 가까운 후보가 없습니다. 자동검증기가 전 종목을 한 바퀴 도는 동안 갱신됩니다.")
-
-options = live_filtered_universe(market) if not manual_ticker else []
-resolved_manual = None
+options=[]
 if manual_ticker:
-    resolved = resolve_manual(manual_ticker, market)
-    if resolved:
-        resolved_manual = resolved
-        options.insert(0, resolved)
-    else:
-        st.sidebar.error("종목을 찾지 못했습니다. 이름을 조금 더 정확히 입력해 주세요.")
-        options = live_filtered_universe(market)
-dedup = {}
-for row in options:
-    ticker = str(row.get("ticker", "")).upper()
-    if ticker:
-        dedup[ticker] = row
-options = list(dedup.values())
-# 수집 단계의 필터를 통과했더라도 캐시·이전 선택·검증 DB에서 다시
-# 유입될 수 있다. 자동 국내 후보는 화면 직전에도 +20% 이상을 강제 제외한다.
-# 직접 검색은 사용자가 원하는 종목을 확인할 수 있도록 예외로 둔다.
-if market == "국내" and not resolved_manual:
-    options = [
-        row for row in options
-        if 0 < float(
-            row.get("screen_change", row.get("change_percent", row.get("change", 0))) or 0
-        ) < 20.0
-    ]
+    resolved=resolve_manual(manual_ticker,market)
+    if resolved: options=[resolved]
+else: options=live_filtered_universe(market)
+if not options: st.warning("자동 후보가 없습니다. 종목을 직접 검색해 주세요."); st.stop()
+selected_ticker=st.selectbox("집중 분석할 종목",[str(r.get("ticker","")) for r in options],format_func=lambda t:next((f"{t} · {r.get('name',t)}" for r in options if str(r.get('ticker',''))==t),t)); selected_row=next(r for r in options if str(r.get("ticker",""))==selected_ticker); selected_row.setdefault("exchange","KR" if market=="국내" else "NASDAQ")
+if st.session_state.get("scalp_selected")!=selected_ticker: st.session_state["scalp_selected"]=selected_ticker; st.session_state["scalp_last_precise"]=0.0; st.session_state.pop("scalp_latest",None)
+latest=dict(st.session_state.get("scalp_latest",{})); due=not latest or (live_refresh_active and now-float(st.session_state.get("scalp_last_precise",0))>=(5 if focus_only else 60))
+if due:
+    try: latest=precise_analysis(selected_row,mode); st.session_state["scalp_latest"]=latest; st.session_state["scalp_last_precise"]=now
+    except Exception as e: st.error(f"분석 대기: {e}"); st.stop()
+price=float(latest.get("price",0) or 0); change=float(latest.get("change_percent",0) or 0)
+if price<=0: st.error("현재가 미확인"); st.stop()
+quality_rows,quality_passed,_=data_quality_gate(latest,market); regime_name,regime_method=market_regime(latest); strategy_rows,buy_votes,sell_votes,wait_votes=strategy_consensus(latest); weighted_score,weighted_buy=weighted_strategy_score(strategy_rows,regime_name); context=benchmark_context(market,selected_ticker); context_aligned=bool(context.get("confirmed")) and (float(context.get("change",0) or 0)>=-0.05 and float(context.get("intraday",0) or 0)>=-0.10); rr=float(latest.get("risk_reward",0) or 0); state=str(latest.get("repeat_scalp_state","UNAVAILABLE")); width=float(latest.get("repeat_scalp_range_percent",0) or 0); support=float(latest.get("structural_support",0) or 0); stop=float(latest.get("stop_loss",0) or 0); t1=float(latest.get("structural_target1",latest.get("structural_target",0)) or 0); t2=float(latest.get("structural_target2",0) or 0)
+cal=calibration_stats(selected_ticker) if require_validation else {m:{"samples":0,"accuracy":0,"bias":0,"mae":0} for m in (5,10,20,30)}; validated=cal[5]["samples"]>=20 and cal[10]["samples"]>=20 and cal[5]["accuracy"]>=55 and cal[10]["accuracy"]>=55
+level="success"
+if not quality_passed or not latest.get("repeat_quality_pass",False) or not latest.get("level_plan_valid") or not latest.get("repeat_candidate",False) or not context_aligned or rr<1.2 or state in {"EXIT","TAKE_PROFIT","RANGE_TOO_NARROW","RANGE_TOO_WIDE"} or sell_votes>=3: level="error"
+elif require_validation and not validated: level="warning"
+elif state not in {"BUY_PULLBACK","HOLD_OR_BREAKOUT"} or buy_votes<4: level="warning"
+latest["entry_checks_passed"]=level=="success"
+if level=="success": st.success(f"🟢 매수 검토 · 반복폭 {width:.2f}% · 1차 {fmt(t1)}")
+elif state=="TAKE_PROFIT": st.warning(f"🟠 1차 목표 접근 · {fmt(t1)}")
+else: st.info(f"🟡 대기 · 반복폭 {width:.2f}%")
 
-if not options:
-    st.warning("현재 가격 조건을 통과하고 시세가 확인된 자동 후보가 없습니다. 원하는 종목을 직접 검색해 주세요.")
-    st.stop()
+cols=st.columns(6); cols[0].metric(f"{selected_ticker} · {latest.get('name','')}",fmt(price),f"{change:+.2f}%"); cols[1].metric("반복 매수가",fmt(latest.get("structural_entry")),f"폭 {width:.2f}%"); cols[2].metric("1차 목표가",fmt(t1),f"{float(latest.get('target1_upside_percent',0) or 0):+.2f}%"); cols[3].metric("2차 목표가",fmt(t2) if t2>0 else "-",f"{float(latest.get('target2_upside_percent',0) or 0):+.2f}%" if t2>0 else None); cols[4].metric("차트 지지",fmt(support)); cols[5].metric("손절가",fmt(stop))
+ext_state=str(latest.get("upside_continuation_state","NO_TARGET2")); ext_label=str(latest.get("upside_continuation_label","⚪ 추가상승 미확인")); ext_pct=float(latest.get("additional_upside_after_target1",0) or 0); ext_score=int(latest.get("upside_continuation_score",0) or 0)
+if ext_state=="STRONG": st.success(f"{ext_label} · 근거 {ext_score}/10 · 1차→2차 +{ext_pct:.2f}%")
+elif ext_state=="WATCH": st.warning(f"{ext_label} · 근거 {ext_score}/10")
+elif ext_state=="LIMITED": st.error(f"{ext_label} · 근거 {ext_score}/10")
+else: st.info(ext_label)
+st.caption(f"1차 근거: {latest.get('target1_basis','-')} · 2차 근거: {latest.get('target2_basis','-')}")
 
-selected_ticker = st.selectbox(
-    "집중 분석할 종목 (자동 목록은 정밀검증 대기, 위 표만 확정 후보)",
-    [str(row.get("ticker", "")) for row in options],
-    format_func=lambda ticker: next(
-        (f"{ticker} · {row.get('name', ticker)} · {row.get('asset_type', '')}"
-         for row in options if str(row.get("ticker", "")) == ticker), ticker),
-    key=f"focus_ticker::{market}::{resolved_manual.get('ticker') if resolved_manual else 'default'}",
-)
-selected_row = next(row for row in options if str(row.get("ticker", "")) == selected_ticker)
-selected_row.setdefault("exchange", "KR" if market == "국내" else "NASDAQ")
-
-if st.session_state.get("scalp_selected") != selected_ticker:
-    st.session_state["scalp_selected"] = selected_ticker
-    st.session_state["scalp_last_precise"] = 0.0
-    st.session_state.pop("scalp_latest", None)
-    st.session_state["scalp_live_history"] = []
-
-latest = dict(st.session_state.get("scalp_latest", {}))
-# 한 종목 집중 모드는 현재가와 완성 전 1분봉의 변화를 놓치지 않도록 5초마다
-# 정밀 재계산한다. 자동 후보 탐색은 API 제한과 전체 처리속도를 위해 60초를 유지한다.
-precise_refresh_seconds = 5 if focus_only else 60
-precise_due = bool(
-    not latest
-    or (
-        live_refresh_active
-        and now - float(st.session_state.get("scalp_last_precise", 0)) >= precise_refresh_seconds
-    )
-)
-if precise_due or not latest:
-    with st.spinner(f"{selected_ticker} 1분봉 정밀분석 중..."):
-        try:
-            latest = precise_analysis(selected_row, mode)
-            st.session_state["scalp_latest"] = latest
-            st.session_state["scalp_last_precise"] = now
-            st.session_state.pop("scalp_error", None)
-        except Exception as error:
-            st.session_state["scalp_error"] = str(error)
-elif now - float(st.session_state.get("scalp_last_quote", 0)) >= (1 if focus_only else 5):
-    try:
-        refreshed = scanner().refresh_quotes([latest], mode)
-        if refreshed:
-            latest.update(refreshed[0])
-            if market == "미국":
-                latest = normalize_us_item(latest, selected_row)
-            latest = repeat_scalp_plan(multi_timeframe_plan(structural_trade_plan(latest, market), market))
-            st.session_state["scalp_latest"] = latest
-        st.session_state["scalp_last_quote"] = now
-    except Exception as error:
-        st.session_state["scalp_quote_error"] = str(error)
-
-if st.session_state.get("scalp_error"):
-    st.error(f"분석 대기: {st.session_state['scalp_error']}")
-if not latest:
-    st.stop()
-
-if latest.get("intraday_fallback"):
-    st.warning("KIS 미국 분봉이 부족하여 Yahoo 보조 분봉을 표시합니다. 이때는 실시간 매수 신호를 내지 않고 관찰만 합니다.")
-
-price = float(latest.get("price", 0) or 0)
-change = float(latest.get("change_percent", 0) or 0)
-calibration = calibration_stats(selected_ticker) if require_validation else {
-    horizon: {"samples": 0, "accuracy": 0.0, "mae": 0.0, "bias": 0.0}
-    for horizon in (5, 10, 20, 30)
-}
-for horizon in (5, 10, 20, 30):
-    stat = calibration[horizon]
-    if stat["samples"] >= 20:
-        key = f"forecast_{horizon}m"
-        latest[key] = round(float(latest.get(key, 0) or 0) - float(stat["bias"]), 3)
-validated_signal = (
-    calibration[5]["samples"] >= 20 and calibration[10]["samples"] >= 20
-    and calibration[5]["accuracy"] >= 55 and calibration[10]["accuracy"] >= 55
-)
-label, level = verdict_text(latest)
-quality_rows, quality_passed, spread_pct = data_quality_gate(latest, market)
-regime_name, regime_method = market_regime(latest)
-strategy_rows, buy_votes, sell_votes, wait_votes = strategy_consensus(latest)
-weighted_score, weighted_buy = weighted_strategy_score(strategy_rows, regime_name)
-context_key = f"scalp_context::{market}::{selected_ticker}"
-if live_refresh_active or context_key not in st.session_state:
-    st.session_state[context_key] = benchmark_context(market, selected_ticker)
-context = st.session_state[context_key]
-forecast_up = float(latest.get("forecast_5m", 0) or 0) > 0
-context_aligned = bool(context.get("confirmed")) and (
-    not forecast_up or (
-        float(context.get("change", 0) or 0) >= -0.05
-        and float(context.get("intraday", 0) or 0) >= -0.10
-    )
-)
-risk_reward = float(latest.get("risk_reward", 0) or 0)
-price_limit = 300000 if market == "국내" else 200
-is_manual_search = str(selected_row.get("asset_type", "")) == "직접 검색"
-continuous_rise = bool(latest.get("continuous_rise"))
-continuous_rise_score = int(latest.get("continuous_rise_score", 0) or 0)
-repeat_state = str(latest.get("repeat_scalp_state", "UNAVAILABLE"))
-repeat_label = str(latest.get("repeat_scalp_label", "⚪ 반복단타 판정 대기"))
-repeat_buy = float(latest.get("repeat_scalp_buy_level", 0) or 0)
-repeat_sell = float(latest.get("repeat_scalp_sell_level", 0) or 0)
-repeat_stop = float(latest.get("stop_loss", latest.get("repeat_scalp_invalidation", 0)) or 0)
-repeat_width = float(latest.get("repeat_scalp_range_percent", 0) or 0)
-higher_trend = bool(latest.get("mtf_higher_trend"))
-short_pullback = bool(latest.get("mtf_short_pullback"))
-if repeat_state == "EXIT":
-    regime_name = "하락 전환"
-    regime_method = "신규 매수 중단·실제 지지 회복과 하락 전환 해소 확인"
-if price <= 0:
-    st.error("⛔ 현재가가 확인되지 않아 분석과 매수 판정을 중단했습니다.")
-    st.stop()
-if price > price_limit and not is_manual_search:
-    level, label = "error", f"🔴 설정 금액 초과 · {fmt(price_limit)} 이하만 분석 대상"
-    latest["entry_checks_passed"] = False
-elif not quality_passed:
-    level, label = "error", "🔴 판정 불가 · 실시간 데이터 검문 미통과"
-    latest["entry_checks_passed"] = False
-elif not bool(latest.get("level_plan_valid")):
-    level, label = "error", "🔴 진입 금지 · 실제 지지·저항 가격대 미확인"
-    latest["entry_checks_passed"] = False
-elif not is_manual_search and not continuous_rise:
-    level, label = "error", f"🔴 후보 제외 · 장중 지속상승 {continuous_rise_score}/10"
-    latest["entry_checks_passed"] = False
-elif not context_aligned:
-    level, label = "error", f"🔴 진입 금지 · 기초지수/시장({context.get('name')}) 동조 미확인"
-    latest["entry_checks_passed"] = False
-elif risk_reward < 1.5:
-    level, label = "error", f"🔴 진입 금지 · 손익비 {risk_reward:.2f} (최소 1.50 필요)"
-    latest["entry_checks_passed"] = False
-elif repeat_state == "EXIT":
-    level, label = "error", repeat_label
-    latest["entry_checks_passed"] = False
-elif repeat_state == "TAKE_PROFIT":
-    level, label = "warning", repeat_label
-    latest["entry_checks_passed"] = False
-elif repeat_state in {"BUY_PULLBACK", "HOLD_OR_BREAKOUT"} and buy_votes >= 4 and sell_votes <= 2:
-    level, label = "success", repeat_label
-    latest["entry_checks_passed"] = True
-elif sell_votes >= 3:
-    level, label = "error", f"🔴 진입 금지 · 매도/약세 기법 {sell_votes}개 감지"
-    latest["entry_checks_passed"] = False
-elif weighted_score < 35 or weighted_buy < 55:
-    level, label = "warning", f"🟡 대기 · 장세가중 합의 {weighted_score:+.1f}점"
-    latest["entry_checks_passed"] = False
-elif buy_votes < 6 or sell_votes > 0:
-    level, label = "warning", f"🟡 대기 · 매수 합의 {buy_votes}/10 · 매도 경고 {sell_votes}/10"
-    latest["entry_checks_passed"] = False
-elif require_validation and not validated_signal:
-    level, label = "warning", "🟡 모의검증 중 · 실제 적중표본이 쌓이기 전 실전 신호 잠금"
-    latest["entry_checks_passed"] = False
-elif level == "success":
-    label = f"🟢 매수 검토 · 주요 기법 합의 {buy_votes}/10"
-
-# The first thing a trader sees is one unambiguous action.  Market direction
-# and entry timing are combined here so a bullish regime cannot appear to
-# contradict the instruction shown immediately below it.
-if not quality_passed:
-    action_class, action_title = "wait", "⚪ 시세 확인 중·주문 대기"
-    action_line = "현재가·분봉·호가 중 미수신 항목을 다시 확인하고 있습니다. 확인 전에는 주문하지 마세요."
-elif repeat_state == "BUY_PULLBACK" and level == "success":
-    action_class, action_title = "buy", "🟢 지금 매수 구간"
-    action_line = f"{fmt(repeat_buy)} 부근 분할매수 → {fmt(repeat_sell)} 부근 분할매도"
-elif repeat_state == "HOLD_OR_BREAKOUT" and level == "success":
-    action_class, action_title = "buy", "🟢 돌파 확인 후 매수"
-    action_line = f"현재가 지지 확인 → {fmt(repeat_sell)} 부근 분할매도"
-elif repeat_state == "TAKE_PROFIT":
-    action_class, action_title = "sell", "🟠 지금 분할매도"
-    action_line = f"확인된 저항 {fmt(repeat_sell)} 도달 구간 · 추격매수 금지"
-elif repeat_state == "EXIT":
-    action_class, action_title = "stop", "🔴 반복단타 종료·매도"
-    action_line = f"추세가 꺾였습니다. {fmt(repeat_stop)} 이탈 시 재진입하지 마세요."
-elif short_pullback:
-    action_class, action_title = "wait", "🟡 상승 추세 속 단기 조정·매수 대기"
-    action_line = f"15분 이상 흐름은 상승이지만 5분봉이 하락 중입니다. {fmt(repeat_buy)} 지지 후 5분봉 재상승을 기다리세요."
-elif higher_trend:
-    action_class, action_title = "wait", "🔵 상승 방향 유지·매수 타점 대기"
-    action_line = f"큰 방향은 상승입니다. 1분봉이 {fmt(repeat_buy)} 지지 후 VWAP를 회복할 때만 진입하세요."
-elif repeat_state == "RANGE_TOO_NARROW":
-    action_class, action_title = "wait", f"🟡 이번 반복 예상 범위 약 +{repeat_width:.2f}%"
-    action_line = f"매수 {fmt(repeat_buy)} 부근 → 매도 {fmt(repeat_sell)} 부근 · 0.5% 최소 반복 폭에 미달"
-else:
-    action_class, action_title = "wait", "🟡 지금은 대기"
-    action_line = f"{fmt(repeat_buy)} 지지 반등 또는 매수 합의가 확인될 때까지 매수하지 마세요."
-st.markdown(
-    f'<div class="trade-action {action_class}"><h2>{action_title}</h2>'
-    f'<p><b>{action_line}</b></p><p>손절·무효 기준: {fmt(repeat_stop)} · '
-    f'확인된 반복 폭: {repeat_width:.2f}%</p></div>',
-    unsafe_allow_html=True,
-)
-# Three-minute per-symbol cool-down prevents the same actionable instruction
-# from being shown as a new alert on every Streamlit rerun.  This never places
-# an order; it is only an on-screen/manual-trading notification.
-if action_class in {"buy", "sell", "stop"}:
-    alert_key = f"signal_alert::{market}::{selected_ticker}::{action_class}"
-    last_alert = float(st.session_state.get(alert_key, 0) or 0)
-    if now - last_alert >= 180:
-        st.toast(f"{selected_ticker} · {action_title}")
-        st.session_state[alert_key] = now
-
-trailing_price = float(latest.get("trailing_stop_price", 0) or 0)
-if latest.get("trailing_stop_enabled") and trailing_price > 0:
-    st.caption(
-        f"상방 돌파 대응: 고점 추적 중 · 고점 대비 0.5% 하락 또는 "
-        f"{fmt(trailing_price)} 이탈 시 수익 보존 매도 알림"
-    )
-top = st.columns([1.4, 1, 1, 1, 1])
-top[0].metric(f"{latest.get('ticker')} · {latest.get('name')}", fmt(price), f"{change:+.2f}%")
-top[1].metric("VWAP", fmt(latest.get("vwap")))
-top[2].metric("단기 평균선(EMA9)", fmt(latest.get("ema9")))
-top[3].metric("평소 대비 거래량", f"{float(latest.get('rvol', 0) or 0):.1f}배")
-top[4].metric("하락위험", f"{int(latest.get('five_min_risk_score', 0) or 0)}점")
-
-status_cols = st.columns(4)
-status_cols[0].metric("데이터 검문", "통과" if quality_passed else "실패")
-status_cols[1].metric("현재 장세", regime_name)
-status_cols[2].metric(
-    f"기초지수 {context.get('name')}",
-    f"{float(context.get('change', 0) or 0):+.2f}%",
-    f"최근 5분 {float(context.get('intraday', 0) or 0):+.2f}%" if context.get("confirmed") else "분봉 미확인",
-)
-status_cols[3].metric("예상수익÷예상손실", f"{risk_reward:.2f}배")
-st.caption(f"현재 적용 기법: {regime_method}")
-
-level_cols = st.columns(4)
-level_cols[0].metric("진입 기준가", fmt(latest.get("structural_entry")))
-level_cols[1].metric("1차 저항 매도가", fmt(latest.get("structural_target")))
-level_cols[2].metric("확인된 지지선", fmt(latest.get("structural_support")))
-level_cols[3].metric("시나리오 무효·손절", fmt(latest.get("stop_loss")))
-st.caption(
-    f"매도가 근거: {latest.get('target_basis', '미확인')} · "
-    f"손절 근거: {latest.get('stop_basis', latest.get('level_plan_reason', '미확인'))}"
-)
-st.caption(
-    f"장중 지속상승 판정 {continuous_rise_score}/10 · "
-    f"5분 {'상승' if float(latest.get('trend_return_5m', 0) or 0) > 0 else '하락'} · "
-    f"15분 {'상승' if float(latest.get('trend_return_15m', 0) or 0) > 0 else '하락'} · "
-    f"30분 {'상승' if float(latest.get('trend_return_30m', 0) or 0) > 0 else '하락'}"
-)
-with st.expander("장중 지속상승 판정 근거", expanded=False):
-    trend_rows = [
-        {"조건": key, "통과": "✅" if value else "❌"}
-        for key, value in (latest.get("continuous_rise_checks", {}) or {}).items()
-    ]
-    if trend_rows:
-        st.dataframe(pd.DataFrame(trend_rows), hide_index=True, use_container_width=True)
-
-with st.expander("다중 시간대 승인 · 일봉→60분→15분→5분→1분", expanded=False):
-    mtf_status = latest.get("mtf_status", {}) or {}
-    mtf_rows = [{"시간대 역할": key, "현재 판정": value} for key, value in mtf_status.items()]
-    if not mtf_rows:
-        mtf_rows = [
-            {"시간대 역할": key, "현재 판정": "상승 허용" if value else "신규매수 차단"}
-            for key, value in (latest.get("mtf_checks", {}) or {}).items()
-        ]
-    if mtf_rows:
-        st.dataframe(pd.DataFrame(mtf_rows), hide_index=True, use_container_width=True)
-    mtf_detail = latest.get("mtf_detail", {}) or {}
-    if mtf_detail:
-        st.caption(" · ".join(
-            f"{minutes}분 {float(detail.get('return', 0) or 0):+.2f}%"
-            f"({'상승' if detail.get('bullish') else '하락' if detail.get('bearish') else '중립'})"
-            for minutes, detail in mtf_detail.items()
-        ))
-
-st.subheader("추세 반복단타")
-repeat_reason = str(latest.get("repeat_scalp_reason", "실제 지지·저항 확인 대기"))
-repeat_message = (
-    f"{repeat_label} · 매수 기준 {fmt(latest.get('repeat_scalp_buy_level'))} · "
-    f"매도 기준 {fmt(latest.get('repeat_scalp_sell_level'))} · {repeat_reason}"
-)
-# Repeat the same top-level instruction here instead of presenting a second,
-# competing verdict.  Detailed model output remains available as evidence.
-if action_class == "buy":
-    st.success(f"{action_title} · {action_line}")
-elif action_class in {"sell", "stop"}:
-    st.error(f"{action_title} · {action_line}")
-else:
-    st.info(f"{action_title} · {action_line}")
-st.caption(f"세부 계산: {repeat_message}")
-with st.expander("추세 꺾임 판정 근거", expanded=repeat_state == "EXIT"):
-    reversal_rows = [
-        {"하락 전환 조건": key, "감지": "예" if value else "아니오"}
-        for key, value in (latest.get("repeat_scalp_reversal_checks", {}) or {}).items()
-    ]
-    if reversal_rows:
-        st.dataframe(pd.DataFrame(reversal_rows), hide_index=True, use_container_width=True)
-
-with st.expander("최종 판정의 세부 차단·허용 근거", expanded=False):
-    getattr(st, level)(label)
-    if level == "success":
-        st.write(
-            f"진입: **{fmt(latest.get('structural_entry'))}** · "
-            f"1차 저항 매도: **{fmt(latest.get('structural_target'))}** · "
-            f"손절: **{fmt(latest.get('stop_loss'))}**"
-        )
-    elif level == "error":
-        st.write(latest.get("invalidation_reason", "VWAP·이동평균·호가 조건 이탈"))
-    else:
-        st.write(latest.get("entry_trigger", "VWAP 지지와 거래량 재증가를 기다리세요."))
-
-pullback_price = float(latest.get("pullback_entry", 0) or 0)
-breakout_price = float(latest.get("breakout_entry", 0) or 0)
-stop_price = float(latest.get("stop_loss", 0) or 0)
-st.caption(f"한 줄 결론: {action_title} · {action_line}")
-
-consensus_cols = st.columns(4)
-consensus_cols[0].metric("매수 기법", f"{buy_votes}/10")
-consensus_cols[1].metric("매도 기법", f"{sell_votes}/10")
-consensus_cols[2].metric("대기 기법", f"{wait_votes}/10")
-consensus_cols[3].metric("종합 매수 강도", f"{weighted_score:+.1f}점", f"매수 근거 비중 {weighted_buy:.1f}%")
-with st.expander("매수·매도 기법별 판정 근거", expanded=False):
-    st.dataframe(pd.DataFrame(strategy_rows), hide_index=True, use_container_width=True)
-with st.expander("실시간 데이터 검문 내역", expanded=not quality_passed):
-    st.dataframe(pd.DataFrame(quality_rows), hide_index=True, use_container_width=True)
-
-f5 = float(latest.get("forecast_5m", 0) or 0)
-f10 = float(latest.get("forecast_10m", 0) or 0)
-f20 = float(latest.get("forecast_20m", 0) or 0)
-f30 = float(latest.get("forecast_30m", 0) or 0)
-forecast_cols = st.columns(4)
-for column, minutes, forecast in zip(forecast_cols, (5, 10, 20, 30), (f5, f10, f20, f30)):
-    direction = forecast_label(forecast)
-    if forecast >= 0.35:
-        grounded_price = fmt(latest.get("structural_target"))
-        basis = latest.get("target_basis", "스윙 고점")
-    elif forecast <= -0.35:
-        grounded_price = fmt(latest.get("structural_support"))
-        basis = latest.get("stop_basis", "스윙 저점")
-    else:
-        grounded_price = f"{fmt(latest.get('structural_support'))}<br>~ {fmt(latest.get('structural_target'))}"
-        basis = "확인된 지지·저항 사이"
-    column.markdown(
-        f'<div class="forecast-card"><div class="title">{minutes}분 판정 · {direction}</div>'
-        f'<div class="price">{grounded_price}</div><div class="basis">{basis}</div></div>',
-        unsafe_allow_html=True,
-    )
-
-target_probability = int(latest.get("target1_probability", 0) or 0)
-if level == "success" and min(f5, f10, f20, f30) > 0:
-    st.success(
-        f"🚦 매수 전 조건 통과 · 5·10·20·30분 방향 일치 · "
-        f"1차 목표 도달 추정 {target_probability}%"
-    )
-elif min(f5, f10, f20, f30) < 0:
-    st.error("⛔ 단기 예상이 약세입니다. 신규 진입하지 마세요.")
-else:
-    st.warning("⏳ 시간대별 방향이 일치하지 않습니다. 진입을 기다리세요.")
-
-st.caption("표시 가격은 임의 퍼센트 목표가가 아니라 현재 분봉에서 실제로 확인된 지지·저항 가격입니다. 확인되지 않으면 숫자를 만들지 않고 진입을 차단합니다.")
-
-st.subheader("실시간 차트 분석 · 매수·매도 타점")
-st.caption("5·15·60분봉으로 방향을 확인하고, 아래 1분봉에서 실제 진입·매도 위치를 표시합니다.")
+st.subheader("실시간 차트 · 지지 / 1차 / 2차 목표")
 render_chart(latest)
+with st.expander("추가상승 판정 근거"):
+    st.dataframe(pd.DataFrame([{"조건":k,"충족":"✅" if v else "❌"} for k,v in (latest.get("upside_continuation_checks",{}) or {}).items()]),hide_index=True,use_container_width=True)
+with st.expander("매수·매도 기법별 판정"):
+    st.dataframe(pd.DataFrame(strategy_rows),hide_index=True,use_container_width=True)
+with st.expander("실시간 데이터 검문",expanded=not quality_passed):
+    st.dataframe(pd.DataFrame(quality_rows),hide_index=True,use_container_width=True)
+with st.expander("진입 전 뉴스·공시 위험 확인"):
+    if st.button("뉴스·SEC·거래정지 확인",use_container_width=True):
+        try: st.session_state["scalp_risk_check"]=scanner().analyze_candidate(selected_row,mode)
+        except Exception as e: st.error(str(e))
+    checked=st.session_state.get("scalp_risk_check")
+    if checked and str(checked.get("ticker"))==selected_ticker: st.write(checked.get("news_summary","뉴스 확인 완료")); st.write("거래정지:",checked.get("halt_active",False))
 
-with st.expander("진입 전 뉴스·공시 위험을 지금 한 번 확인"):
-    if st.button("뉴스·SEC·거래정지 확인", use_container_width=True):
-        with st.spinner("위험자료 확인 중..."):
-            try:
-                checked = scanner().analyze_candidate(selected_row, mode)
-                st.session_state["scalp_risk_check"] = checked
-                st.session_state["scalp_latest"] = checked
-            except Exception as error:
-                st.error(str(error))
-    checked = st.session_state.get("scalp_risk_check")
-    if checked and str(checked.get("ticker")) == selected_ticker:
-        st.write(checked.get("news_summary", "뉴스 확인 완료"))
-        st.write("규제검증:", checked.get("regulatory_checked", False), "· 거래정지:", checked.get("halt_active", False))
-
-audit_records = update_prediction_audit(selected_ticker, price, latest, now) if require_validation else []
-completed = []
-for record in audit_records:
-    if record["ticker"] != selected_ticker:
-        continue
-    for minutes in (5, 10, 20, 30):
-        if f"실제{minutes}분" in record:
-            completed.append({
-                "기준시각": record["기준시각"], "구간": f"{minutes}분",
-                "예상(%)": record[f"예상{minutes}분"], "실제(%)": record[f"실제{minutes}분"],
-                "방향 적중": "적중" if record[f"적중{minutes}분"] else "실패",
-            })
-with st.expander("자동 적중률 검증 기록", expanded=False):
-    stat_cols = st.columns(4)
-    for column, minutes in zip(stat_cols, (5, 10, 20, 30)):
-        stat = calibration[minutes]
-        column.metric(f"{minutes}분 검증", f"{stat['accuracy']:.1f}%", f"표본 {stat['samples']}건 · 평균오차 {stat['mae']:.2f}%")
-    if completed:
-        accuracy = sum(row["방향 적중"] == "적중" for row in completed) / len(completed) * 100
-        st.metric("이번 앱 실행 중 방향 적중률", f"{accuracy:.1f}%", f"검증 {len(completed)}건")
-        st.dataframe(pd.DataFrame(completed[-30:]), hide_index=True, use_container_width=True)
-    else:
-        st.info("신호를 자동 저장했습니다. 5분 후부터 실제 결과와 비교합니다.")
-
-st.caption(f"마지막 정밀분석: {latest.get('updated_at', '-')} · 화면 시각: {datetime.now(KST).strftime('%H:%M:%S')}")
+st.caption(f"화면 시각: {datetime.now(KST).strftime('%H:%M:%S')}")
