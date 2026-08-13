@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""반복단타 스캐너 v5.8 FAST UI.
+"""반복단타 스캐너 v5.9 FAST UI.
 
 중요:
 - 전략 계산은 하나도 삭제하지 않는다.
@@ -21,7 +21,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from run_live_validation import start_fast_worker
 
-st.set_page_config(page_title="반복단타 스캐너 v5.8 FAST", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="반복단타 스캐너 v5.9 FAST", page_icon="⚡", layout="wide")
 
 ROOT = Path(__file__).resolve().parent
 FAST_DB = ROOT / "validation_data" / "fast_scanner.sqlite3"
@@ -120,7 +120,7 @@ with st.sidebar:
     market="KR" if market_name=="국내" else "US"
     min_score=st.slider("최소 점수",30,90,50,5)
     query=st.text_input("종목명/코드 필터",placeholder="LK삼양, 225190, SOXL").strip().casefold()
-    st.caption("v5.8 FAST · 전략 계산은 유지하고 중복호출만 제거했습니다.")
+    st.caption("v5.9 FAST · 거래량 TOP100 ∪ 거래대금 TOP100 · 전략 계산 유지")
     st.caption("현재가/위험은 백그라운드에서 빠르게, Swing 구조는 별도로 갱신합니다.")
 
 hb_age=age(state.get("heartbeat")) if state else None
@@ -137,11 +137,11 @@ if query:
     rows=[x for x in rows if query in str(x.get("_ticker","")).casefold() or query in str(x.get("_name","")).casefold()]
 qualified=[x for x in rows if n(x.get("_score"))>=min_score]
 
-st.title("⚡ 반복단타 스캐너 v5.8 FAST")
-st.caption("0.5~5% 실제 반복 Swing · TREND/RANGE · 5시간 Persistence · 가짜손절/진짜붕괴")
+st.title("⚡ 반복단타 스캐너 v5.9 FAST")
+st.caption("거래량 TOP100 ∪ 거래대금 TOP100 → 0.5~5% Swing → TREND/RANGE → Persistence")
 
 m1,m2,m3,m4=st.columns(4)
-m1.metric("백그라운드 후보풀",f"{state.get('kr_pool_count' if market=='KR' else 'us_pool_count',0)}종목")
+m1.metric("유동성 합집합 후보풀",f"{state.get('kr_pool_count' if market=='KR' else 'us_pool_count',0)}종목")
 m2.metric("화면 Snapshot",f"{len(rows)}종목")
 m3.metric("점수 통과",f"{len(qualified)}종목")
 m4.metric("FINAL BUY",f"{sum(bool(x.get('_final_buy')) for x in qualified)}종목")
