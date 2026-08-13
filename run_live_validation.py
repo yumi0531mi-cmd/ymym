@@ -28,6 +28,8 @@ import pandas as pd
 
 from datetime import datetime, time as clock_time, timedelta, timezone
 from zoneinfo import ZoneInfo
+
+from persistence_engine import evaluate_strategy as evaluate_strategy_v51, update_cycle_state as update_cycle_state_v51
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -165,6 +167,19 @@ def connect() -> sqlite3.Connection:
             singleton INTEGER PRIMARY KEY CHECK(singleton=1), pid INTEGER, heartbeat INTEGER
         )
     """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS cycle_state_v51 (
+            market TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            trade_date TEXT NOT NULL,
+            cooldown_until REAL NOT NULL DEFAULT 0,
+            breakdown_count INTEGER NOT NULL DEFAULT 0,
+            hard_exit_count INTEGER NOT NULL DEFAULT 0,
+            hard_kill INTEGER NOT NULL DEFAULT 0,
+            last_risk_event TEXT,
+            PRIMARY KEY(market,ticker,trade_date)
+        )
+    """)
 
     existing = {row[1] for row in db.execute("PRAGMA table_info(signals)")}
     migrations = {
@@ -254,7 +269,44 @@ _forecast_flags = _SHARED["_forecast_flags"]
 STRATEGY_VERSION = _SHARED["STRATEGY_VERSION"]
 
 
-def analyze_one(engine, policy, finalize, market: str, member: tuple[str, str, str]) -> dict | None:
+
+def load_cycle_state_v51(db: sqlite3.Connection, market: str, ticker: str, now_ts: int) -> dict:
+    trade_date = datetime.fromtimestamp(now_ts, tz=KST).strftime("%Y%m%d")
+    row = db.execute(
+        """SELECT cooldown_until,breakdown_count,hard_exit_count,hard_kill,last_risk_event
+           FROM cycle_state_v51 WHERE market=? AND ticker=? AND trade_date=?""",
+        (market, ticker, trade_date),
+    ).fetchone()
+    if not row:
+        return {"trade_date": trade_date}
+    return {
+        "trade_date": trade_date,
+        "cooldown_until": f(row[0]),
+        "breakdown_count": int(row[1] or 0),
+        "hard_exit_count": int(row[2] or 0),
+        "hard_kill": bool(row[3]),
+        "last_risk_event": str(row[4] or ""),
+    }
+
+
+def save_cycle_state_v51(db: sqlite3.Connection, market: str, ticker: str, state: dict) -> None:
+    trade_date = str(state.get("trade_date") or datetime.now(KST).strftime("%Y%m%d"))
+    db.execute(
+        """INSERT OR REPLACE INTO cycle_state_v51(
+           market,ticker,trade_date,cooldown_until,breakdown_count,hard_exit_count,hard_kill,last_risk_event
+           ) VALUES(?,?,?,?,?,?,?,?)""",
+        (
+            market, ticker, trade_date,
+            f(state.get("cooldown_until")),
+            int(state.get("breakdown_count",0) or 0),
+            int(state.get("hard_exit_count",0) or 0),
+            int(bool(state.get("hard_kill"))),
+            str(state.get("last_risk_event") or ""),
+        ),
+    )
+
+
+def analyze_one(engine, policy, finalize, market: str, member: tuple[str, str, str], cycle_state: dict | None = None) -> dict | None:
     """UI와 같은 계산 순서로 한 종목을 분석한다. Streamlit 상태머신만 제외한다."""
     ticker, name, exchange = member
     mode = "국내 30분 1% 타점" if market == "KR" else "미국 30분 1% 타점"
@@ -276,6 +328,10 @@ def analyze_one(engine, policy, finalize, market: str, member: tuple[str, str, s
         result = forward_forecast_plan(result, market_name)
         result = execution_safety_plan(result, market_name)
         result = target_probability_plan(result)
+        # 검증기도 UI와 동일한 Cooldown/Hard-Kill 상태를 넣어 FINAL_BUY를 계산한다.
+        _cycle_state, result = update_cycle_state_v51(result, cycle_state or {}, int(time.time()))
+        result = evaluate_strategy_v51(result, market, int(time.time()), _cycle_state)
+        result["_cycle_state_v51"] = _cycle_state
         flags = _forecast_flags(result)
         result.update(
             forecast_all_down=bool(flags["all_down"]),
@@ -297,17 +353,8 @@ def analyze_one(engine, policy, finalize, market: str, member: tuple[str, str, s
         if regime == "UPTREND_PULLBACK" and not flags["valid_pullback_forecast"]:
             structure_ok = False
 
-        final_candidate = all([
-            bool(result.get("data_gate_passed")),
-            bool(result.get("repeat_candidate")),
-            bool(result.get("execution_safety_passed")),
-            bool(result.get("swing_cycle_valid")),
-            str(result.get("post_entry_risk_state","")) not in {"REAL_BREAKDOWN","HARD_EXIT"},
-            not flags["all_down"],
-            not flags["medium_down"],
-            structure_ok,
-            str(result.get("repeat_scalp_state", "")) not in {"EXIT", "TAKE_PROFIT"},
-        ])
+        final_candidate = bool(result.get("final_buy"))
+
 
         entry = f(result.get("repeat_scalp_buy_level", result.get("structural_entry")))
         target1 = f(result.get("structural_target1"))
@@ -315,7 +362,7 @@ def analyze_one(engine, policy, finalize, market: str, member: tuple[str, str, s
         stop = f(result.get("stop_loss"))
         width = f(result.get("repeat_scalp_range_percent"))
 
-        reasons = []
+        reasons = list(result.get("final_buy_reasons") or [])
         if not result.get("data_gate_passed"):
             reasons.append("데이터/반복품질 게이트 미통과")
         if not result.get("execution_safety_passed"):
@@ -359,6 +406,7 @@ DETAIL_KEYS = (
     "post_entry_risk_state", "post_entry_risk_label", "post_entry_action",
     "post_entry_soft_stop", "post_entry_hard_stop", "post_entry_noise_buffer",
     "post_entry_return_1m", "post_entry_return_3m", "post_entry_return_5m",
+    "post_entry_recovery_window_minutes", "post_entry_recovery_required_bars", "post_entry_recovery_failed",
     "post_entry_sell_volume_share", "post_entry_shakeout", "post_entry_real_breakdown",
     "post_entry_upside_breakout",
     "repeat_rvol_5_20",
@@ -410,6 +458,16 @@ DETAIL_KEYS = (
     "target1_eta_minutes", "target2_eta_minutes",
     "stop_first_risk_probability", "target1_before_stop_probability",
     "target_probability_confidence", "target_probability_label",
+    "strategy_engine_version", "strategy_type_v51",
+    "persistence_score", "persistence_confidence", "persistence_grade", "persistence_mode",
+    "persistence_projected", "observed_minutes", "remaining_minutes", "persistence_horizon_minutes",
+    "persistence_vwap_hold_ratio", "persistence_structure_score", "persistence_cycle_score",
+    "pattern_fatigue", "pattern_fatigue_reasons",
+    "liquidity_tier1_pass", "liquidity_tier2_pass", "liquidity_tier3_pass", "liquidity_score",
+    "liquidity_day_value", "liquidity_hour_value", "liquidity_day_required", "liquidity_hour_required",
+    "data_freshness_pass", "data_bar_age_seconds", "recovery_window_minutes",
+    "model_raw_score", "calibrated_probability", "calibration_samples", "calibration_state",
+    "final_buy", "final_buy_checks", "final_buy_reasons",
     "strategy_type", "strategy_entry", "strategy_target1", "strategy_target2", "strategy_stop",
     "trade_decision", "trade_decision_reasons", "final_candidate", "final_candidate_before_safety",
     "execution_safety_passed", "execution_safety_reasons",
@@ -889,8 +947,12 @@ def main() -> int:
                             break
                         timestamp = int(time.time())
                         if issuing:
-                            item = analyze_one(engine, policy, finalize, market, member)
+                            cycle_state = load_cycle_state_v51(db, market, member[0], timestamp)
+                            item = analyze_one(engine, policy, finalize, market, member, cycle_state)
                             if item:
+                                updated_cycle = item.pop("_cycle_state_v51", cycle_state)
+                                updated_cycle["trade_date"] = cycle_state.get("trade_date") or datetime.fromtimestamp(timestamp, tz=KST).strftime("%Y%m%d")
+                                save_cycle_state_v51(db, market, member[0], updated_cycle)
                                 store_result(db, market, item, timestamp, max(60, args.signal_bucket))
                         else:
                             price = refresh_quote_only(engine, market, member)
