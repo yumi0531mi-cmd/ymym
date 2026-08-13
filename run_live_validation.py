@@ -48,6 +48,9 @@ FAST_POOL_REFRESH_SEC = 45
 FAST_PRECISE_PER_LOOP = 1
 FAST_FOCUS_QUOTE_SEC = 3
 FAST_FOCUS_FULL_SEC = 60
+LIQUIDITY_TOP_N = 100
+PRECISE_PRIORITY_N = 30
+FULL_UNION_REVISIT_SEC = 300
 
 
 KR_UNIVERSE = [
@@ -831,13 +834,22 @@ def refresh_quote_only(engine, market: str, member: tuple[str, str, str]) -> flo
         return 0.0
 
 
-def discover_market_members(engine, market: str, limit: int = 18) -> list[tuple[str, str, str]]:
+def discover_market_members(engine, market: str, limit: int = 200) -> list[tuple[str, str, str]]:
+    """거래량 TOP100 ∪ 거래대금 TOP100 합집합 후보풀.
+
+    주의:
+    - '교집합'이 아니라 합집합이다.
+    - KIS 엔진이 실제 반환한 실시간 후보 집합 안에서 거래량/거래대금 순위를 각각 계산한다.
+    - 정밀분석에서는 0.5~5% confirmed Swing/Persistence/Risk를 그대로 사용한다.
+    """
     modes = (
-        ("국내 돌파", "국내 거래대금 급증")
+        ("국내 돌파", "국내 거래대금 급증", "국내 우량주")
         if market == "KR"
         else ("미국 30분 1% 타점", "미국 급등주")
     )
+
     ranked: dict[str, dict] = {}
+
     for mode in modes:
         try:
             candidates = engine.candidates(mode) or []
@@ -846,55 +858,151 @@ def discover_market_members(engine, market: str, limit: int = 18) -> list[tuple[
                 ticker = str(c.get("ticker") or c.get("code") or "").upper().strip()
                 if not ticker:
                     continue
+
                 old = ranked.get(ticker, {})
-                price = f(c.get("screen_price") or c.get("price") or old.get("screen_price"))
-                volume = int(f(c.get("screen_volume") or c.get("volume") or c.get("accumulated_volume") or old.get("screen_volume")))
+                price = f(
+                    c.get("screen_price")
+                    or c.get("price")
+                    or c.get("current_price")
+                    or old.get("screen_price")
+                )
+                volume = int(f(
+                    c.get("screen_volume")
+                    or c.get("volume")
+                    or c.get("accumulated_volume")
+                    or old.get("screen_volume")
+                ))
+                # KIS 후보 응답에 거래대금 필드가 있으면 그것을 우선하고,
+                # 없을 때만 price*volume을 근사값으로 사용한다.
+                value = f(
+                    c.get("screen_value")
+                    or c.get("turnover")
+                    or c.get("trading_value")
+                    or c.get("accumulated_value")
+                    or old.get("screen_value")
+                )
+                if value <= 0 and price > 0 and volume > 0:
+                    value = price * volume
+
                 change = f(
                     c.get("screen_change")
                     if c.get("screen_change") is not None
                     else c.get("change_percent", c.get("change", old.get("screen_change", 0)))
                 )
+
+                exchange = str(
+                    c.get("exchange")
+                    or old.get("exchange")
+                    or ("KR" if market == "KR" else "")
+                ).upper().strip()
+
+                # 미국 거래소를 모르면 NASDAQ으로 억지 지정하지 않는다.
+                if market == "US" and exchange not in {"NASDAQ", "NYSE", "AMEX"}:
+                    old_ex = str(old.get("exchange") or "").upper().strip()
+                    exchange = old_ex if old_ex in {"NASDAQ", "NYSE", "AMEX"} else ""
+
                 ranked[ticker] = {
                     "ticker": ticker,
                     "name": str(c.get("name") or old.get("name") or ticker),
-                    "exchange": str(c.get("exchange") or old.get("exchange") or ("KR" if market == "KR" else "NASDAQ")),
-                    "screen_price": price,
+                    "exchange": exchange,
+                    "screen_price": price if price > 0 else f(old.get("screen_price")),
                     "screen_volume": max(volume, int(f(old.get("screen_volume")))),
+                    "screen_value": max(value, f(old.get("screen_value"))),
                     "screen_change": change,
+                    "sources": sorted(set((old.get("sources") or []) + [mode])),
                 }
             del candidates
         except Exception as exc:
             logging.debug("동적 후보 검색 실패 %s %s: %s", market, mode, exc)
 
-    rows = []
+    # 최소 체결 가능성 필터. '순위' 전에 말도 안 되는 데이터만 제거한다.
+    eligible = []
     for c in ranked.values():
         price = f(c.get("screen_price"))
         volume = int(f(c.get("screen_volume")))
+        value = f(c.get("screen_value"))
         change = f(c.get("screen_change"))
-        value = price * volume
+
         if market == "KR":
-            valid = 1000 <= price <= 500000 and -1.0 <= change < 18 and volume >= 50000 and value >= 8_000_000_000
-            score = min(value / 50_000_000_000, 4.0) + min(volume / 500_000, 3.0) + max(0.0, change) * 0.12
+            valid = (
+                1000 <= price <= 1_000_000
+                and volume >= 20_000
+                and value >= 2_000_000_000
+                and -12 <= change < 30
+            )
         else:
-            valid = 0.5 <= price <= 500 and -1.5 <= change < 40 and volume >= 50000 and value >= 5_000_000
-            score = min(value / 50_000_000, 4.0) + min(volume / 1_000_000, 3.0) + max(0.0, change) * 0.10
+            valid = (
+                0.20 <= price <= 1_000
+                and volume >= 20_000
+                and value >= 1_000_000
+                and -20 <= change < 150
+                and str(c.get("exchange") or "") in {"NASDAQ", "NYSE", "AMEX"}
+            )
         if valid:
-            rows.append((
-                score,
-                value,
-                (
-                    str(c["ticker"]),
-                    str(c.get("name") or c["ticker"]),
-                    str(c.get("exchange") or ("KR" if market == "KR" else "NASDAQ")),
-                ),
-            ))
-    rows.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    members = [member for _, _, member in rows[:limit]]
-    if members:
-        logging.info("%s 동적 후보 %d종목 발견 (상위 %d 사용)", market, len(ranked), len(members))
+            eligible.append(c)
+
+    # 각각 TOP100을 만든 뒤 합집합.
+    by_volume = sorted(
+        eligible,
+        key=lambda x: (int(f(x.get("screen_volume"))), f(x.get("screen_value"))),
+        reverse=True,
+    )[:LIQUIDITY_TOP_N]
+
+    by_value = sorted(
+        eligible,
+        key=lambda x: (f(x.get("screen_value")), int(f(x.get("screen_volume")))),
+        reverse=True,
+    )[:LIQUIDITY_TOP_N]
+
+    union: dict[str, dict] = {}
+    vol_rank = {str(c["ticker"]): i + 1 for i, c in enumerate(by_volume)}
+    val_rank = {str(c["ticker"]): i + 1 for i, c in enumerate(by_value)}
+
+    for c in by_volume + by_value:
+        ticker = str(c["ticker"])
+        d = dict(c)
+        d["volume_rank"] = vol_rank.get(ticker)
+        d["value_rank"] = val_rank.get(ticker)
+
+        # 합집합 안의 우선순위만 계산한다.
+        # 정밀 매수 판정은 절대 이 점수로 하지 않고 공통 전략엔진이 수행한다.
+        vr = d["volume_rank"] or 150
+        tr = d["value_rank"] or 150
+        rank_score = (101 - min(vr, 101)) * 0.40 + (101 - min(tr, 101)) * 0.60
+
+        # 직선 급등/급락을 정밀분석 최우선에 두지 않도록 가벼운 추격 감점.
+        ch = abs(f(d.get("screen_change")))
+        chase_penalty = max(0.0, ch - 12.0) * 1.5
+        d["liquidity_priority_score"] = rank_score - chase_penalty
+        union[ticker] = d
+
+    ordered = sorted(
+        union.values(),
+        key=lambda x: (
+            f(x.get("liquidity_priority_score")),
+            f(x.get("screen_value")),
+            int(f(x.get("screen_volume"))),
+        ),
+        reverse=True,
+    )
+
+    if ordered:
+        members = [
+            (
+                str(c["ticker"]),
+                str(c.get("name") or c["ticker"]),
+                str(c.get("exchange") or ("KR" if market == "KR" else "")),
+            )
+            for c in ordered[:max(1, min(limit, len(ordered)))]
+        ]
+        logging.info(
+            "%s 유동성 합집합 후보: eligible=%d volumeTop=%d valueTop=%d union=%d 사용=%d",
+            market, len(eligible), len(by_volume), len(by_value), len(ordered), len(members)
+        )
         return members
+
     fallback = KR_UNIVERSE if market == "KR" else US_UNIVERSE
-    logging.warning("%s 동적 후보 없음 - 고정 안전망 %d종목 사용", market, len(fallback))
+    logging.warning("%s 유동성 TOP100 합집합 후보 없음 - 고정 안전망 %d종목 사용", market, len(fallback))
     return list(fallback)
 
 
@@ -1100,7 +1208,7 @@ def fast_daemon(markets: str = "BOTH") -> int:
                     now = datetime.now(KST)
                     # 후보 pool은 UI와 무관하게 저빈도로만 갱신
                     if not pools[market] or time.time() - pool_at[market] >= FAST_POOL_REFRESH_SEC:
-                        pools[market] = discover_market_members(engine, market, 10000)
+                        pools[market] = discover_market_members(engine, market, LIQUIDITY_TOP_N * 2)
                         pool_at[market] = time.time()
                         cursor[market] %= max(1, len(pools[market]))
 
@@ -1125,16 +1233,24 @@ def fast_daemon(markets: str = "BOTH") -> int:
                     # 일반 후보는 매 loop 딱 1종목만 정밀분석
                     pool = pools[market]
                     if pool:
-                        member = pool[cursor[market] % len(pool)]
+                        # 앞 30개는 반복단타 정밀분석 우선순위가 높은 후보.
+                        # 나머지 합집합 후보도 버리지 않고 cursor가 계속 순환해 재검사한다.
+                        idx = cursor[market] % len(pool)
+                        member = pool[idx]
                         cursor[market] = (cursor[market] + 1) % len(pool)
                         key = f"{market}:{member[0]}"
-                        # 같은 1분봉 동안 같은 종목의 Swing/Persistence를 다시 계산하지 않는다.
-                        due = time.time() - precise_last_at.get(key, 0.0) >= 55.0
+
+                        is_priority = idx < min(PRECISE_PRIORITY_N, len(pool))
+                        min_gap = 55.0 if is_priority else FULL_UNION_REVISIT_SEC
+                        due = time.time() - precise_last_at.get(key, 0.0) >= min_gap
+
                         if due and not (focus and focus[0] == market and focus[1][0] == member[0]):
                             cs = load_cycle_state_v51(db, market, member[0], int(time.time()))
                             item = analyze_one(engine, policy, finalize, market, member, cs)
                             precise_last_at[key] = time.time()
                             if item:
+                                item["liquidity_union_priority"] = is_priority
+                                item["liquidity_union_pool_size"] = len(pool)
                                 new_cs = item.pop("_cycle_state_v51", cs)
                                 save_cycle_state_v51(db, market, member[0], new_cs)
                                 save_fast_snapshot(db, market, member, item, precise=True)
