@@ -35,8 +35,48 @@ from persistence_engine import (
     evaluate_strategy as evaluate_strategy_v51,
     update_cycle_state as update_cycle_state_v51,
     calibrated_from_db as calibrated_from_db_v51,
-    evaluate_live_quote_risk,
 )
+
+
+def evaluate_live_quote_risk(item: dict, price: float) -> dict:
+    """현재가만으로 Soft/Hard Stop을 빠르게 확인하는 UI 경량 함수."""
+    out = dict(item or {})
+    try:
+        px = float(price or 0)
+    except Exception:
+        px = 0.0
+    if px <= 0:
+        out["live_risk_quote_valid"] = False
+        return out
+
+    def n(v):
+        try:
+            x = float(v or 0)
+            return x if math.isfinite(x) else 0.0
+        except Exception:
+            return 0.0
+
+    out["price"] = px
+    soft = n(out.get("post_entry_soft_stop", out.get("soft_stop_price")))
+    hard = n(out.get("post_entry_hard_stop", out.get("hard_stop_price", out.get("stop_loss"))))
+    state = str(out.get("post_entry_risk_state") or "FORMING")
+
+    if hard > 0 and px <= hard:
+        out.update(
+            post_entry_risk_state="HARD_EXIT",
+            post_entry_risk_label="🚨 Hard Stop 실시간 이탈",
+            post_entry_action="즉시손절",
+        )
+    elif soft > 0 and px < soft and state not in {"REAL_BREAKDOWN", "HARD_EXIT"}:
+        out.update(
+            post_entry_risk_state="WARNING",
+            post_entry_risk_label="🟠 Soft Stop 아래 · 1분봉 회복/붕괴 확인 중",
+            post_entry_action="신규진입중지·회복확인",
+        )
+
+    out["live_risk_quote_valid"] = True
+    out["live_risk_price"] = px
+    return out
 
 st.set_page_config(page_title="반복단타 스캐너 v5.5", page_icon="⚡", layout="wide")
 
