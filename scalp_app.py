@@ -631,6 +631,22 @@ def post_entry_risk_plan(item, market_code):
         return item
 
     price = _num(item.get("price"), float(frame["close"].iloc[-1]))
+
+    # 반복 스윙이 아직 검증되지 않았으면 손절/보유 판정을 만들지 않는다.
+    if not bool(item.get("swing_cycle_valid")):
+        item.update(
+            post_entry_risk_state="FORMING",
+            post_entry_risk_label="⚪ 반복 스윙 자료 형성 중",
+            post_entry_action="매수대기",
+            post_entry_soft_stop=0.0,
+            post_entry_hard_stop=0.0,
+            post_entry_noise_buffer=0.0,
+            post_entry_shakeout=False,
+            post_entry_real_breakdown=False,
+            post_entry_upside_breakout=False,
+        )
+        return item
+
     support = _num(item.get("repeat_support", item.get("structural_support")))
     atr14, median_range = _atr_and_range(frame)
     swing_down = _num(item.get("swing_down_width_percent"))
@@ -2139,9 +2155,14 @@ def _locked_entry_plan(ticker:str, proposed:float, stop:float, target1:float, pr
         invalidated=(stop>0 and price<=stop) or (target1>0 and price>=target1)
         reset=expired or structural_shift or invalidated
 
+    # 유효한 매매계획이 없으면 현재가를 가짜 매수가로 대체하지 않는다.
+    plan_valid = proposed > 0 and stop > 0 and target1 > proposed
+    if not plan_valid:
+        locks.pop(ticker, None)
+        return 0.0, 0.0, 0.0, 0
+
     if not rec or reset or float(rec.get("entry",0) or 0)<=0:
-        entry=proposed if proposed>0 else price
-        rec={"entry":entry,"locked_at":now_ts}
+        rec={"entry":proposed,"locked_at":now_ts}
         locks[ticker]=rec
 
     entry=float(rec.get("entry",0) or 0)
@@ -2292,7 +2313,7 @@ def update_prediction_audit(ticker,price,item,now_ts):
 st.title("⚡ 초단타 VWAP 매수타점")
 st.caption("거래량 상위 30개를 순환 분석하고, 우상향/박스 엔진을 분리합니다. 상단의 5·15·30·60분 값은 과거가 아니라 현재 차트 기반 향후 조건부 예상입니다.")
 with st.sidebar:
-    market=st.radio("시장",["국내","미국"],horizontal=True); session_info=market_clock(market); st.caption(f"{session_info['session']} · {session_info['local_time']}"); mode="국내 30분 1% 타점" if market=="국내" else "미국 30분 1% 타점"; minimum_score=st.slider("최소 점수",30,90,50,5); manual_ticker=st.text_input("종목명 또는 종목코드 검색",placeholder="현대차, 005380, SOXL").strip(); run_mode=st.radio("실행 모드",["빠른 자동스캔","선택 종목 집중","검증기 상태"],key="scalp_run_mode"); focus_only=run_mode=="선택 종목 집중"; auto_audit=run_mode=="검증기 상태"; require_validation=st.toggle("실전 검증 잠금",True); st.caption("반복단타 기본폭 0.5~1.5%")
+    market=st.radio("시장",["국내","미국"],horizontal=True); session_info=market_clock(market); st.caption(f"{session_info['session']} · {session_info['local_time']}"); mode="국내 30분 1% 타점" if market=="국내" else "미국 30분 1% 타점"; minimum_score=st.slider("최소 점수",30,90,50,5); manual_ticker=st.text_input("종목명 또는 종목코드 검색",placeholder="현대차, 005380, SOXL").strip(); run_mode=st.radio("실행 모드",["빠른 자동스캔","선택 종목 집중","검증기 상태"],key="scalp_run_mode"); focus_only=run_mode=="선택 종목 집중"; auto_audit=run_mode=="검증기 상태"; require_validation=st.toggle("실전 검증 잠금",True); st.caption("대표 스윙 반복폭 0.5~5.0% · 최근 실제 반복 Swing 기준")
 now=time.time(); live_refresh_active=True; st_autorefresh(interval=3000 if focus_only else 5000,key="scalp_tick")
 if auto_audit: st.caption("자동검증은 별도 run_live_validation.py 프로세스에서 실행합니다.")
 
@@ -2388,9 +2409,17 @@ if not quality_passed or not latest.get("repeat_quality_pass",False) or not late
 elif require_validation and not validated: level="warning"
 elif state not in {"BUY_PULLBACK","HOLD_OR_BREAKOUT"} or buy_votes<4: level="warning"
 latest["entry_checks_passed"]=level=="success"
-if level=="success": st.success(f"🟢 매수 검토 · 반복폭 {width:.2f}% · 1차 {fmt(t1)}")
-elif state=="TAKE_PROFIT": st.warning(f"🟠 1차 목표 접근 · {fmt(t1)}")
-else: st.info(f"🟡 대기 · 반복폭 {width:.2f}%")
+if not bool(latest.get("swing_cycle_valid")):
+    st.info(
+        f"⚪ 매수 대기 · 반복 Swing 형성 중 · "
+        f"유효 반복 {int(latest.get('repeat_oscillation_count',0) or 0)}회"
+    )
+elif level=="success":
+    st.success(f"🟢 매수 검토 · 대표 스윙폭 {width:.2f}% · 1차 {fmt(t1)}")
+elif state=="TAKE_PROFIT":
+    st.warning(f"🟠 1차 목표 접근 · {fmt(t1)}")
+else:
+    st.info(f"🟡 대기 · 대표 스윙폭 {width:.2f}%")
 
 ff=latest.get("forward_forecasts",{}) or {}
 forecast_cols=st.columns(4)
@@ -2407,7 +2436,25 @@ st.caption(
     f"큰 추세: {intraday_label} · {intraday_reason}"
 )
 
-cols=st.columns(6); cols[0].metric(f"{selected_ticker} · {latest.get('name','')}",fmt(price),f"{change:+.2f}%"); cols[1].metric("재매수 기준",fmt(locked_entry),f"{fmt(entry_zone_low)}~{fmt(entry_zone_high)} · {entry_lock_age}분 유지"); cols[2].metric("1차 목표가",fmt(t1),f"진입기준 +{width:.2f}%"); cols[3].metric("2차 목표가",fmt(t2) if t2>0 else "-",f"{float(latest.get('target2_upside_percent',0) or 0):+.2f}%" if t2>0 else None); cols[4].metric("현재 차트 지지",fmt(support)); cols[5].metric("손절가",fmt(stop))
+cols=st.columns(6)
+cols[0].metric(f"{selected_ticker} · {latest.get('name','')}",fmt(price),f"{change:+.2f}%")
+cols[1].metric(
+    "재매수 기준",
+    fmt(locked_entry) if locked_entry>0 else "-",
+    (f"{fmt(entry_zone_low)}~{fmt(entry_zone_high)} · {entry_lock_age}분 유지" if locked_entry>0 else "유효 Swing Low 형성 대기"),
+)
+cols[2].metric(
+    "1차 목표가",
+    fmt(t1) if t1>0 else "-",
+    (f"대표 스윙폭 {width:.2f}%" if t1>0 and width>0 else "다음 Swing High 형성 대기"),
+)
+cols[3].metric(
+    "2차 목표가",
+    fmt(t2) if t2>0 else "-",
+    f"{float(latest.get('target2_upside_percent',0) or 0):+.2f}%" if t2>0 else None,
+)
+cols[4].metric("현재 차트 지지",fmt(support) if support>0 else "-")
+cols[5].metric("손절가",fmt(stop) if stop>0 else "-")
 risk_state=str(latest.get("post_entry_risk_state","FORMING"))
 risk_label=str(latest.get("post_entry_risk_label","⚪ 손절판정 자료 형성 중"))
 risk_action=str(latest.get("post_entry_action","대기"))
@@ -2427,6 +2474,8 @@ elif risk_state=="SHAKEOUT":
     st.success("🟢 지금 손절? → 아니오 · 지지 이탈 후 회복(흔들림 가능)")
 elif risk_state=="UPSIDE_BREAKOUT":
     st.success("🚀 반복상단 돌파 · 고정 상단매도보다 추세추종 우선")
+elif risk_state=="FORMING":
+    st.info("⚪ 지금 손절? → 판정 전 · 반복 스윙/지지/손절 자료 형성 중")
 else:
     st.info(f"🟢 지금 손절? → 아니오 · {risk_label}")
 
