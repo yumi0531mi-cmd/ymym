@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""반복단타 스캐너 v5.5 공통 전략 엔진.
+"""반복단타 스캐너 v5.8 공통 전략 엔진.
 
 목적
 - 실제 1분봉에서 0.5~5.0% 완성 Swing을 미래봉 없이 탐지
@@ -26,7 +26,7 @@ except Exception:
 
 KST = timezone(timedelta(hours=9), name="KST")
 ET = ZoneInfo("America/New_York")
-VERSION = "v5.5-online-swing"
+VERSION = "v5.8-strategy-unchanged"
 SCHEMA_VERSION = "v5.5-schema-1"
 PLAN_VERSION = "v5.5-plan-1"
 SWING_MIN, SWING_MAX, MIN_SWINGS = 0.50, 5.00, 3
