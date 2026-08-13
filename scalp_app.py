@@ -35,6 +35,7 @@ from persistence_engine import (
     evaluate_strategy as evaluate_strategy_v51,
     update_cycle_state as update_cycle_state_v51,
     calibrated_from_db as calibrated_from_db_v51,
+    evaluate_live_quote_risk,
 )
 
 st.set_page_config(page_title="반복단타 스캐너 v5.5", page_icon="⚡", layout="wide")
@@ -1923,7 +1924,7 @@ def _trim_heavy_item(item:dict, keep_bars:int=360) -> dict:
     return item
 
 
-@st.cache_data(ttl=90,show_spinner=False,max_entries=4)
+@st.cache_data(ttl=180,show_spinner=False,max_entries=4)
 def discovery_snapshot(market:str):
     """고정 TopN 없이 KIS가 제공하는 넓은 실시간 모집단을 경량 필터 후 정밀분석한다."""
     ranked={}
@@ -2113,7 +2114,11 @@ def _candidate_public_view(item:dict,row:dict,market:str):
 
 
 def dynamic_repeat_candidates(market:str,minimum_score:float,limit:int=6):
-    """v5.4 시간예산 증분 스캔: 고정 TopN 없이 rerun당 최대 3개만 정밀분석."""
+    """v5.6 초고속 증분 스캔: 고정 TopN 없이 rerun당 1개만 정밀분석.
+
+    UI를 멈추게 하는 가장 큰 원인은 한 rerun에서 여러 KIS 분봉 분석을 직렬 호출하는 것이므로
+    후보 발견은 캐시하고, 정밀분석은 매 화면 주기 1종목씩만 순환한다.
+    """
     snap=discovery_snapshot(market)
     rows=list(snap["rows"])
     if not rows:
@@ -2133,8 +2138,8 @@ def dynamic_repeat_candidates(market:str,minimum_score:float,limit:int=6):
     analyzed=0
     width_pass=0
     attempted=0
-    for offset in range(min(3,len(rows))):
-        if time.perf_counter()-cycle_started>2.2:
+    for offset in range(min(1,len(rows))):
+        if time.perf_counter()-cycle_started>1.2:
             break
         row=rows[(cursor+offset)%len(rows)]
         attempted+=1
@@ -2249,19 +2254,8 @@ def light_quote_refresh(item:dict,row:dict,mode:str):
                 screen_change=change,
                 change_validation_source=source,
             )
-        # 기존 분석에서 계산된 stop을 실시간 현재가와만 비교해 긴급상태는 즉시 반영한다.
-        price=_num(out.get("price"))
-        soft=_num(out.get("post_entry_soft_stop"))
-        hard=_num(out.get("post_entry_hard_stop",out.get("stop_loss")))
-        state=str(out.get("post_entry_risk_state","FORMING"))
-        if hard>0 and price>0 and price<=hard:
-            out["post_entry_risk_state"]="HARD_EXIT"
-            out["post_entry_risk_label"]="🚨 Hard Stop 실시간 이탈"
-            out["post_entry_action"]="즉시손절"
-        elif soft>0 and price>0 and price<soft and state not in {"REAL_BREAKDOWN","HARD_EXIT"}:
-            out["post_entry_risk_state"]="WARNING"
-            out["post_entry_risk_label"]="🟠 Soft Stop 아래 · 다음 분봉 회복 확인"
-            out["post_entry_action"]="회복대기"
+        # 2~5초 위험판정도 공통 전략엔진 한 곳만 사용한다.
+        out=evaluate_live_quote_risk(out,_num(out.get("price")))
     except Exception as exc:
         out["light_quote_error"]=f"{type(exc).__name__}: {exc}"
     return out
@@ -2390,10 +2384,10 @@ def update_prediction_audit(ticker,price,item,now_ts):
 
 
 st.title("⚡ 초단타 VWAP 매수타점")
-st.caption("고정 Top30 없이 넓게 경량 탐색하고, 우선 후보만 시간예산으로 정밀분석합니다. 상단의 5·15·30·60분 값은 과거가 아니라 현재 차트 기반 향후 조건부 예상입니다.")
+st.caption("고정 Top30 없이 넓게 탐색합니다. 현재가·손절위험은 빠르게, Swing/Persistence 구조는 새 분봉 중심으로 느리게 갱신해 화면 멈춤을 줄였습니다.")
 with st.sidebar:
-    market=st.radio("시장",["국내","미국"],horizontal=True); session_info=market_clock(market); st.caption(f"{session_info['session']} · {session_info['local_time']}"); mode="국내 30분 1% 타점" if market=="국내" else "미국 30분 1% 타점"; minimum_score=st.slider("최소 점수",30,90,50,5); manual_ticker=st.text_input("종목명 또는 종목코드 검색",placeholder="현대차, 005380, SOXL").strip(); run_mode=st.radio("실행 모드",["빠른 자동스캔","선택 종목 집중","검증기 상태"],key="scalp_run_mode"); focus_only=run_mode=="선택 종목 집중"; auto_audit=run_mode=="검증기 상태"; require_validation=st.toggle("실전 검증 잠금",True); st.caption("v5.4 · 실제 Swing 0.5~5.0% · Fail-Closed · 시간예산 스캔")
-now=time.time(); live_refresh_active=True; st_autorefresh(interval=3000 if focus_only else 5000,key="scalp_tick")
+    market=st.radio("시장",["국내","미국"],horizontal=True); session_info=market_clock(market); st.caption(f"{session_info['session']} · {session_info['local_time']}"); mode="국내 30분 1% 타점" if market=="국내" else "미국 30분 1% 타점"; minimum_score=st.slider("최소 점수",30,90,50,5); manual_ticker=st.text_input("종목명 또는 종목코드 검색",placeholder="현대차, 005380, SOXL").strip(); run_mode=st.radio("실행 모드",["빠른 자동스캔","선택 종목 집중","검증기 상태"],key="scalp_run_mode"); focus_only=run_mode=="선택 종목 집중"; auto_audit=run_mode=="검증기 상태"; require_validation=st.toggle("실전 검증 잠금",True); st.caption("v5.6 FAST · 실제 Swing 0.5~5.0% · 2~5초 위험감시 + 1분봉 구조분석 분리")
+now=time.time(); live_refresh_active=True; st_autorefresh(interval=2500 if focus_only else 4000,key="scalp_tick")
 if auto_audit: st.caption("자동검증은 별도 run_live_validation.py 프로세스에서 실행합니다.")
 
 startup_key=f"fast_ui_started::{market}"
@@ -2476,7 +2470,7 @@ if st.session_state.get("scalp_selected")!=selected_ticker: st.session_state["sc
 latest=dict(st.session_state.get("scalp_latest",{}))
 # 집중모드: 전체 분봉/스윙 계산은 15초, 현재가는 3초마다 KIS quote만 갱신.
 # 자동스캔: 선택 상세분석 30초, 검증기상태: 60초.
-refresh_seconds=15 if focus_only else 60 if auto_audit else 30
+refresh_seconds=60 if focus_only else 120 if auto_audit else 90
 due=not latest or now-float(st.session_state.get("scalp_last_precise",0))>=refresh_seconds
 if due:
     try:
@@ -2490,7 +2484,7 @@ if due:
             st.stop()
 else:
     # full analysis 사이에는 현재가만 빠르게 갱신한다.
-    light_due=focus_only and now-float(st.session_state.get("scalp_last_light_quote",0))>=2.5
+    light_due=focus_only and now-float(st.session_state.get("scalp_last_light_quote",0))>=2.0
     if light_due:
         latest=light_quote_refresh(latest,selected_row,mode)
         st.session_state["scalp_latest"]=latest
