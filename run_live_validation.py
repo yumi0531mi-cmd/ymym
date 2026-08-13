@@ -262,10 +262,10 @@ def analyze_one(engine, policy, finalize, market: str, member: tuple[str, str, s
     try:
         result = engine.analyze(row_for(ticker, name, exchange), mode)
         result = policy(finalize(result), mode)
-        result = hourly_structure_plan(result)
+        result = hourly_structure_plan(result, market_name)
         result = apply_repeat_scalp_overlay(result, market)
         result = adapt_repeat_overlay(result)
-        result = intraday_regime_plan(result)
+        result = intraday_regime_plan(result, market_name)
 
         quality_rows, gate, spread = data_quality_gate(result, market_name)
         if spread is not None:
@@ -273,7 +273,7 @@ def analyze_one(engine, policy, finalize, market: str, member: tuple[str, str, s
         result["data_gate_rows"] = quality_rows
         result["data_gate_passed"] = bool(gate and result.get("repeat_quality_pass", False))
 
-        result = forward_forecast_plan(result)
+        result = forward_forecast_plan(result, market_name)
         result = execution_safety_plan(result, market_name)
         result = target_probability_plan(result)
         flags = _forecast_flags(result)
