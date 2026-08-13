@@ -1,19 +1,17 @@
 # -*- coding: utf-8 -*-
-"""반복단타 스캐너 v5.7 FAST UI.
+"""반복단타 스캐너 v5.8 FAST UI.
 
 중요:
-- 이 Streamlit 파일은 KIS 후보검색/분봉 정밀분석을 직접 하지 않는다.
-- run_live_validation.py --fast-daemon 프로세스가 뒤에서 계산한다.
-- UI는 SQLite snapshot만 읽으므로 시장전환/종목선택이 빠르다.
+- 전략 계산은 하나도 삭제하지 않는다.
+- KIS 후보검색/분봉/Swing/Persistence는 단일 백그라운드 thread가 담당한다.
+- Streamlit UI는 SQLite snapshot만 읽는다.
+- 같은 종목 정밀계산은 새 1분봉 주기에 맞춰 재사용한다.
 """
 from __future__ import annotations
 
 import json
 import math
-import os
 import sqlite3
-import subprocess
-import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,8 +19,9 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+from run_live_validation import start_fast_worker
 
-st.set_page_config(page_title="반복단타 스캐너 v5.7 FAST", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="반복단타 스캐너 v5.8 FAST", page_icon="⚡", layout="wide")
 
 ROOT = Path(__file__).resolve().parent
 FAST_DB = ROOT / "validation_data" / "fast_scanner.sqlite3"
@@ -76,21 +75,9 @@ def ensure_daemon():
     state=daemon_state()
     if state and time.time()-n(state.get("heartbeat"))<DAEMON_STALE_SEC:
         return state, False
-    script=ROOT/"run_live_validation.py"
-    if not script.exists():
-        return state, False
-    launch_key="fast_daemon_launch_at"
-    if time.time()-n(st.session_state.get(launch_key))<10:
-        return state, False
     try:
-        kwargs={"cwd":str(ROOT),"stdout":subprocess.DEVNULL,"stderr":subprocess.DEVNULL}
-        if os.name=="nt":
-            kwargs["creationflags"]=getattr(subprocess,"CREATE_NO_WINDOW",0)
-        else:
-            kwargs["start_new_session"]=True
-        subprocess.Popen([sys.executable,str(script),"--fast-daemon","--markets","BOTH"],**kwargs)
-        st.session_state[launch_key]=time.time()
-        return state, True
+        info=start_fast_worker("BOTH")
+        return state, bool(info.get("started"))
     except Exception as exc:
         st.session_state["daemon_launch_error"]=f"{type(exc).__name__}: {exc}"
         return state, False
@@ -126,19 +113,19 @@ def age(ts):
     return max(0,int(time.time()-n(ts))) if n(ts)>0 else None
 
 state, launched = ensure_daemon()
-st_autorefresh(interval=2500,key="fast_ui_tick")
+st_autorefresh(interval=5000,key="fast_ui_tick")
 
 with st.sidebar:
     market_name=st.radio("시장",["국내","미국"],horizontal=True)
     market="KR" if market_name=="국내" else "US"
     min_score=st.slider("최소 점수",30,90,50,5)
     query=st.text_input("종목명/코드 필터",placeholder="LK삼양, 225190, SOXL").strip().casefold()
-    st.caption("v5.7 FAST · 화면은 KIS를 직접 호출하지 않습니다.")
+    st.caption("v5.8 FAST · 전략 계산은 유지하고 중복호출만 제거했습니다.")
     st.caption("현재가/위험은 백그라운드에서 빠르게, Swing 구조는 별도로 갱신합니다.")
 
 hb_age=age(state.get("heartbeat")) if state else None
 if launched:
-    st.info("⚙️ 백그라운드 스캐너를 시작했습니다. 첫 후보가 생길 때까지 잠시만 기다리면 화면 조작은 계속 가능합니다.")
+    st.info("⚙️ 스캐너 계산 worker를 시작했습니다. 계산은 뒤에서 진행되며 화면 조작은 계속 가능합니다.")
 elif hb_age is None or hb_age>DAEMON_STALE_SEC:
     err=st.session_state.get("daemon_launch_error") or state.get("last_error","")
     st.warning("백그라운드 스캐너 연결 대기 중" + (f" · {err}" if err else ""))
@@ -150,7 +137,7 @@ if query:
     rows=[x for x in rows if query in str(x.get("_ticker","")).casefold() or query in str(x.get("_name","")).casefold()]
 qualified=[x for x in rows if n(x.get("_score"))>=min_score]
 
-st.title("⚡ 반복단타 스캐너 v5.7 FAST")
+st.title("⚡ 반복단타 스캐너 v5.8 FAST")
 st.caption("0.5~5% 실제 반복 Swing · TREND/RANGE · 5시간 Persistence · 가짜손절/진짜붕괴")
 
 m1,m2,m3,m4=st.columns(4)
