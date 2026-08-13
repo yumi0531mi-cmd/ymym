@@ -22,6 +22,7 @@ import signal
 import sqlite3
 import sys
 import time
+import threading
 import zlib
 
 import pandas as pd
@@ -1085,6 +1086,7 @@ def fast_daemon(markets: str = "BOTH") -> int:
     cursor = {"KR": 0, "US": 0}
     focus_full_at = {}
     focus_quote_at = {}
+    precise_last_at = {}
 
     with fast_connect() as db:
         if not claim_fast_daemon(db):
@@ -1125,10 +1127,13 @@ def fast_daemon(markets: str = "BOTH") -> int:
                     if pool:
                         member = pool[cursor[market] % len(pool)]
                         cursor[market] = (cursor[market] + 1) % len(pool)
-                        # focus와 같은 종목이면 중복 정밀분석 생략
-                        if not (focus and focus[0] == market and focus[1][0] == member[0]):
+                        key = f"{market}:{member[0]}"
+                        # 같은 1분봉 동안 같은 종목의 Swing/Persistence를 다시 계산하지 않는다.
+                        due = time.time() - precise_last_at.get(key, 0.0) >= 55.0
+                        if due and not (focus and focus[0] == market and focus[1][0] == member[0]):
                             cs = load_cycle_state_v51(db, market, member[0], int(time.time()))
                             item = analyze_one(engine, policy, finalize, market, member, cs)
+                            precise_last_at[key] = time.time()
                             if item:
                                 new_cs = item.pop("_cycle_state_v51", cs)
                                 save_cycle_state_v51(db, market, member[0], new_cs)
@@ -1156,6 +1161,30 @@ def fast_daemon(markets: str = "BOTH") -> int:
                 db.commit()
                 time.sleep(2)
 
+
+
+
+_FAST_THREAD_LOCK = threading.Lock()
+_FAST_THREAD = None
+
+def start_fast_worker(markets: str = "BOTH") -> dict:
+    """Streamlit 프로세스 안에서 fast_daemon을 단 한 번만 백그라운드 thread로 시작한다.
+
+    Streamlit UI 요소는 thread에서 절대 만지지 않고 KIS 분석 + SQLite 저장만 수행한다.
+    전략 계산은 persistence_engine.evaluate_strategy()를 그대로 사용한다.
+    """
+    global _FAST_THREAD
+    with _FAST_THREAD_LOCK:
+        if _FAST_THREAD is not None and _FAST_THREAD.is_alive():
+            return {"running": True, "started": False, "name": _FAST_THREAD.name}
+        _FAST_THREAD = threading.Thread(
+            target=fast_daemon,
+            args=(markets,),
+            name="repeat-scalp-fast-worker",
+            daemon=True,
+        )
+        _FAST_THREAD.start()
+        return {"running": True, "started": True, "name": _FAST_THREAD.name}
 
 
 def main() -> int:
