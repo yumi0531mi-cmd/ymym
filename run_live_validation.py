@@ -29,7 +29,7 @@ import pandas as pd
 from datetime import datetime, time as clock_time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from persistence_engine import evaluate_strategy as evaluate_strategy_v51, update_cycle_state as update_cycle_state_v51
+from persistence_engine import evaluate_strategy as evaluate_strategy_v54, update_cycle_state as update_cycle_state_v54
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -329,8 +329,8 @@ def analyze_one(engine, policy, finalize, market: str, member: tuple[str, str, s
         result = execution_safety_plan(result, market_name)
         result = target_probability_plan(result)
         # 검증기도 UI와 동일한 Cooldown/Hard-Kill 상태를 넣어 FINAL_BUY를 계산한다.
-        _cycle_state, result = update_cycle_state_v51(result, cycle_state or {}, int(time.time()))
-        result = evaluate_strategy_v51(result, market, int(time.time()), _cycle_state)
+        _cycle_state, result = update_cycle_state_v54(result, cycle_state or {}, int(time.time()))
+        result = evaluate_strategy_v54(result, market, int(time.time()), _cycle_state)
         result["_cycle_state_v51"] = _cycle_state
         flags = _forecast_flags(result)
         result.update(
