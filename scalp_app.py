@@ -31,6 +31,12 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
+from persistence_engine import (
+    evaluate_strategy as evaluate_strategy_v51,
+    update_cycle_state as update_cycle_state_v51,
+    calibrated_from_db as calibrated_from_db_v51,
+)
+
 st.set_page_config(page_title="초단타 VWAP 타점", page_icon="⚡", layout="wide")
 
 AUDIT_IMPORT_ERROR = "UI에서는 검증기를 직접 실행하지 않습니다. 별도 프로세스로 실행하세요."
@@ -435,7 +441,7 @@ def _swing_levels(values, kind="high"):
     return _dedupe_levels(levels)
 
 
-STRATEGY_VERSION = "v3.8-swing-cycle-risk"
+STRATEGY_VERSION = "v5.1-persistence-cycle"
 SWING_LOOKBACK_MINUTES = 180
 SWING_CONTEXT_MINUTES = 360
 SWING_MIN_PERCENT = 0.50
@@ -682,12 +688,17 @@ def post_entry_risk_plan(item, market_code):
             up_vol += vol
     sell_share = down_vol / (down_vol + up_vol) if (down_vol + up_vol) > 0 else 0.5
 
-    below_soft_count = sum(1 for x in closes[-3:] if soft_stop > 0 and x < soft_stop)
-    below_vwap_count = sum(1 for x in closes[-3:] if vwap > 0 and x < vwap)
-    below_ema20_count = sum(1 for x in closes[-3:] if ema20 > 0 and x < ema20)
+    # 종목의 평소 하락스윙 시간에 따라 회복 확인시간을 1~4분으로 동적 설정한다.
+    down_duration = _num(item.get("swing_down_duration_minutes"), 0)
+    recovery_window = int(round(max(1.0, min(4.0, down_duration * 0.25)))) if down_duration > 0 else 2
+    window_n = max(2, min(recovery_window, len(closes)))
 
-    # 최근 3분 안에 지지를 찔렀다가 종가가 되찾았으면 shakeout 후보.
-    pierced = soft_stop > 0 and min(lows[-3:]) < soft_stop
+    below_soft_count = sum(1 for x in closes[-window_n:] if soft_stop > 0 and x < soft_stop)
+    below_vwap_count = sum(1 for x in closes[-window_n:] if vwap > 0 and x < vwap)
+    below_ema20_count = sum(1 for x in closes[-window_n:] if ema20 > 0 and x < ema20)
+
+    # 동적 회복구간 안에 지지를 찔렀다가 종가가 되찾았으면 Shakeout 후보.
+    pierced = soft_stop > 0 and min(lows[-window_n:]) < soft_stop
     reclaimed = soft_stop > 0 and price >= soft_stop and closes[-1] >= soft_stop
     shakeout = pierced and reclaimed and sell_share < 0.70 and volume_burst < 2.0
 
@@ -695,7 +706,11 @@ def post_entry_risk_plan(item, market_code):
     abnormal_down = abs(min(r3, 0.0)) >= max(1.0, typical_down * 0.70)
     fast_down = speed_ratio >= 1.50 or (r3 < 0 and abs(r3) / 3 >= max(0.12, typical_down / max(_num(item.get("swing_down_duration_minutes"), 8.0), 3.0) * 1.5))
     flow_bad = sell_share >= 0.65 or volume_burst >= 1.50
-    structure_bad = below_soft_count >= 2 and (below_vwap_count >= 2 or below_ema20_count >= 2)
+    required_bars = max(1, math.ceil(window_n * 0.67))
+    structure_bad = (
+        below_soft_count >= required_bars
+        and (below_vwap_count >= required_bars or below_ema20_count >= required_bars)
+    )
 
     emergency = (
         (hard_stop > 0 and price <= hard_stop)
@@ -705,13 +720,28 @@ def post_entry_risk_plan(item, market_code):
             and sell_share >= 0.72
         )
     )
-    real_breakdown = (not emergency) and structure_bad and fast_down and flow_bad
+    recovery_failed = (
+        soft_stop > 0
+        and price < soft_stop
+        and below_soft_count >= required_bars
+    )
+    real_breakdown = (
+        (not emergency)
+        and recovery_failed
+        and structure_bad
+        and fast_down
+        and flow_bad
+        and (abnormal_down or speed_ratio >= 1.75)
+    )
     warning = (not emergency and not real_breakdown and not shakeout and soft_stop > 0 and price < soft_stop)
 
     # 위쪽 훅 돌파: 대표 스윙을 훨씬 빠른 속도/거래량으로 넘어설 때 기존 상단 매도를 강제하지 않는다.
-    context_high = _num(item.get("swing_context_high"))
+    # 현재 봉을 포함한 context_high는 돌파기준으로 쓰면 자기 자신을 넘기 어려우므로
+    # 최근 3개 봉을 제외한 '이전 고점'을 실제 상방돌파 기준으로 사용한다.
+    prior_context_high = max(frame["high"].tolist()[:-3]) if len(frame) >= 6 else 0.0
     target1 = _num(item.get("repeat_target1", item.get("structural_target1")))
-    breakout_ref = max(x for x in (context_high, target1) if x > 0) if any(x > 0 for x in (context_high, target1)) else 0.0
+    refs = [x for x in (prior_context_high, target1) if x > 0]
+    breakout_ref = max(refs) if refs else 0.0
     upside_breakout = (
         breakout_ref > 0
         and price > breakout_ref
@@ -727,7 +757,7 @@ def post_entry_risk_plan(item, market_code):
     elif shakeout:
         state, label, action = "SHAKEOUT", "🟢 지지 이탈 후 회복 · 흔들림 가능", "보유/재확인"
     elif warning:
-        state, label, action = "WARNING", "🟠 지지 이탈 · 최대 1~3분 회복 확인", "회복대기"
+        state, label, action = "WARNING", f"🟠 지지 이탈 · 최대 {recovery_window}분 회복 확인", "회복대기"
     elif upside_breakout:
         state, label, action = "UPSIDE_BREAKOUT", "🚀 반복상단 돌파 · 추세확장", "추세추종"
     else:
@@ -751,6 +781,9 @@ def post_entry_risk_plan(item, market_code):
         post_entry_below_soft_count=below_soft_count,
         post_entry_below_vwap_count=below_vwap_count,
         post_entry_below_ema20_count=below_ema20_count,
+        post_entry_recovery_window_minutes=recovery_window,
+        post_entry_recovery_required_bars=required_bars,
+        post_entry_recovery_failed=bool(recovery_failed),
         post_entry_shakeout=bool(shakeout),
         post_entry_real_breakdown=bool(real_breakdown),
         post_entry_upside_breakout=bool(upside_breakout),
@@ -2190,6 +2223,53 @@ def _apply_entry_locks_to_board(rows:list[dict], now_ts:float):
     return out
 
 
+
+def light_quote_refresh(item:dict,row:dict,mode:str):
+    """집중모드 3초 갱신용. 분봉/스윙 전체 재계산 없이 현재가만 KIS에서 갱신한다."""
+    if not isinstance(item,dict):
+        return item
+    out=dict(item)
+    ticker=str((row or {}).get("ticker") or out.get("ticker") or "").upper()
+    exchange=str((row or {}).get("exchange") or out.get("exchange") or "")
+    if not ticker:
+        return out
+    try:
+        if mode.startswith("국내"):
+            q=scanner().client.kr_quote(ticker)
+            price=_num(q.get("price",q.get("current_price",0)))
+            change=_num(q.get("change",q.get("change_percent",out.get("change_percent",0))))
+            if price>0:
+                out["price"]=price
+            out["change_percent"]=change
+        else:
+            q=scanner().client.us_quote(ticker,exchange or "NASDAQ")
+            price,prev,change,source=verified_us_change(q,_num(out.get("price")))
+            if price>0:
+                out["price"]=price
+            out.update(
+                previous_close=prev,
+                change_percent=change,
+                screen_change=change,
+                change_validation_source=source,
+            )
+        # 기존 분석에서 계산된 stop을 실시간 현재가와만 비교해 긴급상태는 즉시 반영한다.
+        price=_num(out.get("price"))
+        soft=_num(out.get("post_entry_soft_stop"))
+        hard=_num(out.get("post_entry_hard_stop",out.get("stop_loss")))
+        state=str(out.get("post_entry_risk_state","FORMING"))
+        if hard>0 and price>0 and price<=hard:
+            out["post_entry_risk_state"]="HARD_EXIT"
+            out["post_entry_risk_label"]="🚨 Hard Stop 실시간 이탈"
+            out["post_entry_action"]="즉시손절"
+        elif soft>0 and price>0 and price<soft and state not in {"REAL_BREAKDOWN","HARD_EXIT"}:
+            out["post_entry_risk_state"]="WARNING"
+            out["post_entry_risk_label"]="🟠 Soft Stop 아래 · 다음 분봉 회복 확인"
+            out["post_entry_action"]="회복대기"
+    except Exception as exc:
+        out["light_quote_error"]=f"{type(exc).__name__}: {exc}"
+    return out
+
+
 def precise_analysis(row:dict,mode:str,fast_scan:bool=False):
     raw=scanner().analyze(dict(row),mode)
     item=_trim_heavy_item(apply_mode_policy(finalize_trade_item(raw),mode),360)
@@ -2228,6 +2308,7 @@ def precise_analysis(row:dict,mode:str,fast_scan:bool=False):
     item["forecast_medium_down"]=bool(flags["medium_down"])
     item["forecast_valid_pullback"]=bool(flags["valid_pullback_forecast"])
     item["data_gate_passed"]=bool(gate and item.get("repeat_quality_pass",False))
+    item=evaluate_strategy_v51(item,"KR" if market=="국내" else "US")
     return _trim_heavy_item(item,360)
 
 
@@ -2246,7 +2327,7 @@ def render_chart(item:dict):
     times=item.get("chart_time_1m",[]) or []; closes=item.get("chart_close_1m",[]) or []; opens=item.get("chart_open_1m",[]) or []; highs=item.get("chart_high_1m",[]) or []; lows=item.get("chart_low_1m",[]) or []; vw=item.get("chart_vwap_1m",[]) or []; e9=item.get("chart_ema9_1m",[]) or []; e20=item.get("chart_ema20_1m",[]) or []; sig=item.get("chart_signal_1m",[]) or []
     n=min(map(len,(times,closes,opens,highs,lows,vw,e9,e20,sig))) if times else 0
     if n<=0: st.info("1분봉 수집 중"); return
-    n=min(n,120); times=times[-n:]; closes=closes[-n:]; opens=opens[-n:]; highs=highs[-n:]; lows=lows[-n:]; vw=vw[-n:]; e9=e9[-n:]; e20=e20[-n:]; sig=sig[-n:]
+    n=min(n,90 if focus_only else 120); times=times[-n:]; closes=closes[-n:]; opens=opens[-n:]; highs=highs[-n:]; lows=lows[-n:]; vw=vw[-n:]; e9=e9[-n:]; e20=e20[-n:]; sig=sig[-n:]
     df=pd.DataFrame({"시간":pd.to_datetime(times,errors="coerce"),"시가":opens,"고가":highs,"저가":lows,"종가":closes,"VWAP":vw,"EMA9":e9,"EMA20":e20,"신호":sig}).dropna(subset=["시간"]); df["색상"]=df.apply(lambda r:"상승" if r["종가"]>=r["시가"] else "하락",axis=1); color=alt.Scale(domain=["상승","하락"],range=["#ef5350","#2962ff"]); base=alt.Chart(df).encode(x=alt.X("시간:T",title=None)); wick=base.mark_rule().encode(y=alt.Y("저가:Q",scale=alt.Scale(zero=False)),y2="고가:Q",color=alt.Color("색상:N",scale=color,legend=None)); body=base.mark_bar(size=7).encode(y="시가:Q",y2="종가:Q",color=alt.Color("색상:N",scale=color,legend=None)); lines=alt.Chart(df).transform_fold(["VWAP","EMA9","EMA20"],as_=["지표","값"]).mark_line().encode(x="시간:T",y=alt.Y("값:Q",scale=alt.Scale(zero=False)),color="지표:N"); chart=wick+body+lines
     levels=[]; entry=float(item.get("structural_entry",0) or 0); support=float(item.get("structural_support",0) or 0); stop=float(item.get("stop_loss",0) or 0); t1=float(item.get("structural_target1",item.get("structural_target",0)) or 0); t2=float(item.get("structural_target2",0) or 0)
     if entry>0: levels.append({"가격":entry,"구간":"반복 매수가"})
@@ -2259,6 +2340,7 @@ def render_chart(item:dict):
     st.altair_chart(chart.properties(height=430),use_container_width=True)
 
 
+@st.cache_data(ttl=60,show_spinner=False,max_entries=64)
 def calibration_stats(ticker:str):
     stats={}
     with db_connect() as db:
@@ -2313,7 +2395,7 @@ def update_prediction_audit(ticker,price,item,now_ts):
 st.title("⚡ 초단타 VWAP 매수타점")
 st.caption("거래량 상위 30개를 순환 분석하고, 우상향/박스 엔진을 분리합니다. 상단의 5·15·30·60분 값은 과거가 아니라 현재 차트 기반 향후 조건부 예상입니다.")
 with st.sidebar:
-    market=st.radio("시장",["국내","미국"],horizontal=True); session_info=market_clock(market); st.caption(f"{session_info['session']} · {session_info['local_time']}"); mode="국내 30분 1% 타점" if market=="국내" else "미국 30분 1% 타점"; minimum_score=st.slider("최소 점수",30,90,50,5); manual_ticker=st.text_input("종목명 또는 종목코드 검색",placeholder="현대차, 005380, SOXL").strip(); run_mode=st.radio("실행 모드",["빠른 자동스캔","선택 종목 집중","검증기 상태"],key="scalp_run_mode"); focus_only=run_mode=="선택 종목 집중"; auto_audit=run_mode=="검증기 상태"; require_validation=st.toggle("실전 검증 잠금",True); st.caption("대표 스윙 반복폭 0.5~5.0% · 최근 실제 반복 Swing 기준")
+    market=st.radio("시장",["국내","미국"],horizontal=True); session_info=market_clock(market); st.caption(f"{session_info['session']} · {session_info['local_time']}"); mode="국내 30분 1% 타점" if market=="국내" else "미국 30분 1% 타점"; minimum_score=st.slider("최소 점수",30,90,50,5); manual_ticker=st.text_input("종목명 또는 종목코드 검색",placeholder="현대차, 005380, SOXL").strip(); run_mode=st.radio("실행 모드",["빠른 자동스캔","선택 종목 집중","검증기 상태"],key="scalp_run_mode"); focus_only=run_mode=="선택 종목 집중"; auto_audit=run_mode=="검증기 상태"; require_validation=st.toggle("실전 검증 잠금",True); st.caption("v5.1 · 실제 Swing 0.5~5.0% · 5시간 지속성/가짜손절/재진입 관리")
 now=time.time(); live_refresh_active=True; st_autorefresh(interval=3000 if focus_only else 5000,key="scalp_tick")
 if auto_audit: st.caption("자동검증은 별도 run_live_validation.py 프로세스에서 실행합니다.")
 
@@ -2323,7 +2405,20 @@ if first_paint:
     st.session_state[startup_key]=True
     dynamic_board={"rows":[],"raw_count":0,"unique_count":0,"stage1_count":0,"analyzed_count":0,"width_pass_count":0,"final_count":0,"fallback_used":False}
 else:
-    dynamic_board={"rows":[],"raw_count":0,"unique_count":0,"stage1_count":0,"analyzed_count":0,"width_pass_count":0,"final_count":0,"fallback_used":False} if manual_ticker else dynamic_repeat_candidates(market,minimum_score,6)
+    if manual_ticker:
+        dynamic_board={"rows":[],"raw_count":0,"unique_count":0,"stage1_count":0,"analyzed_count":0,"width_pass_count":0,"final_count":0,"fallback_used":False}
+    elif focus_only:
+        # 집중모드에서는 백그라운드 후보 정밀분석을 멈춘다.
+        # 기존 자동스캔 후보 캐시만 화면에 유지해 선택종목 분석과 API가 경쟁하지 않게 한다.
+        cached=list((st.session_state.get(f"fast_candidate_cache::{market}",{}) or {}).values())
+        cached=sorted(cached,key=lambda x:float(x.get("rank",0) or 0),reverse=True)[:6]
+        dynamic_board={
+            "rows":cached,"raw_count":0,"unique_count":0,"stage1_count":0,
+            "analyzed_count":0,"width_pass_count":0,"final_count":len(cached),
+            "fallback_used":False,"focus_paused":True
+        }
+    else:
+        dynamic_board=dynamic_repeat_candidates(market,minimum_score,6)
 candidate_board=_apply_entry_locks_to_board(dynamic_board["rows"],now)
 st.subheader("실시간 동적 반복단타 후보")
 if not manual_ticker:
@@ -2333,6 +2428,7 @@ if not manual_ticker:
     f3.metric("이번 새로고침 분석",f"{dynamic_board['analyzed_count']}종목")
     f4.metric("최종 후보",f"{dynamic_board['final_count']}종목")
     if dynamic_board.get("fallback_used"): st.warning("실시간 순위 API 후보가 없어 고정 유니버스를 임시 안전망으로 사용 중입니다.")
+    if dynamic_board.get("focus_paused"): st.caption("⚡ 선택 종목 집중 모드: 후보 정밀스캔 일시정지 · 선택종목 속도 우선")
 if candidate_board:
     st.dataframe(pd.DataFrame([{
         "유형":c.get("trade_type","-"),
@@ -2380,11 +2476,68 @@ else:
 if not options: st.warning("자동 후보가 없습니다. 종목을 직접 검색해 주세요."); st.stop()
 selected_ticker=st.selectbox("집중 분석할 종목",[str(r.get("ticker","")) for r in options],format_func=lambda t:next((f"{t} · {r.get('name',t)}" for r in options if str(r.get('ticker',''))==t),t)); selected_row=next(r for r in options if str(r.get("ticker",""))==selected_ticker); selected_row.setdefault("exchange","KR" if market=="국내" else "NASDAQ")
 if st.session_state.get("scalp_selected")!=selected_ticker: st.session_state["scalp_selected"]=selected_ticker; st.session_state["scalp_last_precise"]=0.0; st.session_state.pop("scalp_latest",None)
-latest=dict(st.session_state.get("scalp_latest",{})); refresh_seconds=5 if focus_only else 60 if auto_audit else 30; due=not latest or now-float(st.session_state.get("scalp_last_precise",0))>=refresh_seconds
+latest=dict(st.session_state.get("scalp_latest",{}))
+# 집중모드: 전체 분봉/스윙 계산은 15초, 현재가는 3초마다 KIS quote만 갱신.
+# 자동스캔: 선택 상세분석 30초, 검증기상태: 60초.
+refresh_seconds=15 if focus_only else 60 if auto_audit else 30
+due=not latest or now-float(st.session_state.get("scalp_last_precise",0))>=refresh_seconds
 if due:
-    try: latest=precise_analysis(selected_row,mode); st.session_state["scalp_latest"]=latest; st.session_state["scalp_last_precise"]=now
-    except Exception as e: st.error(f"분석 대기: {e}"); st.stop()
+    try:
+        latest=precise_analysis(selected_row,mode)
+        st.session_state["scalp_latest"]=latest
+        st.session_state["scalp_last_precise"]=now
+        st.session_state["scalp_last_light_quote"]=now
+    except Exception as e:
+        if not latest:
+            st.error(f"분석 대기: {e}")
+            st.stop()
+else:
+    # full analysis 사이에는 현재가만 빠르게 갱신한다.
+    light_due=focus_only and now-float(st.session_state.get("scalp_last_light_quote",0))>=2.5
+    if light_due:
+        latest=light_quote_refresh(latest,selected_row,mode)
+        st.session_state["scalp_latest"]=latest
+        st.session_state["scalp_last_light_quote"]=now
+# v5.1: DB 보정확률(표본 30건+) + 종목별 Cooldown/Hard-Kill
+try:
+    validation_db=Path(__file__).resolve().parent/"validation_data"/"live_validation.sqlite3"
+    cal_key=f"v51_calibration::{selected_ticker}"
+    cal_rec=st.session_state.get(cal_key,{}) or {}
+    if now-float(cal_rec.get("ts",0) or 0)>=60:
+        cp,cs=calibrated_from_db_v51(
+            validation_db,
+            float(latest.get("model_raw_score",0) or 0),
+            str(latest.get("strategy_type_v51","")),
+            30,
+            10,
+        )
+        cal_rec={"ts":now,"prob":cp,"samples":cs}
+        st.session_state[cal_key]=cal_rec
+    latest["calibrated_probability"]=cal_rec.get("prob")
+    latest["calibration_samples"]=int(cal_rec.get("samples",0) or 0)
+    latest["calibration_state"]="보정완료" if cal_rec.get("prob") is not None and int(cal_rec.get("samples",0) or 0)>=30 else "보정전"
+
+    cycle_states=st.session_state.setdefault("v51_cycle_states",{})
+    cycle_key=f"{market}:{selected_ticker}:{datetime.now(KST).strftime('%Y%m%d')}"
+    cs0=cycle_states.get(cycle_key,{})
+    cs1,latest=update_cycle_state_v51(latest,cs0,now)
+    cycle_states[cycle_key]=cs1
+    latest=evaluate_strategy_v51(
+        latest,
+        "KR" if market=="국내" else "US",
+        now,
+        cs1,
+        latest.get("calibrated_probability"),
+        int(latest.get("calibration_samples",0) or 0),
+    )
+    st.session_state["scalp_latest"]=latest
+except Exception as _v51_exc:
+    latest["v51_error"]=f"{type(_v51_exc).__name__}: {_v51_exc}"
+
 price=float(latest.get("price",0) or 0); change=float(latest.get("change_percent",0) or 0)
+if focus_only:
+    full_age=max(0,int(now-float(st.session_state.get("scalp_last_precise",now) or now)))
+    st.caption(f"⚡ 현재가 3초 갱신 · 스윙/분봉 전체분석 15초 갱신 · 전체분석 {full_age}초 전")
 proposed_entry=float(latest.get("repeat_scalp_buy_level",latest.get("structural_support",latest.get("structural_entry",0))) or 0)
 locked_entry,entry_zone_low,entry_zone_high,entry_lock_age=_locked_entry_plan(
     selected_ticker, proposed_entry,
@@ -2396,8 +2549,13 @@ latest["locked_entry"]=locked_entry
 latest["entry_zone_low"]=entry_zone_low
 latest["entry_zone_high"]=entry_zone_high
 if price<=0: st.error("현재가 미확인"); st.stop()
-try: update_prediction_audit(selected_ticker,price,latest,now)
-except Exception: pass
+audit_key=f"prediction_audit_last::{selected_ticker}"
+if now-float(st.session_state.get(audit_key,0) or 0)>=60:
+    try:
+        update_prediction_audit(selected_ticker,price,latest,now)
+        st.session_state[audit_key]=now
+    except Exception:
+        pass
 quality_rows,quality_passed,_=data_quality_gate(latest,market); regime_name,regime_method=market_regime(latest)
 intraday_label=str(latest.get("intraday_regime_label","⚪ 큰 추세 확인 중"))
 intraday_reason=str(latest.get("intraday_regime_reason",""))
@@ -2455,6 +2613,42 @@ cols[3].metric(
 )
 cols[4].metric("현재 차트 지지",fmt(support) if support>0 else "-")
 cols[5].metric("손절가",fmt(stop) if stop>0 else "-")
+# v5.1 5시간 지속형 핵심 패널
+p_score=float(latest.get("persistence_score",0) or 0)
+p_conf=float(latest.get("persistence_confidence",0) or 0)
+p_grade=str(latest.get("persistence_grade","-"))
+p_mode=str(latest.get("persistence_mode","-"))
+p_remain=int(latest.get("remaining_minutes",0) or 0)
+p_horizon=int(latest.get("persistence_horizon_minutes",0) or 0)
+p_fatigue=float(latest.get("pattern_fatigue",0) or 0)
+p_type=str(latest.get("strategy_type_v51","-"))
+p_raw=float(latest.get("model_raw_score",0) or 0)
+p_cal=latest.get("calibrated_probability")
+p_samples=int(latest.get("calibration_samples",0) or 0)
+p_cal_state=str(latest.get("calibration_state","보정전"))
+p_final=bool(latest.get("final_buy"))
+p_cool=bool(latest.get("cycle_cooldown_active"))
+p_kill=bool(latest.get("cycle_hard_kill"))
+p_obs=int(latest.get("observed_minutes",0) or 0)
+
+if p_final:
+    st.success(f"✅ v5.1 FINAL BUY · {p_type} · 지속성 {p_score:.0f}점")
+else:
+    reasons=latest.get("final_buy_reasons") or []
+    st.info(f"⏳ v5.1 대기 · {p_type} · " + (" / ".join(reasons[:3]) if reasons else "조건 형성 중"))
+
+pc1,pc2,pc3,pc4,pc5,pc6=st.columns(6)
+pc1.metric("5시간 지속성",f"{p_score:.0f}점",p_grade)
+pc2.metric("지속성 신뢰",f"{p_conf:.0f}%",f"근거 {p_obs}분 · {'실측' if p_mode=='OBSERVED_300' else '추정'}")
+pc3.metric("평가 Horizon",f"{p_horizon}분",f"남은 장 {p_remain}분")
+pc4.metric("패턴 피로",f"{p_fatigue:.0f}점","낮을수록 좋음")
+pc5.metric("모델점수",f"{p_raw:.0f}점",f"{p_cal_state} · 표본 {p_samples}")
+pc6.metric("보정확률",f"{float(p_cal):.0f}%" if p_cal is not None else "-", "30건 이상부터 표시")
+if p_cool:
+    st.warning("⏸️ 손절/붕괴 후 COOLDOWN 중 · 신규 재진입 금지")
+if p_kill:
+    st.error("⛔ HARD KILL · 오늘 이 종목 추가 반복매매 금지")
+
 risk_state=str(latest.get("post_entry_risk_state","FORMING"))
 risk_label=str(latest.get("post_entry_risk_label","⚪ 손절판정 자료 형성 중"))
 risk_action=str(latest.get("post_entry_action","대기"))
@@ -2469,7 +2663,7 @@ if risk_state=="HARD_EXIT":
 elif risk_state=="REAL_BREAKDOWN":
     st.error(f"🔴 지금 손절? → 예 · {risk_label}")
 elif risk_state=="WARNING":
-    st.warning(f"🟠 지금 손절? → 아직 확정 아님 · 1~3분 회복 확인")
+    st.warning(f"🟠 지금 손절? → 아직 확정 아님 · 최대 {int(latest.get('recovery_window_minutes',latest.get('post_entry_recovery_window_minutes',2)) or 2)}분 회복 확인")
 elif risk_state=="SHAKEOUT":
     st.success("🟢 지금 손절? → 아니오 · 지지 이탈 후 회복(흔들림 가능)")
 elif risk_state=="UPSIDE_BREAKOUT":
