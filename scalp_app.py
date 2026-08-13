@@ -37,7 +37,7 @@ from persistence_engine import (
     calibrated_from_db as calibrated_from_db_v51,
 )
 
-st.set_page_config(page_title="초단타 VWAP 타점", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="반복단타 스캐너 v5.5", page_icon="⚡", layout="wide")
 
 AUDIT_IMPORT_ERROR = "UI에서는 검증기를 직접 실행하지 않습니다. 별도 프로세스로 실행하세요."
 AUDIT_KR_UNIVERSE = []
@@ -441,7 +441,7 @@ def _swing_levels(values, kind="high"):
     return _dedupe_levels(levels)
 
 
-STRATEGY_VERSION = "v5.1-persistence-cycle"
+STRATEGY_VERSION = "v5.4-fail-closed-speed"
 SWING_LOOKBACK_MINUTES = 180
 SWING_CONTEXT_MINUTES = 360
 SWING_MIN_PERCENT = 0.50
@@ -1925,7 +1925,7 @@ def _trim_heavy_item(item:dict, keep_bars:int=360) -> dict:
 
 @st.cache_data(ttl=90,show_spinner=False,max_entries=4)
 def discovery_snapshot(market:str):
-    """거래량 상위 모집단을 먼저 만든 뒤 KIS 정밀분석으로 재검증한다."""
+    """고정 TopN 없이 KIS가 제공하는 넓은 실시간 모집단을 경량 필터 후 정밀분석한다."""
     ranked={}
     raw_count=0
 
@@ -1976,14 +1976,16 @@ def discovery_snapshot(market:str):
         if not valid:
             continue
         # 후보 모집 단계는 거래량을 절대 우선한다. 등락률은 거의 가중하지 않는다.
-        liquidity_score=(min(math.log10(max(volume,1)),10)*8
+        volatility_hint=max(0.0,12.0-abs(abs(change)-3.0)*1.4)
+        chase_penalty=max(0.0,abs(change)-12.0)*1.5
+        liquidity_score=(min(math.log10(max(volume,1)),10)*6
                          +min(math.log10(max(value,1)),15)*3
-                         +min(max(change,0),10)*0.05)
+                         +volatility_hint-chase_penalty)
         d=dict(c); d["screen_value"]=value; d["discovery_score"]=liquidity_score
         stage1.append(d)
 
-    stage1.sort(key=lambda r:(int(r.get("screen_volume",0) or 0),float(r.get("screen_value",0) or 0)),reverse=True)
-    stage1=stage1[:30]
+    stage1.sort(key=lambda r:float(r.get("discovery_score",0) or 0),reverse=True)
+    # v5.4: Top30/Top100 고정 컷 없음.
     fallback_used=False
     if not stage1:
         fallback_used=True
@@ -2111,11 +2113,7 @@ def _candidate_public_view(item:dict,row:dict,market:str):
 
 
 def dynamic_repeat_candidates(market:str,minimum_score:float,limit:int=6):
-    """빠른 UI용 증분 스캔.
-
-    한 번의 Streamlit rerun에서 정밀분석은 딱 1종목만 한다.
-    최근 4분간 분석된 좋은 후보는 session_state에 작은 dict로 누적한다.
-    """
+    """v5.4 시간예산 증분 스캔: 고정 TopN 없이 rerun당 최대 3개만 정밀분석."""
     snap=discovery_snapshot(market)
     rows=list(snap["rows"])
     if not rows:
@@ -2126,45 +2124,44 @@ def dynamic_repeat_candidates(market:str,minimum_score:float,limit:int=6):
     mode="국내 30분 1% 타점" if market=="국내" else "미국 30분 1% 타점"
     cursor_key=f"fast_scan_cursor::{market}"
     cache_key=f"fast_candidate_cache::{market}"
-
-    cursor=int(st.session_state.get(cursor_key,0)) % len(rows)
-    row=rows[cursor]
-    st.session_state[cursor_key]=(cursor+1)%len(rows)
-
+    cursor=int(st.session_state.get(cursor_key,0))%len(rows)
     cache=dict(st.session_state.get(cache_key,{}) or {})
     now_ts=time.time()
-
-    # 4분 지난 후보 제거
     cache={k:v for k,v in cache.items() if now_ts-float(v.get("_seen_at",0) or 0)<=240}
 
+    cycle_started=time.perf_counter()
     analyzed=0
     width_pass=0
-    try:
-        item=precise_analysis(dict(row),mode,fast_scan=True)
-        analyzed=1
-        width=float(item.get("repeat_scalp_range_percent",0) or 0)
-        box_ok=str(item.get("box_state",""))=="RANGE"
-        if 0.5<=width<=5.0 or box_ok:
-            width_pass=1
-        candidate=_candidate_public_view(item,row,market)
-        if candidate and float(candidate.get("score",0) or 0)>=minimum_score:
-            cache[str(candidate["ticker"])]=candidate
-        else:
-            # 해당 종목이 더 이상 유효하지 않으면 예전 후보도 제거
-            cache.pop(str(row.get("ticker") or ""),None)
-    except Exception:
-        pass
+    attempted=0
+    for offset in range(min(3,len(rows))):
+        if time.perf_counter()-cycle_started>2.2:
+            break
+        row=rows[(cursor+offset)%len(rows)]
+        attempted+=1
+        try:
+            item=precise_analysis(dict(row),mode,fast_scan=True)
+            analyzed+=1
+            width=float(item.get("repeat_scalp_range_percent",0) or 0)
+            if 0.5<=width<=5.0: width_pass+=1
+            candidate=_candidate_public_view(item,row,market)
+            if candidate and float(candidate.get("score",0) or 0)>=minimum_score:
+                cache[str(candidate["ticker"])]=candidate
+            else:
+                cache.pop(str(row.get("ticker") or ""),None)
+        except Exception:
+            continue
 
+    next_cursor=(cursor+max(1,attempted))%len(rows)
+    st.session_state[cursor_key]=next_cursor
     st.session_state[cache_key]=cache
     final=sorted(cache.values(),key=lambda x:float(x.get("rank",0) or 0),reverse=True)[:limit]
     return {
         "raw_count":snap["raw_count"],"unique_count":snap["unique_count"],
         "stage1_count":snap["stage1_count"],"analyzed_count":analyzed,
         "width_pass_count":width_pass,"final_count":len(final),
-        "fallback_used":snap["fallback_used"],"scan_cursor":cursor+1,
+        "fallback_used":snap["fallback_used"],"scan_cursor":next_cursor+1,
         "scan_total":len(rows),"rows":final,
     }
-
 
 def _locked_entry_plan(ticker:str, proposed:float, stop:float, target1:float, price:float, now_ts:float):
     """새로고침 때 진입 기준가가 흔들리지 않도록 종목별 계획을 잠근다.
@@ -2393,9 +2390,9 @@ def update_prediction_audit(ticker,price,item,now_ts):
 
 
 st.title("⚡ 초단타 VWAP 매수타점")
-st.caption("거래량 상위 30개를 순환 분석하고, 우상향/박스 엔진을 분리합니다. 상단의 5·15·30·60분 값은 과거가 아니라 현재 차트 기반 향후 조건부 예상입니다.")
+st.caption("고정 Top30 없이 넓게 경량 탐색하고, 우선 후보만 시간예산으로 정밀분석합니다. 상단의 5·15·30·60분 값은 과거가 아니라 현재 차트 기반 향후 조건부 예상입니다.")
 with st.sidebar:
-    market=st.radio("시장",["국내","미국"],horizontal=True); session_info=market_clock(market); st.caption(f"{session_info['session']} · {session_info['local_time']}"); mode="국내 30분 1% 타점" if market=="국내" else "미국 30분 1% 타점"; minimum_score=st.slider("최소 점수",30,90,50,5); manual_ticker=st.text_input("종목명 또는 종목코드 검색",placeholder="현대차, 005380, SOXL").strip(); run_mode=st.radio("실행 모드",["빠른 자동스캔","선택 종목 집중","검증기 상태"],key="scalp_run_mode"); focus_only=run_mode=="선택 종목 집중"; auto_audit=run_mode=="검증기 상태"; require_validation=st.toggle("실전 검증 잠금",True); st.caption("v5.1 · 실제 Swing 0.5~5.0% · 5시간 지속성/가짜손절/재진입 관리")
+    market=st.radio("시장",["국내","미국"],horizontal=True); session_info=market_clock(market); st.caption(f"{session_info['session']} · {session_info['local_time']}"); mode="국내 30분 1% 타점" if market=="국내" else "미국 30분 1% 타점"; minimum_score=st.slider("최소 점수",30,90,50,5); manual_ticker=st.text_input("종목명 또는 종목코드 검색",placeholder="현대차, 005380, SOXL").strip(); run_mode=st.radio("실행 모드",["빠른 자동스캔","선택 종목 집중","검증기 상태"],key="scalp_run_mode"); focus_only=run_mode=="선택 종목 집중"; auto_audit=run_mode=="검증기 상태"; require_validation=st.toggle("실전 검증 잠금",True); st.caption("v5.4 · 실제 Swing 0.5~5.0% · Fail-Closed · 시간예산 스캔")
 now=time.time(); live_refresh_active=True; st_autorefresh(interval=3000 if focus_only else 5000,key="scalp_tick")
 if auto_audit: st.caption("자동검증은 별도 run_live_validation.py 프로세스에서 실행합니다.")
 
