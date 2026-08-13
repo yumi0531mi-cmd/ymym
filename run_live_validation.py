@@ -27,6 +27,7 @@ import zlib
 import pandas as pd
 
 from datetime import datetime, time as clock_time, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -233,20 +234,22 @@ def load_shared_strategy_core() -> dict:
     if start_marker not in source or end_marker not in source:
         raise RuntimeError("scalp_app.py에서 SHARED_STRATEGY_CORE를 찾지 못했습니다.")
     core = source.split(start_marker, 1)[1].split(end_marker, 1)[0]
-    namespace = {"math": math, "pd": pd}
+    namespace = {"math": math, "pd": pd, "KST": KST, "ET": ZoneInfo("America/New_York")}
     exec(compile(core, str(source_path) + "::<shared_core>", "exec"), namespace)
     return namespace
 
 
 _SHARED = load_shared_strategy_core()
 apply_repeat_scalp_overlay = _SHARED["apply_repeat_scalp_overlay"]
-adapt_repeat_overlay = _SHARED["adapt_repeat_overlay"]
+adapt_repeat_overlay = _SHARED["_adapt_repeat_overlay_for_ui"]
 hourly_structure_plan = _SHARED["hourly_structure_plan"]
 intraday_regime_plan = _SHARED["intraday_regime_plan"]
 forward_forecast_plan = _SHARED["forward_forecast_plan"]
 data_quality_gate = _SHARED["data_quality_gate"]
 execution_safety_plan = _SHARED["execution_safety_plan"]
 target_probability_plan = _SHARED["target_probability_plan"]
+swing_cycle_plan = _SHARED["swing_cycle_plan"]
+post_entry_risk_plan = _SHARED["post_entry_risk_plan"]
 _forecast_flags = _SHARED["_forecast_flags"]
 STRATEGY_VERSION = _SHARED["STRATEGY_VERSION"]
 
@@ -298,6 +301,8 @@ def analyze_one(engine, policy, finalize, market: str, member: tuple[str, str, s
             bool(result.get("data_gate_passed")),
             bool(result.get("repeat_candidate")),
             bool(result.get("execution_safety_passed")),
+            bool(result.get("swing_cycle_valid")),
+            str(result.get("post_entry_risk_state","")) not in {"REAL_BREAKDOWN","HARD_EXIT"},
             not flags["all_down"],
             not flags["medium_down"],
             structure_ok,
@@ -344,8 +349,19 @@ def analyze_one(engine, policy, finalize, market: str, member: tuple[str, str, s
 
 
 DETAIL_KEYS = (
-    "strategy_version", "repeat_lookback_minutes", "repeat_pivot_lookback_minutes",
-    "repeat_oscillation_count", "repeat_rvol_5_20",
+    "strategy_version", "repeat_lookback_minutes", "repeat_context_minutes", "repeat_pivot_lookback_minutes",
+    "repeat_oscillation_count", "swing_cycle_valid", "swing_cycle_reason",
+    "swing_up_width_percent", "swing_down_width_percent", "swing_width_samples", "swing_down_samples",
+    "swing_width_consistency", "swing_up_duration_minutes", "swing_down_duration_minutes",
+    "swing_cycle_duration_minutes", "swing_current_phase", "swing_current_elapsed_minutes",
+    "swing_current_move_percent", "swing_speed_ratio", "swing_volume_burst_ratio",
+    "swing_context_low", "swing_context_high", "swing_context_width_percent",
+    "post_entry_risk_state", "post_entry_risk_label", "post_entry_action",
+    "post_entry_soft_stop", "post_entry_hard_stop", "post_entry_noise_buffer",
+    "post_entry_return_1m", "post_entry_return_3m", "post_entry_return_5m",
+    "post_entry_sell_volume_share", "post_entry_shakeout", "post_entry_real_breakdown",
+    "post_entry_upside_breakout",
+    "repeat_rvol_5_20",
     "execution_safety_passed", "execution_safety_reasons",
     "execution_stop_distance_percent", "execution_noise_floor_percent",
     "execution_stop_inside_noise", "execution_stop_too_wide", "execution_effective_rr",
@@ -682,7 +698,7 @@ def export_html_report(db: sqlite3.Connection) -> None:
 
     warning = (
         "반복단타 성공률은 안전 게이트를 통과하고 반복 매수가가 실제로 체결된 표본에서 계산합니다. "
-        "손절이 정상 단기 변동폭 안쪽인 신호는 최종 후보에서 제외됩니다. "
+        "Soft Stop 단순 터치는 즉시 손절로 채점하지 않고, Hard Stop 또는 실제 하락전환 기준을 사용합니다. "
         "현재 quotes는 60초 해상도이므로 틱 단위 선후관계와 동일하지 않습니다."
     )
     document = f"""<!doctype html><html lang='ko'><meta charset='utf-8'><title>초단타 자동검증 결과</title>
