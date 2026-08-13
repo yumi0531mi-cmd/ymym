@@ -2,7 +2,7 @@
 """초단타 반복매매 전용 Streamlit 앱.
 
 같은 폴더의 app.py에 번들된 KIS 엔진을 읽어 사용한다.
-반복단타 기본 후보는 실제 차트의 지지→1차 저항 폭 0.5~1.5%만 표시한다.
+반복단타 후보는 최근 180분의 실제 Swing Low↔Swing High 반복파동을 분석하며 대표 스윙폭 0.5~5.0%를 사용한다.
 1차·2차 목표가는 임의 +1%/+2%가 아니라 실제 분봉 저항/돌파 구조로 계산한다.
 """
 from __future__ import annotations
@@ -252,6 +252,7 @@ from scanner.kis_engine import KISUnifiedScanner,apply_mode_policy,finalize_trad
 @st.cache_resource
 def scanner(): return KISUnifiedScanner()
 
+# === SHARED_STRATEGY_CORE_START ===
 def fmt(value):
     try:
         x=float(value)
@@ -402,7 +403,7 @@ def _intraday_ohlcv(item):
     except Exception:
         pass
 
-    return frame.tail(180).reset_index(drop=True)
+    return frame.tail(360).reset_index(drop=True)
 
 def _atr_and_range(frame):
     if frame.empty:
@@ -433,21 +434,446 @@ def _swing_levels(values, kind="high"):
             levels.append(value)
     return _dedupe_levels(levels)
 
+
+STRATEGY_VERSION = "v3.8-swing-cycle-risk"
+SWING_LOOKBACK_MINUTES = 180
+SWING_CONTEXT_MINUTES = 360
+SWING_MIN_PERCENT = 0.50
+SWING_MAX_PERCENT = 5.00
+SWING_MIN_COMPLETED_UP_LEGS = 3
+
+
+def _pivot_events(frame, left=2, right=2):
+    """1분봉에서 국소 고점/저점을 시간순으로 추출하고 같은 방향 피벗은 더 극단값만 남긴다."""
+    if frame is None or frame.empty or len(frame) < left + right + 5:
+        return []
+    highs = frame["high"].tolist()
+    lows = frame["low"].tolist()
+    events = []
+    for i in range(left, len(frame) - right):
+        hwin = highs[i-left:i+right+1]
+        lwin = lows[i-left:i+right+1]
+        is_high = highs[i] >= max(hwin)
+        is_low = lows[i] <= min(lwin)
+        if is_high and not is_low:
+            events.append({"i": i, "type": "H", "price": float(highs[i])})
+        elif is_low and not is_high:
+            events.append({"i": i, "type": "L", "price": float(lows[i])})
+        elif is_high and is_low:
+            # 매우 큰 단일 봉은 앞 종가와 가까운 쪽보다 극단 방향을 보수적으로 하나만 선택한다.
+            prev = float(frame["close"].iloc[max(0, i-1)])
+            if abs(highs[i] - prev) >= abs(prev - lows[i]):
+                events.append({"i": i, "type": "H", "price": float(highs[i])})
+            else:
+                events.append({"i": i, "type": "L", "price": float(lows[i])})
+
+    compressed = []
+    for ev in events:
+        if not compressed:
+            compressed.append(ev)
+            continue
+        last = compressed[-1]
+        if ev["type"] == last["type"]:
+            if ev["type"] == "H" and ev["price"] >= last["price"]:
+                compressed[-1] = ev
+            elif ev["type"] == "L" and ev["price"] <= last["price"]:
+                compressed[-1] = ev
+        else:
+            # 너무 미세한 0.20% 미만 방향전환은 노이즈 피벗으로 제외한다.
+            base = last["price"]
+            move = abs(ev["price"] / base - 1.0) * 100 if base > 0 else 0.0
+            if move >= 0.20:
+                compressed.append(ev)
+    return compressed
+
+
+def swing_cycle_plan(item, market_code):
+    """대표 반복폭을 '진입→목표'가 아니라 실제 반복 Swing 파동들의 중앙값으로 계산한다."""
+    if not isinstance(item, dict):
+        return item
+    frame = _intraday_ohlcv(item)
+    if frame.empty or len(frame) < 30:
+        item.update(
+            swing_cycle_valid=False,
+            swing_cycle_reason="연속 1분봉 30개 미만",
+            repeat_lookback_minutes=SWING_LOOKBACK_MINUTES,
+            repeat_context_minutes=min(len(frame), SWING_CONTEXT_MINUTES),
+        )
+        return item
+
+    context = frame.tail(min(SWING_CONTEXT_MINUTES, len(frame))).reset_index(drop=True)
+    recent = context.tail(min(SWING_LOOKBACK_MINUTES, len(context))).reset_index(drop=True)
+    pivots = _pivot_events(recent)
+
+    up_legs, down_legs = [], []
+    for a, b in zip(pivots, pivots[1:]):
+        if a["price"] <= 0 or b["price"] <= 0 or b["i"] <= a["i"]:
+            continue
+        duration = max(1, int(b["i"] - a["i"]))
+        if a["type"] == "L" and b["type"] == "H":
+            width = (b["price"] / a["price"] - 1.0) * 100
+            if 0.20 <= width <= 8.0:
+                up_legs.append({"width": width, "duration": duration, "start": a, "end": b})
+        elif a["type"] == "H" and b["type"] == "L":
+            width = (a["price"] / b["price"] - 1.0) * 100
+            if 0.20 <= width <= 8.0:
+                down_legs.append({"width": width, "duration": duration, "start": a, "end": b})
+
+    valid_up = [x for x in up_legs if SWING_MIN_PERCENT <= x["width"] <= SWING_MAX_PERCENT]
+    valid_down = [x for x in down_legs if 0.30 <= x["width"] <= 6.0]
+
+    def med(rows, key):
+        return float(pd.Series([r[key] for r in rows], dtype=float).median()) if rows else 0.0
+
+    up_width = med(valid_up, "width")
+    down_width = med(valid_down, "width")
+    up_duration = med(valid_up, "duration")
+    down_duration = med(valid_down, "duration")
+    cycle_duration = up_duration + down_duration if up_duration > 0 and down_duration > 0 else max(up_duration, down_duration)
+
+    # 한 번의 급등이 대표폭을 왜곡하지 않도록 중앙값 절대편차 기반 일관성을 계산한다.
+    if valid_up and up_width > 0:
+        deviations = [abs(x["width"] - up_width) for x in valid_up]
+        mad = float(pd.Series(deviations).median()) if deviations else 0.0
+        consistency = max(0.0, min(1.0, 1.0 - mad / max(up_width, 0.01)))
+    else:
+        mad, consistency = 0.0, 0.0
+
+    cycle_count = len(valid_up)
+    swing_valid = (
+        cycle_count >= SWING_MIN_COMPLETED_UP_LEGS
+        and SWING_MIN_PERCENT <= up_width <= SWING_MAX_PERCENT
+        and consistency >= 0.45
+    )
+
+    closes = recent["close"].tolist()
+    volumes = recent["volume"].tolist()
+    last_pivot = pivots[-1] if pivots else None
+    if last_pivot:
+        elapsed = max(0, len(recent) - 1 - int(last_pivot["i"]))
+        pivot_price = float(last_pivot["price"])
+        current_price = float(closes[-1])
+        current_move = (
+            (current_price / pivot_price - 1.0) * 100
+            if last_pivot["type"] == "L"
+            else (pivot_price / current_price - 1.0) * 100
+        ) if pivot_price > 0 and current_price > 0 else 0.0
+        phase = "RISING" if last_pivot["type"] == "L" else "FALLING"
+    else:
+        elapsed, pivot_price, current_move, phase = 0, 0.0, 0.0, "FORMING"
+
+    hist_speed = 0.0
+    speed_rows = valid_up if phase == "RISING" else valid_down
+    speeds = [r["width"] / max(1, r["duration"]) for r in speed_rows if r["duration"] > 0]
+    if speeds:
+        hist_speed = float(pd.Series(speeds, dtype=float).median())
+    current_speed = abs(current_move) / max(1, elapsed)
+    speed_ratio = current_speed / hist_speed if hist_speed > 0 else 0.0
+
+    prior_vol = float(pd.Series(volumes[-23:-3], dtype=float).mean()) if len(volumes) >= 23 else (
+        float(pd.Series(volumes[:-3], dtype=float).mean()) if len(volumes) > 3 else 0.0
+    )
+    recent3_vol = float(pd.Series(volumes[-3:], dtype=float).mean()) if volumes else 0.0
+    volume_burst = recent3_vol / prior_vol if prior_vol > 0 else (1.0 if recent3_vol > 0 else 0.0)
+
+    # 큰 가격구간은 최대 360분 컨텍스트의 실제 고저로 별도 표시한다.
+    context_low = float(context["low"].min())
+    context_high = float(context["high"].max())
+    context_width = (context_high / context_low - 1.0) * 100 if context_high > context_low > 0 else 0.0
+
+    valid_up_widths = [round(x["width"], 4) for x in valid_up[-8:]]
+    valid_down_widths = [round(x["width"], 4) for x in valid_down[-8:]]
+
+    item.update(
+        swing_cycle_valid=bool(swing_valid),
+        swing_cycle_reason=(
+            f"최근 {len(recent)}분 유효 상승스윙 {cycle_count}회 · 중앙값 {up_width:.2f}% · 일관성 {consistency*100:.0f}%"
+            if valid_up else "유효 반복 스윙 형성 중"
+        ),
+        repeat_lookback_minutes=min(SWING_LOOKBACK_MINUTES, len(recent)),
+        repeat_context_minutes=min(SWING_CONTEXT_MINUTES, len(context)),
+        repeat_oscillation_count=cycle_count,
+        swing_up_width_percent=up_width,
+        swing_down_width_percent=down_width,
+        swing_width_samples=valid_up_widths,
+        swing_down_samples=valid_down_widths,
+        swing_width_consistency=consistency,
+        swing_width_mad=mad,
+        swing_up_duration_minutes=up_duration,
+        swing_down_duration_minutes=down_duration,
+        swing_cycle_duration_minutes=cycle_duration,
+        swing_current_phase=phase,
+        swing_current_elapsed_minutes=elapsed,
+        swing_current_move_percent=current_move,
+        swing_current_speed_percent_per_min=current_speed,
+        swing_historical_speed_percent_per_min=hist_speed,
+        swing_speed_ratio=speed_ratio,
+        swing_volume_burst_ratio=volume_burst,
+        swing_context_low=context_low,
+        swing_context_high=context_high,
+        swing_context_width_percent=context_width,
+        # 핵심: 반복폭은 실제 스윙파동 중앙값이다.
+        repeat_width_percent=up_width,
+        repeat_scalp_range_percent=up_width,
+        repeat_preferred_range=bool(swing_valid),
+        repeat_scalp_preferred_range=bool(swing_valid),
+    )
+    return item
+
+
+def post_entry_risk_plan(item, market_code):
+    """현재 하락이 정상 흔들림인지 실제 구조 붕괴인지 1/3/5분 속도·수급·회복으로 분리한다."""
+    if not isinstance(item, dict):
+        return item
+    frame = _intraday_ohlcv(item)
+    if frame.empty or len(frame) < 12:
+        item.update(post_entry_risk_state="FORMING", post_entry_risk_label="⚪ 손절판정 자료 형성 중")
+        return item
+
+    price = _num(item.get("price"), float(frame["close"].iloc[-1]))
+    support = _num(item.get("repeat_support", item.get("structural_support")))
+    atr14, median_range = _atr_and_range(frame)
+    swing_down = _num(item.get("swing_down_width_percent"))
+    swing_up = _num(item.get("swing_up_width_percent"))
+    speed_ratio = _num(item.get("swing_speed_ratio"))
+    volume_burst = _num(item.get("swing_volume_burst_ratio"), 1.0)
+    vwap = _num(item.get("vwap"))
+    ema20 = _num(item.get("ema20"))
+
+    closes = frame["close"].tolist()
+    lows = frame["low"].tolist()
+    volumes = frame["volume"].tolist()
+
+    # Soft stop은 '확인 시작선', Hard stop만 비상 손절선이다.
+    noise_buffer = max(
+        atr14 * 0.80,
+        median_range * 1.20,
+        support * max(0.0025, min(0.0100, swing_down * 0.20 / 100.0 if swing_down > 0 else 0.0025)),
+    ) if support > 0 else 0.0
+    soft_stop = support
+    hard_stop = max(0.0, support - noise_buffer) if support > 0 else 0.0
+
+    def ret(m):
+        return (closes[-1] / closes[-1-m] - 1.0) * 100 if len(closes) > m and closes[-1-m] > 0 else 0.0
+
+    r1, r3, r5 = ret(1), ret(3), ret(5)
+    down_vol = up_vol = 0.0
+    for i in range(max(1, len(closes)-5), len(closes)):
+        vol = volumes[i] if i < len(volumes) else 0.0
+        if closes[i] < closes[i-1]:
+            down_vol += vol
+        elif closes[i] > closes[i-1]:
+            up_vol += vol
+    sell_share = down_vol / (down_vol + up_vol) if (down_vol + up_vol) > 0 else 0.5
+
+    below_soft_count = sum(1 for x in closes[-3:] if soft_stop > 0 and x < soft_stop)
+    below_vwap_count = sum(1 for x in closes[-3:] if vwap > 0 and x < vwap)
+    below_ema20_count = sum(1 for x in closes[-3:] if ema20 > 0 and x < ema20)
+
+    # 최근 3분 안에 지지를 찔렀다가 종가가 되찾았으면 shakeout 후보.
+    pierced = soft_stop > 0 and min(lows[-3:]) < soft_stop
+    reclaimed = soft_stop > 0 and price >= soft_stop and closes[-1] >= soft_stop
+    shakeout = pierced and reclaimed and sell_share < 0.70 and volume_burst < 2.0
+
+    typical_down = max(swing_down, 0.60)
+    abnormal_down = abs(min(r3, 0.0)) >= max(1.0, typical_down * 0.70)
+    fast_down = speed_ratio >= 1.50 or (r3 < 0 and abs(r3) / 3 >= max(0.12, typical_down / max(_num(item.get("swing_down_duration_minutes"), 8.0), 3.0) * 1.5))
+    flow_bad = sell_share >= 0.65 or volume_burst >= 1.50
+    structure_bad = below_soft_count >= 2 and (below_vwap_count >= 2 or below_ema20_count >= 2)
+
+    emergency = (
+        (hard_stop > 0 and price <= hard_stop)
+        or (
+            r3 <= -max(1.50, typical_down * 0.95)
+            and volume_burst >= 2.0
+            and sell_share >= 0.72
+        )
+    )
+    real_breakdown = (not emergency) and structure_bad and fast_down and flow_bad
+    warning = (not emergency and not real_breakdown and not shakeout and soft_stop > 0 and price < soft_stop)
+
+    # 위쪽 훅 돌파: 대표 스윙을 훨씬 빠른 속도/거래량으로 넘어설 때 기존 상단 매도를 강제하지 않는다.
+    context_high = _num(item.get("swing_context_high"))
+    target1 = _num(item.get("repeat_target1", item.get("structural_target1")))
+    breakout_ref = max(x for x in (context_high, target1) if x > 0) if any(x > 0 for x in (context_high, target1)) else 0.0
+    upside_breakout = (
+        breakout_ref > 0
+        and price > breakout_ref
+        and (speed_ratio >= 1.35 or r3 >= max(0.8, swing_up * 0.55))
+        and volume_burst >= 1.35
+        and sell_share <= 0.50
+    )
+
+    if emergency:
+        state, label, action = "HARD_EXIT", "🚨 비정상 급락 · 긴급손절", "즉시손절"
+    elif real_breakdown:
+        state, label, action = "REAL_BREAKDOWN", "🔴 실제 하락전환 · 손절", "손절"
+    elif shakeout:
+        state, label, action = "SHAKEOUT", "🟢 지지 이탈 후 회복 · 흔들림 가능", "보유/재확인"
+    elif warning:
+        state, label, action = "WARNING", "🟠 지지 이탈 · 최대 1~3분 회복 확인", "회복대기"
+    elif upside_breakout:
+        state, label, action = "UPSIDE_BREAKOUT", "🚀 반복상단 돌파 · 추세확장", "추세추종"
+    else:
+        phase = str(item.get("swing_current_phase", "FORMING"))
+        if phase == "FALLING":
+            state, label, action = "NORMAL_PULLBACK", "🟡 정상 스윙 눌림 범위", "보유"
+        else:
+            state, label, action = "NORMAL_SWING", "🟢 정상 스윙 진행", "보유"
+
+    item.update(
+        post_entry_risk_state=state,
+        post_entry_risk_label=label,
+        post_entry_action=action,
+        post_entry_soft_stop=soft_stop,
+        post_entry_hard_stop=hard_stop,
+        post_entry_noise_buffer=noise_buffer,
+        post_entry_return_1m=r1,
+        post_entry_return_3m=r3,
+        post_entry_return_5m=r5,
+        post_entry_sell_volume_share=sell_share,
+        post_entry_below_soft_count=below_soft_count,
+        post_entry_below_vwap_count=below_vwap_count,
+        post_entry_below_ema20_count=below_ema20_count,
+        post_entry_shakeout=bool(shakeout),
+        post_entry_real_breakdown=bool(real_breakdown),
+        post_entry_upside_breakout=bool(upside_breakout),
+        # 실제 stop_loss는 긴급/구조 붕괴용 hard stop. soft stop 터치는 즉시손절 신호가 아니다.
+        repeat_stop=hard_stop if hard_stop > 0 else _num(item.get("repeat_stop")),
+        stop_loss=hard_stop if hard_stop > 0 else _num(item.get("stop_loss")),
+    )
+    return item
+
+
+def _forecast_flags(item):
+    ff = item.get("forward_forecasts", {}) or {}
+    values = {h: _num((ff.get(h, {}) or {}).get("center_pct")) for h in (5, 15, 30, 60)}
+    return {
+        "values": values,
+        "all_down": all(values[h] < 0 for h in (5, 15, 30, 60)),
+        "medium_down": all(values[h] < 0 for h in (15, 30, 60)),
+        "valid_pullback_forecast": values[5] < 0 and all(values[h] >= 0 for h in (15, 30, 60)),
+    }
+
+
+def execution_safety_plan(item, market):
+    """진입 전에 hard stop이 정상 노이즈 안쪽인지와 실효 RR을 검사한다."""
+    entry = _num(item.get("repeat_entry", item.get("structural_entry")))
+    target1 = _num(item.get("repeat_target1", item.get("structural_target1")))
+    hard_stop = _num(item.get("post_entry_hard_stop", item.get("repeat_stop", item.get("stop_loss"))))
+    atr = _num(item.get("repeat_atr14"))
+    median_range = _num(item.get("repeat_median_range"))
+    price = _num(item.get("price"))
+    noise_floor = max(
+        atr * 0.80,
+        median_range * 1.20,
+        price * 0.0025 if price > 0 else 0.0,
+    )
+    stop_distance = entry - hard_stop if entry > hard_stop > 0 else 0.0
+    reward = target1 - entry if target1 > entry > 0 else 0.0
+    rr = reward / stop_distance if stop_distance > 0 else 0.0
+    inside_noise = stop_distance > 0 and stop_distance < noise_floor
+    too_wide = entry > 0 and stop_distance / entry * 100 > 3.5
+    reasons = []
+    if inside_noise:
+        reasons.append("Hard Stop이 최근 정상 노이즈 안쪽")
+    if too_wide:
+        reasons.append("필요 손절폭이 3.5% 초과")
+    if rr < 1.10:
+        reasons.append(f"실효 RR 부족 {rr:.2f}")
+    if not bool(item.get("swing_cycle_valid")):
+        reasons.append("반복 스윙 3회 이상/일관성 미확인")
+    risk_state = str(item.get("post_entry_risk_state", "FORMING"))
+    if risk_state in {"REAL_BREAKDOWN", "HARD_EXIT"}:
+        reasons.append("현재 이미 하락전환/급락 상태")
+    passed = not reasons
+    item.update(
+        execution_safety_passed=bool(passed),
+        execution_safety_reasons=reasons,
+        execution_stop_distance_percent=(stop_distance / entry * 100 if entry > 0 else 0.0),
+        execution_target1_distance_percent=(reward / entry * 100 if entry > 0 else 0.0),
+        execution_noise_floor_percent=(noise_floor / entry * 100 if entry > 0 else 0.0),
+        execution_safe_stop_reference=hard_stop,
+        execution_stop_inside_noise=bool(inside_noise),
+        execution_stop_too_wide=bool(too_wide),
+        execution_effective_rr=rr,
+        execution_atr14_percent=(atr / price * 100 if price > 0 else 0.0),
+        execution_median_tr_percent=(median_range / price * 100 if price > 0 else 0.0),
+        execution_forecast5_noise_percent=abs(_num((item.get("forward_forecasts", {}).get(5, {}) or {}).get("low_pct"))),
+    )
+    return item
+
+
+def target_probability_plan(item):
+    """목표가 자체가 아니라 T1을 Hard Stop보다 먼저 도달할 상대 확률을 보수적으로 추정한다."""
+    entry = _num(item.get("repeat_entry", item.get("structural_entry")))
+    t1 = _num(item.get("repeat_target1", item.get("structural_target1")))
+    stop = _num(item.get("post_entry_hard_stop", item.get("stop_loss")))
+    if not (stop > 0 and entry > stop and t1 > entry):
+        item.update(
+            target1_reach_probability=0.0,
+            target1_before_stop_probability=0.0,
+            target2_reach_probability=0.0,
+            stop_first_risk_probability=100.0,
+            target_probability_confidence=0.0,
+            target_probability_label="자료 부족",
+        )
+        return item
+
+    rr = (t1 - entry) / (entry - stop)
+    swing_consistency = _num(item.get("swing_width_consistency"))
+    cycles = int(_num(item.get("repeat_oscillation_count")))
+    trend = _num(item.get("intraday_uptrend_score"))
+    f15 = _num((item.get("forward_forecasts", {}).get(15, {}) or {}).get("up_probability"), 50.0)
+    f30 = _num((item.get("forward_forecasts", {}).get(30, {}) or {}).get("up_probability"), 50.0)
+    risk_state = str(item.get("post_entry_risk_state", "NORMAL_SWING"))
+
+    score = (
+        50.0
+        + min(12.0, max(-8.0, (rr - 1.0) * 8.0))
+        + (swing_consistency - 0.5) * 18.0
+        + min(8.0, max(0, cycles - 2) * 2.0)
+        + min(8.0, max(0.0, trend - 6.0) * 1.2)
+        + (f15 - 50.0) * 0.18
+        + (f30 - 50.0) * 0.12
+    )
+    if risk_state == "WARNING":
+        score -= 12
+    elif risk_state == "SHAKEOUT":
+        score -= 4
+    elif risk_state in {"REAL_BREAKDOWN", "HARD_EXIT"}:
+        score = min(score, 15)
+    score = max(5.0, min(90.0, score))
+    confidence = max(20.0, min(85.0, 35 + cycles * 6 + swing_consistency * 25))
+    t2 = max(5.0, score - 15.0)
+    item.update(
+        target1_reach_probability=score,
+        target1_before_stop_probability=score,
+        target2_reach_probability=t2,
+        stop_first_risk_probability=100.0 - score,
+        target_probability_confidence=confidence,
+        target_probability_label=("높음" if score >= 75 else "보통" if score >= 60 else "낮음"),
+    )
+    return item
+
+
 def apply_repeat_scalp_overlay(item, market_code):
-    """기존 엔진 결과를 보존하면서 반복단타 전용 차트 레벨만 추가한다."""
+    """실제 1분봉 반복 Swing을 기준으로 재매수·목표·Hard Stop을 계산한다."""
     if not isinstance(item, dict):
         return item
     item = dict(item)
     price = _num(item.get("price"))
     frame = _intraday_ohlcv(item)
-    if price <= 0 or len(frame) < 20:
+    if price <= 0 or len(frame) < 30:
         item.update(
             repeat_chart_valid=False,
-            repeat_chart_reason="현재가 또는 연속 1분봉 20개 미만",
+            repeat_chart_reason="현재가 또는 연속 1분봉 30개 미만",
             repeat_candidate=False,
         )
         return item
 
+    # 먼저 실제 반복 스윙 통계를 만든다.
+    item = swing_cycle_plan(item, market_code)
     highs = frame["high"].tolist()
     lows = frame["low"].tolist()
     closes = frame["close"].tolist()
@@ -462,26 +888,25 @@ def apply_repeat_scalp_overlay(item, market_code):
     ema9 = _num(item.get("ema9"))
     ema20 = _num(item.get("ema20"))
     rsi = _num(item.get("rsi"), 50.0)
-    macd = _num(item.get("macd_histogram"))
     rvol = _num(item.get("rvol"))
-    f10 = _num(item.get("forecast_10m"))
-    f30 = _num(item.get("forecast_30m"))
-
     bid = _num(item.get("best_bid"))
     ask = _num(item.get("best_ask"))
     spread = ((ask - bid) / ((ask + bid) / 2) * 100) if ask >= bid > 0 else None
     spread_limit = 0.35 if "레버리지" in str(item.get("asset_type", "")) else 0.25
+
     quality_checks = {
         "분봉 실데이터": not bool(item.get("intraday_fallback")),
         "VWAP 확인": vwap > 0,
         "EMA9·20 확인": ema9 > 0 and ema20 > 0,
         "호가 스프레드": spread is None or spread <= spread_limit,
+        "스윙 3회 이상": int(_num(item.get("repeat_oscillation_count"))) >= SWING_MIN_COMPLETED_UP_LEGS,
+        "스윙 일관성": _num(item.get("swing_width_consistency")) >= 0.45,
     }
     quality_pass = all(quality_checks.values())
 
-    ret5 = (closes[-1] / closes[-6] - 1) * 100 if len(closes) >= 6 and closes[-6] > 0 else 0.0
-    ret15 = (closes[-1] / closes[-16] - 1) * 100 if len(closes) >= 16 and closes[-16] > 0 else 0.0
-    ret30 = (closes[-1] / closes[-31] - 1) * 100 if len(closes) >= 31 and closes[-31] > 0 else 0.0
+    def ret(m):
+        return (closes[-1] / closes[-1-m] - 1) * 100 if len(closes) > m and closes[-1-m] > 0 else 0.0
+    ret5, ret15, ret30 = ret(5), ret(15), ret(30)
 
     recent_hi = max(highs[-6:])
     previous_hi = max(highs[-12:-6]) if len(highs) >= 12 else recent_hi
@@ -489,184 +914,137 @@ def apply_repeat_scalp_overlay(item, market_code):
     previous_lo = min(lows[-12:-6]) if len(lows) >= 12 else recent_lo
 
     up_volume = down_volume = 0.0
-    start = max(1, len(closes) - 20)
-    for i in range(start, len(closes)):
+    for i in range(max(1, len(closes)-20), len(closes)):
         vol = volumes[i] if i < len(volumes) else 0.0
-        if closes[i] > closes[i - 1]:
+        if closes[i] > closes[i-1]:
             up_volume += vol
-        elif closes[i] < closes[i - 1]:
+        elif closes[i] < closes[i-1]:
             down_volume += vol
     volume_ratio = up_volume / down_volume if down_volume > 0 else (2.0 if up_volume > 0 else 0.0)
 
     trend_checks = {
         "VWAP 위": price > vwap > 0,
         "EMA 정배열": price >= ema9 >= ema20 > 0,
-        "5분 상승": ret5 > 0,
-        "15분 상승": ret15 >= 0,
-        "30분 상승": ret30 >= -0.15,
-        "고점 상승": recent_hi >= previous_hi,
-        "저점 상승": recent_lo >= previous_lo,
-        "상승봉 거래량 우세": volume_ratio >= 1.05,
-        "RSI 과열 아님": rsi < (82 if market_code == "US" else 78),
-        "10분 전망 급락 아님": f10 > -0.40,
+        "15분 약세 아님": ret15 >= -0.10,
+        "30분 급락 아님": ret30 >= -0.30,
+        "고점 유지": recent_hi >= previous_hi * 0.995,
+        "저점 유지": recent_lo >= previous_lo * 0.995,
+        "상승봉 거래량 열세 아님": volume_ratio >= 0.90,
+        "RSI 과열 아님": rsi < (84 if market_code == "US" else 80),
     }
     trend_score = sum(bool(v) for v in trend_checks.values())
 
-    swing_lows = _swing_levels(lows, "low")
-    support_candidates = [(x, "1분봉 스윙 저점") for x in swing_lows if 0 < x < price]
+    # 지지는 가장 최근 실제 pivot low를 우선하고 VWAP/EMA20을 보조로 사용.
+    pivots = _pivot_events(frame.tail(min(SWING_LOOKBACK_MINUTES, len(frame))).reset_index(drop=True))
+    pivot_lows = [p["price"] for p in pivots if p["type"] == "L" and 0 < p["price"] <= price]
+    support_candidates = [(x, "최근 실제 반복 Swing Low") for x in pivot_lows[-5:]]
     recent_low = min(lows[-20:])
-    if 0 < recent_low < price:
+    if 0 < recent_low <= price:
         support_candidates.append((recent_low, "최근 20분 저점"))
-    if 0 < vwap < price:
+    if 0 < vwap <= price:
         support_candidates.append((vwap, "VWAP"))
-    if 0 < ema9 < price:
-        support_candidates.append((ema9, "EMA9"))
-    if 0 < ema20 < price:
+    if 0 < ema20 <= price:
         support_candidates.append((ema20, "EMA20"))
-
     if not support_candidates:
         item.update(
             repeat_chart_valid=False,
-            repeat_chart_reason="현재가 아래 차트 지지선 미확인",
+            repeat_chart_reason="현재가 아래 반복 Swing 지지 미확인",
             repeat_candidate=False,
-            repeat_trend_score=trend_score,
-            repeat_trend_checks=trend_checks,
+            repeat_quality_pass=quality_pass,
+            repeat_quality_checks=quality_checks,
         )
         return item
 
     support, support_basis = max(support_candidates, key=lambda x: x[0])
+    entry = support
 
-    swing_highs = _swing_levels(highs, "high")
-    # 반복단타 1차 목표는 지지선 대비 최소 +0.5% 공간이 있는 첫 의미 있는 저항만 사용한다.
-    min_repeat_target = support * 1.005
-    resistance_candidates = [x for x in swing_highs if x > price and x >= min_repeat_target]
-    box_high = max(highs[-30:])
-    box_low = min(lows[-30:])
-    box_width = max(0.0, box_high - box_low)
-    prior_high = max(highs[-30:-1]) if len(highs) >= 31 else max(highs[:-1])
-    for level in (box_high, prior_high):
-        if level > price and level >= min_repeat_target:
-            resistance_candidates.append(level)
-    resistance_candidates = _dedupe_levels(resistance_candidates)
+    # 목표는 '대표폭을 계산하기 위해' 만드는 것이 아니다.
+    # 실제 pivot high들 중 대표 스윙폭과 가장 비슷한 다음 저항을 선택한다.
+    representative = _num(item.get("swing_up_width_percent"))
+    pivot_highs = [p["price"] for p in pivots if p["type"] == "H" and p["price"] > entry]
+    resistance = _dedupe_levels(pivot_highs)
+    usable = []
+    for level in resistance:
+        width = (level / entry - 1.0) * 100 if entry > 0 else 0.0
+        if SWING_MIN_PERCENT <= width <= SWING_MAX_PERCENT * 1.15:
+            usable.append((abs(width - representative), level, width))
+    usable.sort(key=lambda x: (x[0], x[1]))
 
-    target1 = 0.0
+    target1 = usable[0][1] if usable else 0.0
+    target1_basis = "실제 반복 Swing High 중 대표 스윙폭과 가장 유사한 저항" if usable else ""
+    if target1 <= price and representative > 0 and bool(item.get("swing_cycle_valid")):
+        projected = entry * (1.0 + representative / 100.0)
+        if projected > price:
+            target1 = projected
+            target1_basis = "반복 Swing 3회+ 중앙값 투영 · 실제 저항 미형성"
+
     target2 = 0.0
-    target1_basis = ""
     target2_basis = ""
-    if resistance_candidates:
-        target1 = resistance_candidates[0]
-        target1_basis = "현재가 위 가장 가까운 실제 1분봉 저항"
-        higher = [x for x in resistance_candidates[1:] if x > target1 * 1.0005]
-        if higher:
-            target2 = higher[0]
-            target2_basis = "1차 위 다음 실제 1분봉 저항"
-    elif trend_score >= 7:
-        # 신저가/신고가 돌파로 실제 저항이 아직 없을 때만 최근 ATR·봉폭을 투영한다.
-        projection1 = max(atr14 * 1.25, median_range * 1.50)
-        if box_width > 0:
-            projection1 = min(projection1, max(atr14 * 2.20, box_width * 0.50))
-        target1 = price + projection1
-        target1_basis = "신고가 구간 · 최근 1분봉 ATR/박스폭 투영"
+    higher = [x for x in resistance if x > max(target1, price) * 1.0005]
+    if higher:
+        target2 = higher[0]
+        target2_basis = "1차 위 다음 실제 Swing High"
+    elif target1 > 0 and representative > 0 and trend_score >= 6:
+        target2 = target1 * (1.0 + min(representative, 3.0) / 100.0)
+        target2_basis = "상방 확장 시 다음 대표 스윙폭"
 
-    if target1 > price and target2 <= target1 and trend_score >= 6:
-        projection2 = max(atr14 * 1.35, median_range * 1.75, (target1 - price) * 0.80)
-        if box_width > 0:
-            projection2 = min(projection2, max(atr14 * 2.40, box_width * 0.60))
-        target2 = target1 + projection2
-        target2_basis = "다음 저항 미형성 · ATR/최근 박스폭 보수 투영"
-
-    if not (0 < support < price < target1):
+    if not (0 < entry <= price and target1 > price):
         item.update(
             repeat_chart_valid=False,
-            repeat_chart_reason="지지 < 현재가 < 1차 목표 가격순서 불충족",
+            repeat_chart_reason="현재 위치에서 유효한 다음 반복 Swing 목표 미확인",
             repeat_candidate=False,
-            repeat_support=support,
-            repeat_trend_score=trend_score,
-            repeat_trend_checks=trend_checks,
+            repeat_support=entry,
+            repeat_quality_pass=quality_pass,
+            repeat_quality_checks=quality_checks,
         )
         return item
 
-    stop_buffer = max(atr14 * 0.35, median_range * 0.45)
-    if stop_buffer <= 0:
-        stop_buffer = support * 0.0025
-    stop_buffer = min(stop_buffer, support * 0.0060)
-    stop = max(0.0, support - stop_buffer)
-    entry = support
-
-    repeat_width = (target1 / entry - 1) * 100 if target1 > entry > 0 else 0.0
-    t1_from_current = (target1 / price - 1) * 100
-    t2_from_current = (target2 / price - 1) * 100 if target2 > price else 0.0
-    extra_after_t1 = (target2 / target1 - 1) * 100 if target2 > target1 > 0 else 0.0
-    risk = entry - stop
+    # Soft stop=지지 확인선. Hard stop은 정상 노이즈 밖.
+    swing_down = _num(item.get("swing_down_width_percent"))
+    noise_buffer = max(
+        atr14 * 0.80,
+        median_range * 1.20,
+        entry * max(0.0025, min(0.0100, swing_down * 0.20 / 100.0 if swing_down > 0 else 0.0025)),
+    )
+    hard_stop = max(0.0, entry - noise_buffer)
+    risk = entry - hard_stop
     reward = target1 - entry
-    repeat_rr = reward / risk if risk > 0 else 0.0
+    rr = reward / risk if risk > 0 else 0.0
 
-    continuation_checks = {
-        "2차 차트 목표 존재": target2 > target1,
-        "VWAP 위 유지": price > vwap > 0,
-        "EMA 정배열": ema9 >= ema20 > 0,
-        "15분 실제 상승": ret15 > 0,
-        "30분 약세 아님": ret30 >= -0.10,
-        "상승봉 거래량 우세": volume_ratio >= 1.05,
-        "MACD 비약세": macd >= 0,
-        "RVOL 확보": rvol >= 0.80,
-        "10분 전망 약세 아님": f10 > -0.25,
-        "30분 전망 약세 아님": f30 > -0.35,
-    }
-    continuation_score = sum(bool(v) for v in continuation_checks.values())
-    if target2 <= target1:
-        continuation_state = "NONE"
-        continuation_label = "⚪ 2차 목표 미확인"
-    elif continuation_score >= 8:
-        continuation_state = "HIGH"
-        continuation_label = "🟢 추가상승 가능성 높음"
-    elif continuation_score >= 6:
-        continuation_state = "MID"
-        continuation_label = "🟡 추가상승 가능·1차 후 확인"
+    repeat_width = _num(item.get("swing_up_width_percent"))
+    near = max(median_range * 0.90, atr14 * 0.45)
+    if price >= target1 - near:
+        repeat_state, repeat_label = "TAKE_PROFIT", "🟠 반복 Swing 상단 접근"
+    elif price <= entry + near and trend_score >= 5:
+        repeat_state, repeat_label = "BUY_ZONE", "🟢 반복 Swing 하단·재매수 구간"
+    elif trend_score >= 5:
+        repeat_state, repeat_label = "WAIT_PULLBACK", "🟡 다음 Swing Low 대기"
     else:
-        continuation_state = "LOW"
-        continuation_label = "🔴 1차 부근 상승 제한 가능"
+        repeat_state, repeat_label = "WAIT_TREND", "⚪ 반복구조 재확인"
 
-    near = max(median_range * 0.75, atr14 * 0.35)
-    if price <= support:
-        repeat_state = "BREAKDOWN"
-        repeat_label = "🔴 지지 이탈"
-    elif price >= target1 - near:
-        repeat_state = "TAKE_PROFIT"
-        repeat_label = "🟠 1차 매도구간 근접"
-    elif price <= support + near and trend_score >= 6:
-        repeat_state = "BUY_ZONE"
-        repeat_label = "🟢 반복 매수구간 근접"
-    elif trend_score >= 6:
-        repeat_state = "WAIT_PULLBACK"
-        repeat_label = "🟡 지지 눌림 대기"
-    else:
-        repeat_state = "WAIT_TREND"
-        repeat_label = "⚪ 추세 재확인"
-
-    preferred = 0.50 <= repeat_width <= 1.50
     candidate = bool(
-        preferred
-        and trend_score >= 6
-        and repeat_state not in {"BREAKDOWN", "TAKE_PROFIT"}
-        and repeat_rr >= 1.20
+        item.get("swing_cycle_valid")
+        and SWING_MIN_PERCENT <= repeat_width <= SWING_MAX_PERCENT
         and quality_pass
+        and rr >= 1.10
+        and repeat_state not in {"TAKE_PROFIT"}
     )
 
     item.update(
         repeat_chart_valid=True,
-        repeat_chart_reason="연속 1분봉 지지·저항/ATR 계산 완료",
+        repeat_chart_reason=str(item.get("swing_cycle_reason") or "Swing 반복 계산 완료"),
         repeat_candidate=candidate,
         repeat_entry=entry,
-        repeat_support=support,
-        repeat_stop=stop,
+        repeat_support=entry,
+        repeat_soft_stop=entry,
+        repeat_stop=hard_stop,
         repeat_target1=target1,
         repeat_target2=target2,
         repeat_width_percent=repeat_width,
-        repeat_target1_current_upside=t1_from_current,
-        repeat_target2_current_upside=t2_from_current,
-        repeat_extra_after_target1=extra_after_t1,
-        repeat_risk_reward=repeat_rr,
+        repeat_target1_current_upside=(target1 / price - 1.0) * 100,
+        repeat_target2_current_upside=((target2 / price - 1.0) * 100 if target2 > price else 0.0),
+        repeat_extra_after_target1=((target2 / target1 - 1.0) * 100 if target2 > target1 > 0 else 0.0),
+        repeat_risk_reward=rr,
         repeat_state=repeat_state,
         repeat_label=repeat_label,
         repeat_trend_score=trend_score,
@@ -677,18 +1055,28 @@ def apply_repeat_scalp_overlay(item, market_code):
         repeat_atr14=atr14,
         repeat_median_range=median_range,
         repeat_volume_ratio=volume_ratio,
-        repeat_continuation_state=continuation_state,
-        repeat_continuation_label=continuation_label,
-        repeat_continuation_score=continuation_score,
-        repeat_continuation_checks=continuation_checks,
-        repeat_preferred_range=preferred,
+        repeat_preferred_range=bool(item.get("swing_cycle_valid")),
         repeat_quality_pass=quality_pass,
         repeat_quality_checks=quality_checks,
         repeat_spread_percent=spread,
         repeat_spread_limit=spread_limit,
-        repeat_chart_box_low=box_low,
-        repeat_chart_box_high=box_high,
+        repeat_chart_box_low=_num(item.get("swing_context_low")),
+        repeat_chart_box_high=_num(item.get("swing_context_high")),
     )
+    item = post_entry_risk_plan(item, market_code)
+
+    # 실제 붕괴가 확인된 경우에만 EXIT. Soft stop 단순 터치는 EXIT가 아니다.
+    risk_state = str(item.get("post_entry_risk_state", ""))
+    if risk_state in {"REAL_BREAKDOWN", "HARD_EXIT"}:
+        item["repeat_state"] = "BREAKDOWN"
+        item["repeat_label"] = item.get("post_entry_risk_label")
+        item["repeat_candidate"] = False
+    elif risk_state == "SHAKEOUT":
+        item["repeat_label"] = "🟢 흔들림 회복 · 즉시손절 아님"
+    elif risk_state == "WARNING":
+        item["repeat_candidate"] = False
+        item["repeat_label"] = "🟠 지지 이탈 · 1~3분 회복 확인"
+
     return item
 
 def _adapt_repeat_overlay_for_ui(item: dict) -> dict:
@@ -699,7 +1087,7 @@ def _adapt_repeat_overlay_for_ui(item: dict) -> dict:
     state = str(item.get("repeat_state") or "WAIT_TREND")
     if width < 0.50 and item.get("repeat_chart_valid"):
         legacy_state = "RANGE_TOO_NARROW"
-    elif width > 1.50 and item.get("repeat_chart_valid"):
+    elif width > 5.00 and item.get("repeat_chart_valid"):
         legacy_state = "RANGE_TOO_WIDE"
     else:
         legacy_state = {
@@ -812,7 +1200,7 @@ def structural_trade_plan(item:dict,market:str):
     risk=price-support; reward1=t1-price; reward2=t2-price if t2>price else 0
     rr1=reward1/risk if risk>0 else 0; rr2=reward2/risk if risk>0 and reward2>0 else 0
     t1pct=(t1/price-1)*100; t2pct=(t2/price-1)*100 if t2>price else 0; repeat_width=(t1/support-1)*100 if t1>support>0 else 0
-    item.update(continuous_rise=trend_score>=7 and ret15>0 and ret30>0,continuous_rise_score=trend_score,continuous_rise_checks=checks,trend_return_5m=ret5,trend_return_15m=ret15,trend_return_30m=ret30,up_down_volume_ratio=volume_dom,structural_entry=price,structural_support=support,stop_loss=support,structural_target=t1,structural_target1=t1,structural_target2=t2,target1_upside_percent=t1pct,target2_upside_percent=t2pct,risk_reward=rr1,risk_reward_target1=rr1,risk_reward_target2=rr2,level_plan_valid=risk>0 and reward1>0,target_basis=b1,target1_basis=b1,target2_basis=b2,stop_basis=f"{support_reason} 이탈 시 상승 시나리오 무효",level_plan_reason=f"1차 {fmt(t1)} ({t1pct:+.2f}%) / 2차 {fmt(t2) if t2 else '-'} / 지지 {fmt(support)}",chart_resistance_levels=resistances,chart_box_high=box_high,chart_box_low=box_low,chart_box_width=box_width,breakout_active=breakout,repeat_scalp_range_percent=repeat_width,repeat_scalp_preferred_range=0.50<=repeat_width<=1.50)
+    item.update(continuous_rise=trend_score>=7 and ret15>0 and ret30>0,continuous_rise_score=trend_score,continuous_rise_checks=checks,trend_return_5m=ret5,trend_return_15m=ret15,trend_return_30m=ret30,up_down_volume_ratio=volume_dom,structural_entry=price,structural_support=support,stop_loss=support,structural_target=t1,structural_target1=t1,structural_target2=t2,target1_upside_percent=t1pct,target2_upside_percent=t2pct,risk_reward=rr1,risk_reward_target1=rr1,risk_reward_target2=rr2,level_plan_valid=risk>0 and reward1>0,target_basis=b1,target1_basis=b1,target2_basis=b2,stop_basis=f"{support_reason} 이탈 시 상승 시나리오 무효",level_plan_reason=f"1차 {fmt(t1)} ({t1pct:+.2f}%) / 2차 {fmt(t2) if t2 else '-'} / 지지 {fmt(support)}",chart_resistance_levels=resistances,chart_box_high=box_high,chart_box_low=box_low,chart_box_width=box_width,breakout_active=breakout,repeat_scalp_range_percent=repeat_width,repeat_scalp_preferred_range=0.50<=repeat_width<=5.00)
     return item
 
 
@@ -1157,7 +1545,7 @@ def box_regime_plan(item:dict):
     slope=(float(ema20.iloc[-1])/float(ema20.iloc[max(0,len(ema20)-11)])-1)*100 if len(ema20)>10 else 0.0
     pos=(c[-1]-lo)/(hi-lo) if hi>lo else 0.5
 
-    valid=(1.0<=width<=2.2 and lower_touches>=2 and upper_touches>=2 and crossings>=3 and abs(slope)<=0.30)
+    valid=(0.5<=width<=5.0 and lower_touches>=2 and upper_touches>=2 and crossings>=3 and abs(slope)<=0.30)
     break_risk=valid and pos<=0.10 and c[-1]<float(ema20.iloc[-1])
 
     if break_risk:
@@ -1354,6 +1742,8 @@ def forward_forecast_plan(item:dict, market:str):
     return item
 
 
+# === SHARED_STRATEGY_CORE_END ===
+
 def upside_continuation_plan(item:dict):
     price=float(item.get("price",0) or 0); t1=float(item.get("structural_target1",0) or 0); t2=float(item.get("structural_target2",0) or 0); vwap=float(item.get("vwap",0) or 0); ema9=float(item.get("ema9",0) or 0); ema20=float(item.get("ema20",0) or 0); macd=float(item.get("macd_histogram",0) or 0); vol=float(item.get("up_down_volume_ratio",0) or 0); ret15=float(item.get("trend_return_15m",0) or 0); ret30=float(item.get("trend_return_30m",0) or 0); trend=int(item.get("continuous_rise_score",0) or 0); f20=float(item.get("forecast_20m",0) or 0); f30=float(item.get("forecast_30m",0) or 0)
     checks={"차트상 2차 목표 존재":t2>t1>price,"VWAP 위 유지":price>vwap>0,"EMA 정배열":ema9>ema20>0,"15분 실제 상승":ret15>0,"30분 실제 상승":ret30>0,"상승봉 거래량 우세":vol>=1.05,"MACD 비약세":macd>=0,"지속상승 7점 이상":trend>=7,"20분 예측 약세 아님":f20>-0.35,"30분 예측 약세 아님":f30>-0.35}
@@ -1371,24 +1761,24 @@ def repeat_scalp_plan(item:dict):
     closes=[float(x) for x in (item.get("chart_close_1m",[]) or []) if float(x or 0)>0]; highs=[float(x) for x in (item.get("chart_high_1m",[]) or []) if float(x or 0)>0]; lows=[float(x) for x in (item.get("chart_low_1m",[]) or []) if float(x or 0)>0]; volumes=[float(x or 0) for x in (item.get("chart_volume_1m",[]) or [])]
     if not item.get("level_plan_valid") or min(price,support,target)<=0 or len(closes)<12: item.update(repeat_scalp_state="UNAVAILABLE",repeat_scalp_label="⚪ 반복단타 판정 대기",repeat_scalp_reason="실제 지지·저항 확인 대기"); return item
     ranges=[max(0,highs[i]-lows[i]) for i in range(max(0,len(highs)-20),len(highs))]; median_range=float(pd.Series(ranges).median()) if ranges else 0; median_vol=float(pd.Series(volumes[-20:]).median()) if volumes else 0; last_vol=volumes[-1] if volumes else 0
-    trend=int(item.get("continuous_rise_score",0) or 0); ret15=float(item.get("trend_return_15m",0) or 0); width=(target/support-1)*100 if target>support>0 else 0; mtf=bool(item.get("mtf_alignment")); mtf_exit=bool(item.get("mtf_exit")); rsi=float(item.get("rsi",50) or 50); prior_rsi=float(item.get("rsi_previous",rsi) or rsi)
-    box_high=max(highs[-30:]) if len(highs)>=30 else 0; box_low=min(lows[-30:]) if len(lows)>=30 else 0; box_range=(box_high/box_low-1)*100 if box_high>box_low>0 else 0; box_valid=0.5<=box_range<=4; lower_zone=box_low>0 and price<=box_low+(box_high-box_low)*0.35; upper_zone=box_high>0 and price>=box_low+(box_high-box_low)*0.75; rsi_recovery=(prior_rsi<=35 and rsi>prior_rsi) or 40<=rsi<=68; trend_intact=mtf and price>=vwap>0 and ema9>=ema20>0 and trend>=6 and ret15>=0; near_support=support<=price<=support+max(median_range,1e-9); near_target=target>=price and target-price<=max(median_range,1e-9); bounce=len(closes)>=2 and closes[-1]>closes[-2] and lows[-1]<=support+max(median_range,1e-9); volume_returns=median_vol<=0 or last_vol>=median_vol
+    trend=int(item.get("continuous_rise_score",0) or 0); ret15=float(item.get("trend_return_15m",0) or 0); width=float(item.get('swing_up_width_percent',item.get('repeat_width_percent',0)) or 0); mtf=bool(item.get("mtf_alignment")); mtf_exit=bool(item.get("mtf_exit")); rsi=float(item.get("rsi",50) or 50); prior_rsi=float(item.get("rsi_previous",rsi) or rsi)
+    box_high=max(highs[-30:]) if len(highs)>=30 else 0; box_low=min(lows[-30:]) if len(lows)>=30 else 0; box_range=(box_high/box_low-1)*100 if box_high>box_low>0 else 0; box_valid=0.5<=box_range<=5.0; lower_zone=box_low>0 and price<=box_low+(box_high-box_low)*0.35; upper_zone=box_high>0 and price>=box_low+(box_high-box_low)*0.75; rsi_recovery=(prior_rsi<=35 and rsi>prior_rsi) or 40<=rsi<=68; trend_intact=mtf and price>=vwap>0 and ema9>=ema20>0 and trend>=6 and ret15>=0; near_support=support<=price<=support+max(median_range,1e-9); near_target=target>=price and target-price<=max(median_range,1e-9); bounce=len(closes)>=2 and closes[-1]>closes[-2] and lows[-1]<=support+max(median_range,1e-9); volume_returns=median_vol<=0 or last_vol>=median_vol
     recent_high=max(highs[-6:]); prior_high=max(highs[-12:-6]); recent_low=min(lows[-6:]); prior_low=min(lows[-12:-6]); lower_structure=recent_high<prior_high and recent_low<prior_low; vwap_break=len(closes)>=3 and vwap>0 and all(x<vwap for x in closes[-3:]); ema_bear=ema9<ema20 and ema20>0; macd_bear=float(item.get("macd_histogram",0) or 0)<0
     down=up=0
     for i in range(max(1,len(closes)-12),len(closes)):
         vol=volumes[i] if i<len(volumes) else 0
         if closes[i]<closes[i-1]: down+=vol
         elif closes[i]>closes[i-1]: up+=vol
-    reversal_checks={"VWAP 아래 3개 봉":vwap_break,"EMA9·EMA20 하락 정렬":ema_bear,"고점·저점 동시 하락":lower_structure,"MACD 음전환":macd_bear,"하락봉 거래량 우세":down>up*1.15}; reversal=sum(map(bool,reversal_checks.values())); breakdown=price<support or reversal>=3 or mtf_exit
+    reversal_checks={"VWAP 아래 3개 봉":vwap_break,"EMA9·EMA20 하락 정렬":ema_bear,"고점·저점 동시 하락":lower_structure,"MACD 음전환":macd_bear,"하락봉 거래량 우세":down>up*1.15}; reversal=sum(map(bool,reversal_checks.values())); risk_state=str(item.get("post_entry_risk_state","")); breakdown=risk_state in {"REAL_BREAKDOWN","HARD_EXIT"} or reversal>=4 or mtf_exit
     if breakdown: state,label,reason="EXIT","🔴 추세 꺾임·매도",f"하락 전환 {reversal}/5"
     elif width<0.5: state,label,reason="RANGE_TOO_NARROW",f"⚪ 반복폭 부족 +{width:.2f}%","0.5% 미만"
-    elif width>1.5: state,label,reason="RANGE_TOO_WIDE",f"🔵 반복폭 넓음 +{width:.2f}%","상승여력은 있으나 기본 반복후보 범위 밖"
+    elif width>5.0: state,label,reason="RANGE_TOO_WIDE",f"🔵 반복폭 넓음 +{width:.2f}%","상승여력은 있으나 기본 반복후보 범위 밖"
     elif price>=target or near_target or upper_zone: state,label,reason="TAKE_PROFIT","🟠 1차 목표 접근·분할매도",f"실제 차트 저항 {fmt(target)}"
     elif trend_intact and box_valid and (near_support or lower_zone) and bounce and volume_returns and rsi_recovery: state,label,reason="BUY_PULLBACK","🟢 눌림 반등 매수",f"지지 {fmt(support)} 반등"
     elif trend_intact and box_valid and price>ema9 and volume_returns: state,label,reason="HOLD_OR_BREAKOUT","🟢 보유·돌파 매수 검토",f"1차 {fmt(target)}까지 공간"
     elif trend_intact: state,label,reason="WAIT_PULLBACK","🟡 눌림목 재매수 대기",f"지지 {fmt(support)} 대기"
     else: state,label,reason="WAIT_TREND","🔵 추세 재확인 대기","상위시간대 정렬 대기"
-    item.update(repeat_scalp_state=state,repeat_scalp_label=label,repeat_scalp_reason=reason,repeat_scalp_buy_level=support,repeat_scalp_sell_level=target,repeat_scalp_invalidation=support,repeat_scalp_median_bar_range=median_range,repeat_scalp_reversal_score=reversal,repeat_scalp_reversal_checks=reversal_checks,repeat_scalp_range_percent=width,repeat_scalp_preferred_range=0.5<=width<=1.5,repeat_box_valid=box_valid,repeat_box_low=box_low,repeat_box_high=box_high,repeat_box_range_percent=box_range,repeat_rsi_recovery=rsi_recovery,trailing_stop_enabled=state in {"HOLD_OR_BREAKOUT","TAKE_PROFIT"},trailing_stop_percent=0.5,trailing_stop_price=max(highs[-10:])*0.995 if highs else 0)
+    item.update(repeat_scalp_state=state,repeat_scalp_label=label,repeat_scalp_reason=reason,repeat_scalp_buy_level=support,repeat_scalp_sell_level=target,repeat_scalp_invalidation=support,repeat_scalp_median_bar_range=median_range,repeat_scalp_reversal_score=reversal,repeat_scalp_reversal_checks=reversal_checks,repeat_scalp_range_percent=width,repeat_scalp_preferred_range=0.5<=width<=5.0,repeat_box_valid=box_valid,repeat_box_low=box_low,repeat_box_high=box_high,repeat_box_range_percent=box_range,repeat_rsi_recovery=rsi_recovery,trailing_stop_enabled=state in {"HOLD_OR_BREAKOUT","TAKE_PROFIT"},trailing_stop_percent=0.5,trailing_stop_price=max(highs[-10:])*0.995 if highs else 0)
     return item
 
 
@@ -1566,7 +1956,7 @@ def _candidate_public_view(item:dict,row:dict,market:str):
     box_width=float(item.get("box_width_percent",0) or 0)
     trend_state=str(item.get("intraday_regime_state","UNKNOWN"))
     box_state=str(item.get("box_state","UNAVAILABLE"))
-    repeat_ok=0.5<=width<=1.5
+    repeat_ok=0.5<=width<=5.0
     box_ok=box_state=="RANGE"
 
     score=float(item.get("score",0) or 0)
@@ -1705,7 +2095,7 @@ def dynamic_repeat_candidates(market:str,minimum_score:float,limit:int=6):
         analyzed=1
         width=float(item.get("repeat_scalp_range_percent",0) or 0)
         box_ok=str(item.get("box_state",""))=="RANGE"
-        if 0.5<=width<=1.5 or box_ok:
+        if 0.5<=width<=5.0 or box_ok:
             width_pass=1
         candidate=_candidate_public_view(item,row,market)
         if candidate and float(candidate.get("score",0) or 0)>=minimum_score:
@@ -1773,10 +2163,8 @@ def _apply_entry_locks_to_board(rows:list[dict], now_ts:float):
         d["entry_zone_low"]=lo
         d["entry_zone_high"]=hi
         d["entry_lock_age_min"]=age
-        if entry>0 and float(d.get("target1",0) or 0)>entry:
-            d["repeat_width_locked"]=(float(d["target1"])/entry-1)*100
-        else:
-            d["repeat_width_locked"]=float(d.get("repeat_width",0) or 0)
+        # 반복폭은 진입→1차 수익률이 아니라 실제 반복 Swing 중앙값을 유지한다.
+        d["repeat_width_locked"]=float(d.get("repeat_width",0) or 0)
         out.append(d)
     return out
 
@@ -1811,6 +2199,13 @@ def precise_analysis(row:dict,mode:str,fast_scan:bool=False):
     if spread is not None:
         item["verified_spread_percent"]=spread
     item=forward_forecast_plan(item,market)
+    item=post_entry_risk_plan(item,"KR" if market=="국내" else "US")
+    item=execution_safety_plan(item,market)
+    item=target_probability_plan(item)
+    flags=_forecast_flags(item)
+    item["forecast_all_down"]=bool(flags["all_down"])
+    item["forecast_medium_down"]=bool(flags["medium_down"])
+    item["forecast_valid_pullback"]=bool(flags["valid_pullback_forecast"])
     item["data_gate_passed"]=bool(gate and item.get("repeat_quality_pass",False))
     return _trim_heavy_item(item,360)
 
@@ -1947,7 +2342,7 @@ if candidate_board:
         "RVOL":round(c["rvol"],1),
         "스프레드":f"{c['spread']:.3f}%" if c.get("spread") is not None else "-"
     } for c in candidate_board]),hide_index=True,use_container_width=True)
-else: st.info("현재 실시간 시장에서 우상향 반복단타 또는 1~2% 왕복 박스 품질 조건을 통과한 후보가 없습니다.")
+else: st.info("현재 실시간 시장에서 우상향 반복단타 또는 0.5~5% 왕복 스윙/박스 품질 조건을 통과한 후보가 없습니다.")
 
 options=[]
 if manual_ticker:
@@ -1986,10 +2381,10 @@ quality_rows,quality_passed,_=data_quality_gate(latest,market); regime_name,regi
 intraday_label=str(latest.get("intraday_regime_label","⚪ 큰 추세 확인 중"))
 intraday_reason=str(latest.get("intraday_regime_reason",""))
 strategy_rows,buy_votes,sell_votes,wait_votes=strategy_consensus(latest); weighted_score,weighted_buy=weighted_strategy_score(strategy_rows,regime_name); context=benchmark_context(market,selected_ticker); context_aligned=bool(context.get("confirmed")) and (float(context.get("change",0) or 0)>=-0.05 and float(context.get("intraday",0) or 0)>=-0.10); rr=float(latest.get("risk_reward",0) or 0); state=str(latest.get("repeat_scalp_state","UNAVAILABLE")); width=float(latest.get("repeat_scalp_range_percent",0) or 0); support=float(latest.get("structural_support",0) or 0); stop=float(latest.get("stop_loss",0) or 0); t1=float(latest.get("structural_target1",latest.get("structural_target",0)) or 0); t2=float(latest.get("structural_target2",0) or 0)
-if locked_entry>0 and t1>locked_entry: width=(t1/locked_entry-1)*100
+# 반복폭은 실제 Swing 중앙값이므로 T1/진입가로 다시 계산하지 않는다.
 cal=calibration_stats(selected_ticker) if require_validation else {m:{"samples":0,"accuracy":0,"bias":0,"mae":0} for m in (5,15,30,60)}; validated=cal[5]["samples"]>=20 and cal[15]["samples"]>=20 and cal[5]["accuracy"]>=55 and cal[15]["accuracy"]>=55
 level="success"
-if not quality_passed or not latest.get("repeat_quality_pass",False) or not latest.get("level_plan_valid") or not latest.get("repeat_candidate",False) or not context_aligned or rr<1.2 or state in {"EXIT","TAKE_PROFIT","RANGE_TOO_NARROW","RANGE_TOO_WIDE"} or sell_votes>=3: level="error"
+if not quality_passed or not latest.get("repeat_quality_pass",False) or not latest.get("level_plan_valid") or not latest.get("repeat_candidate",False) or not latest.get("execution_safety_passed",False) or not context_aligned or rr<1.1 or str(latest.get("post_entry_risk_state","")) in {"REAL_BREAKDOWN","HARD_EXIT"} or state in {"EXIT","TAKE_PROFIT","RANGE_TOO_NARROW","RANGE_TOO_WIDE"} or sell_votes>=3: level="error"
 elif require_validation and not validated: level="warning"
 elif state not in {"BUY_PULLBACK","HOLD_OR_BREAKOUT"} or buy_votes<4: level="warning"
 latest["entry_checks_passed"]=level=="success"
@@ -2013,6 +2408,36 @@ st.caption(
 )
 
 cols=st.columns(6); cols[0].metric(f"{selected_ticker} · {latest.get('name','')}",fmt(price),f"{change:+.2f}%"); cols[1].metric("재매수 기준",fmt(locked_entry),f"{fmt(entry_zone_low)}~{fmt(entry_zone_high)} · {entry_lock_age}분 유지"); cols[2].metric("1차 목표가",fmt(t1),f"진입기준 +{width:.2f}%"); cols[3].metric("2차 목표가",fmt(t2) if t2>0 else "-",f"{float(latest.get('target2_upside_percent',0) or 0):+.2f}%" if t2>0 else None); cols[4].metric("현재 차트 지지",fmt(support)); cols[5].metric("손절가",fmt(stop))
+risk_state=str(latest.get("post_entry_risk_state","FORMING"))
+risk_label=str(latest.get("post_entry_risk_label","⚪ 손절판정 자료 형성 중"))
+risk_action=str(latest.get("post_entry_action","대기"))
+soft_stop=float(latest.get("post_entry_soft_stop",0) or 0)
+hard_stop=float(latest.get("post_entry_hard_stop",stop) or stop or 0)
+swing_duration=float(latest.get("swing_cycle_duration_minutes",0) or 0)
+swing_elapsed=int(latest.get("swing_current_elapsed_minutes",0) or 0)
+speed_ratio=float(latest.get("swing_speed_ratio",0) or 0)
+osc_count=int(latest.get("repeat_oscillation_count",0) or 0)
+if risk_state=="HARD_EXIT":
+    st.error(f"🚨 지금 손절? → 긴급손절 · {risk_label}")
+elif risk_state=="REAL_BREAKDOWN":
+    st.error(f"🔴 지금 손절? → 예 · {risk_label}")
+elif risk_state=="WARNING":
+    st.warning(f"🟠 지금 손절? → 아직 확정 아님 · 1~3분 회복 확인")
+elif risk_state=="SHAKEOUT":
+    st.success("🟢 지금 손절? → 아니오 · 지지 이탈 후 회복(흔들림 가능)")
+elif risk_state=="UPSIDE_BREAKOUT":
+    st.success("🚀 반복상단 돌파 · 고정 상단매도보다 추세추종 우선")
+else:
+    st.info(f"🟢 지금 손절? → 아니오 · {risk_label}")
+
+r1,r2,r3,r4,r5=st.columns(5)
+r1.metric("대표 스윙폭",f"{width:.2f}%",f"최근 {osc_count}회")
+r2.metric("대표 스윙주기",f"{swing_duration:.0f}분" if swing_duration>0 else "-",
+          f"현재 {swing_elapsed}분째")
+r3.metric("하락/상승 속도",f"{speed_ratio:.2f}배","평소 스윙 대비")
+r4.metric("Soft Stop",fmt(soft_stop),"터치=즉시손절 아님")
+r5.metric("Hard Stop",fmt(hard_stop),"급락/구조붕괴용")
+
 ext_state=str(latest.get("upside_continuation_state","NO_TARGET2")); ext_label=str(latest.get("upside_continuation_label","⚪ 추가상승 미확인")); ext_pct=float(latest.get("additional_upside_after_target1",0) or 0); ext_score=int(latest.get("upside_continuation_score",0) or 0)
 if ext_state=="STRONG": st.success(f"{ext_label} · 근거 {ext_score}/10 · 1차→2차 +{ext_pct:.2f}%")
 elif ext_state=="WATCH": st.warning(f"{ext_label} · 근거 {ext_score}/10")
