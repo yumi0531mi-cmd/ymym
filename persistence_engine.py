@@ -1,23 +1,29 @@
 # -*- coding: utf-8 -*-
-"""반복단타 스캐너 v5.5 공통 전략 엔진.
+"""반복단타 스캐너 v5.1 공통 지속성 엔진.
 
-목적
-- 실제 1분봉에서 0.5~5.0% 완성 Swing을 미래봉 없이 탐지
-- TREND_SWING / RANGE_SWING 분류
-- 5시간 Persistence와 Evidence Confidence 분리
-- 가짜손절(SHAKEOUT)과 실제 붕괴를 상태로 분리
-- 비용/스프레드/틱을 뺀 Net Swing으로 실거래 가능성 확인
-- 진입 plan_id 및 PRE_ENTRY/IN_POSITION/EXITED 상태
-- 후보판/집중분석/검증기가 동일 evaluate_strategy() 사용
+목표:
+- 0.5~5.0% 실제 Swing 반복
+- TREND_SWING / RANGE_SWING
+- 장초반=추정, 장중=실측 강화, 장후반=남은 세션 기준
+- 5시간(300분) Persistence Score + Confidence
+- 3중 유동성
+- 패턴 피로도
+- Cooldown / Hard-Kill 상태관리
+- 후보판/집중분석/검증기에서 같은 FINAL_BUY 규칙 사용
 
-주의: 99%는 '설계 항목의 코드 반영 목표'이며 수익률/무오류 보장이 아니다.
+주의:
+calibrated_probability는 DB 표본 30건 이상일 때만 별도로 채운다.
 """
 from __future__ import annotations
-import json, math, sqlite3, time, hashlib
+
+import json
+import math
+import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 try:
     import pandas as pd
@@ -26,384 +32,628 @@ except Exception:
 
 KST = timezone(timedelta(hours=9), name="KST")
 ET = ZoneInfo("America/New_York")
-VERSION = "v5.5-online-swing"
-SCHEMA_VERSION = "v5.5-schema-1"
-PLAN_VERSION = "v5.5-plan-1"
-SWING_MIN, SWING_MAX, MIN_SWINGS = 0.50, 5.00, 3
+
+VERSION = "v5.1-persistence-cycle"
+SWING_MIN = 0.50
+SWING_MAX = 5.00
+MIN_SWINGS = 3
 TARGET_HORIZON_MIN = 300
 
-def _num(v:Any, default:float=0.0)->float:
+
+def _num(v: Any, default: float = 0.0) -> float:
     try:
-        x=float(v); return x if math.isfinite(x) else default
-    except Exception: return default
+        x = float(v)
+        return x if math.isfinite(x) else default
+    except Exception:
+        return default
 
-def _clamp(x,lo,hi): return max(lo,min(hi,x))
-def _median(xs, default=0.0):
-    a=sorted(float(x) for x in xs if math.isfinite(float(x)))
-    if not a:return default
-    n=len(a); m=n//2
-    return a[m] if n%2 else (a[m-1]+a[m])/2
 
-def _series(item,key):
-    out=[]
-    for v in item.get(key,[]) or []:
-        x=_num(v,float("nan"))
-        if math.isfinite(x): out.append(x)
+def _series(item: dict, key: str) -> list[float]:
+    out = []
+    for v in item.get(key, []) or []:
+        x = _num(v, float("nan"))
+        if math.isfinite(x):
+            out.append(x)
     return out
 
-def _market_code(market):
-    s=str(market or "").upper()
-    return "KR" if s in {"KR","국내"} or s.startswith("국내") else "US"
 
-def _tick(price, market):
-    if price<=0:return 0.0
-    if _market_code(market)=="US": return 0.0001 if price<1 else 0.01
-    if price<2000:return 1
-    if price<5000:return 5
-    if price<20000:return 10
-    if price<50000:return 50
-    if price<200000:return 100
-    if price<500000:return 500
-    return 1000
+def _median(values: list[float], default: float = 0.0) -> float:
+    vals = sorted(x for x in values if math.isfinite(x))
+    if not vals:
+        return default
+    n = len(vals)
+    m = n // 2
+    return vals[m] if n % 2 else (vals[m - 1] + vals[m]) / 2.0
 
-def _round_tick(price, market):
-    t=_tick(price,market)
-    return round(price/t)*t if t else price
 
-def _session_bounds(market, now):
-    if _market_code(market)=="KR":
-        local=now.astimezone(KST)
-        if local.weekday()>=5:return None,None,"국내 휴장"
-        return local.replace(hour=9,minute=0,second=0,microsecond=0), local.replace(hour=15,minute=30,second=0,microsecond=0), "국내 정규장"
-    local=now.astimezone(ET)
-    if local.weekday()>=5:return None,None,"미국 휴장"
-    m=local.hour*60+local.minute
-    if 4*60<=m<9*60+30:
-        return local.replace(hour=4,minute=0,second=0,microsecond=0),local.replace(hour=9,minute=30,second=0,microsecond=0),"미국 프리마켓"
-    if 9*60+30<=m<16*60:
-        return local.replace(hour=9,minute=30,second=0,microsecond=0),local.replace(hour=16,minute=0,second=0,microsecond=0),"미국 정규장"
-    if 16*60<=m<20*60:
-        return local.replace(hour=16,minute=0,second=0,microsecond=0),local.replace(hour=20,minute=0,second=0,microsecond=0),"미국 애프터마켓"
-    return None,None,"미국 장외시간"
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
-def session_horizon(market, now_ts=None):
-    now=datetime.fromtimestamp(now_ts or time.time(),tz=KST)
-    op,cl,label=_session_bounds(market,now)
-    if not op:return dict(session_label=label,tradable=False,elapsed_minutes=0,remaining_minutes=0,persistence_horizon_minutes=0,late_session=True)
-    local=now.astimezone(op.tzinfo)
-    elapsed=max(0,int((local-op).total_seconds()//60)); remain=max(0,int((cl-local).total_seconds()//60))
-    return dict(session_label=label,tradable=op<=local<cl,elapsed_minutes=elapsed,remaining_minutes=remain,
-                persistence_horizon_minutes=min(300,remain),late_session=remain<45)
 
-def _bar_age_seconds(item, market, now_ts):
-    times=item.get("chart_time_1m",[]) or []
-    if not times or pd is None:return None
+def _market_code(market: str) -> str:
+    s = str(market or "").upper()
+    return "KR" if s in {"KR", "국내"} or s.startswith("국내") else "US"
+
+
+def _session_bounds(market: str, now: datetime) -> tuple[datetime | None, datetime | None, str]:
+    code = _market_code(market)
+    if code == "KR":
+        local = now.astimezone(KST)
+        if local.weekday() >= 5:
+            return None, None, "국내 휴장"
+        op = local.replace(hour=9, minute=0, second=0, microsecond=0)
+        cl = local.replace(hour=15, minute=30, second=0, microsecond=0)
+        return op, cl, "국내 정규장"
+
+    local = now.astimezone(ET)
+    if local.weekday() >= 5:
+        return None, None, "미국 휴장"
+    minute = local.hour * 60 + local.minute
+    if 4 * 60 <= minute < 9 * 60 + 30:
+        op = local.replace(hour=4, minute=0, second=0, microsecond=0)
+        cl = local.replace(hour=9, minute=30, second=0, microsecond=0)
+        return op, cl, "미국 프리마켓"
+    if 9 * 60 + 30 <= minute < 16 * 60:
+        op = local.replace(hour=9, minute=30, second=0, microsecond=0)
+        cl = local.replace(hour=16, minute=0, second=0, microsecond=0)
+        return op, cl, "미국 정규장"
+    if 16 * 60 <= minute < 20 * 60:
+        op = local.replace(hour=16, minute=0, second=0, microsecond=0)
+        cl = local.replace(hour=20, minute=0, second=0, microsecond=0)
+        return op, cl, "미국 애프터마켓"
+    return None, None, "미국 장외시간"
+
+
+def session_horizon(market: str, now_ts: float | None = None) -> dict:
+    now = datetime.fromtimestamp(now_ts or time.time(), tz=KST)
+    op, cl, label = _session_bounds(market, now)
+    if op is None or cl is None:
+        return {
+            "session_label": label,
+            "tradable": False,
+            "elapsed_minutes": 0,
+            "remaining_minutes": 0,
+            "persistence_horizon_minutes": 0,
+            "late_session": True,
+        }
+    local = now.astimezone(op.tzinfo)
+    elapsed = max(0, int((local - op).total_seconds() // 60))
+    remaining = max(0, int((cl - local).total_seconds() // 60))
+    return {
+        "session_label": label,
+        "tradable": op <= local < cl,
+        "elapsed_minutes": elapsed,
+        "remaining_minutes": remaining,
+        "persistence_horizon_minutes": min(TARGET_HORIZON_MIN, remaining),
+        "late_session": remaining < 45,
+    }
+
+
+def _bar_age_seconds(item: dict, market: str, now_ts: float) -> float | None:
+    times = item.get("chart_time_1m", []) or []
+    if not times or pd is None:
+        return None
     try:
-        t=pd.Timestamp(pd.to_datetime(times[-1]))
-        if t.tzinfo is None:t=t.tz_localize(KST if _market_code(market)=="KR" else ET)
-        now=pd.Timestamp(datetime.fromtimestamp(now_ts,tz=timezone.utc))
-        return max(0.0,(now-t.tz_convert("UTC")).total_seconds())
-    except Exception:return None
+        t = pd.Timestamp(pd.to_datetime(times[-1]))
+        if t.tzinfo is None:
+            t = t.tz_localize(KST if _market_code(market) == "KR" else ET)
+        now = pd.Timestamp(datetime.fromtimestamp(now_ts, tz=timezone.utc))
+        return max(0.0, (now - t.tz_convert("UTC")).total_seconds())
+    except Exception:
+        return None
 
-def _atr_pct(highs,lows,closes,n=14):
-    k=min(len(closes),len(highs),len(lows))
-    if k<3:return 0.0
-    trs=[]
-    for i in range(max(1,k-n),k):
-        prev=closes[i-1]
-        trs.append(max(highs[i]-lows[i],abs(highs[i]-prev),abs(lows[i]-prev)))
-    atr=_median(trs)
-    return atr/closes[-1]*100 if closes[-1]>0 else 0.0
 
-def online_swing_plan(item, market):
-    """확정은 반대방향 reversal이 발생한 시점에만 한다. 미래봉을 보지 않는다."""
-    out=dict(item)
-    highs=_series(out,"chart_high_1m"); lows=_series(out,"chart_low_1m"); closes=_series(out,"chart_close_1m")
-    times=list(out.get("chart_time_1m",[]) or [])
-    n=min(len(highs),len(lows),len(closes),len(times) if times else 10**9)
-    if n<8:
-        out.update(online_swing_valid=False, online_swing_reason="1분봉 표본부족", confirmed_swing_count=0)
-        return out
-    highs,lows,closes=highs[-n:],lows[-n:],closes[-n:]
-    times=(times[-n:] if times else list(range(n)))
-    spread=_num(out.get("verified_spread_percent",out.get("repeat_spread_percent")),-1)
-    atrp=_atr_pct(highs,lows,closes)
-    tickp=_tick(closes[-1],market)/closes[-1]*100 if closes[-1]>0 else 0
-    cost=max(0.0,spread if spread>=0 else 0.0)+tickp*2+(_num(out.get("expected_slippage_percent"),0.03 if _market_code(market)=="KR" else 0.05)*2)
-    reversal=_clamp(max(0.22,atrp*0.75,tickp*4,cost*1.25),0.22,2.0)
+def _turnover(item: dict, bars: int | None = None) -> float:
+    closes = _series(item, "chart_close_1m")
+    vols = _series(item, "chart_volume_1m")
+    n = min(len(closes), len(vols))
+    if n <= 0:
+        return 0.0
+    if bars is not None:
+        n = min(n, bars)
+    return sum(closes[-n + i] * vols[-n + i] for i in range(n))
 
-    piv=[]; direction=0
-    # direction 0: 아직 첫 방향 미확정. running low/high에서 threshold가 나오면 시작한다.
-    run_low=lows[0]; low_i=0
-    run_high=highs[0]; high_i=0
-    extreme=closes[0]; ex_i=0
-    for i in range(1,n):
-        h,l=highs[i],lows[i]
-        if direction==0:
-            if l<run_low: run_low=l; low_i=i
-            if h>run_high: run_high=h; high_i=i
-            up=(h/run_low-1)*100 if run_low>0 else 0
-            down=(1-l/run_high)*100 if run_high>0 else 0
-            if up>=reversal and low_i< i:
-                piv.append(("L",low_i,run_low,times[low_i]))
-                direction=1; extreme=h; ex_i=i
-            elif down>=reversal and high_i< i:
-                piv.append(("H",high_i,run_high,times[high_i]))
-                direction=-1; extreme=l; ex_i=i
-            continue
-        if direction==1:
-            if h>=extreme: extreme=h; ex_i=i
-            rev=(extreme-l)/extreme*100 if extreme>0 else 0
-            if rev>=reversal:
-                piv.append(("H",ex_i,extreme,times[ex_i]))
-                direction=-1; extreme=l; ex_i=i
-        else:
-            if l<=extreme: extreme=l; ex_i=i
-            rev=(h-extreme)/extreme*100 if extreme>0 else 0
-            if rev>=reversal:
-                piv.append(("L",ex_i,extreme,times[ex_i]))
-                direction=1; extreme=h; ex_i=i
 
-    # 동일 타입 연속 pivot 정리
-    clean=[]
-    for p in piv:
-        if not clean or clean[-1][0]!=p[0]: clean.append(p)
-        elif (p[0]=="H" and p[2]>clean[-1][2]) or (p[0]=="L" and p[2]<clean[-1][2]): clean[-1]=p
+def _liquidity_thresholds(market: str, session_label: str) -> tuple[float, float]:
+    code = _market_code(market)
+    if code == "KR":
+        return 30_000_000_000.0, 3_000_000_000.0  # 300억 / 30억
+    if "프리" in session_label:
+        return 3_000_000.0, 500_000.0
+    if "정규" in session_label:
+        return 50_000_000.0, 5_000_000.0
+    if "애프터" in session_label:
+        return 2_000_000.0, 300_000.0
+    return 5_000_000.0, 500_000.0
 
-    swings=[]
-    for a,b in zip(clean,clean[1:]):
-        if a[0]=="L" and b[0]=="H" and b[2]>a[2]:
-            gross=(b[2]/a[2]-1)*100
-            net=gross-cost
-            if SWING_MIN<=gross<=SWING_MAX:
-                swings.append(dict(low=a[2],high=b[2],low_i=a[1],high_i=b[1],low_time=str(a[3]),high_time=str(b[3]),
-                                   gross_pct=gross,net_pct=net,duration=max(1,b[1]-a[1])))
-    widths=[s["gross_pct"] for s in swings]; nets=[s["net_pct"] for s in swings]
-    durations=[s["duration"] for s in swings]
-    rep=_median(widths); netrep=_median(nets); cyc=[]
-    lows_p=[p for p in clean if p[0]=="L"]
-    for a,b in zip(lows_p,lows_p[1:]): cyc.append(max(1,b[1]-a[1]))
-    cycle=_median(cyc,_median(durations,0))
-    consistency=0.0
-    if len(widths)>=2 and rep>0:
-        mad=_median([abs(x-rep) for x in widths])
-        consistency=_clamp(1-mad/max(rep,0.01),0,1)
 
-    provisional=dict(type=("H" if direction>=0 else "L"),price=extreme,index=ex_i,time=str(times[ex_i]),confirmed=False)
+def tier_liquidity(item: dict, market: str, horizon: dict) -> dict:
+    observed = min(
+        len(item.get("chart_close_1m", []) or []),
+        len(item.get("chart_volume_1m", []) or []),
+    )
+    day_value = _turnover(item, None)
+    hour_value = _turnover(item, 60)
+
+    day_base, hour_base = _liquidity_thresholds(market, horizon["session_label"])
+    elapsed = max(1, horizon["elapsed_minutes"])
+    # 장초반에는 하루 기준을 경과시간에 비례해 적용한다.
+    if _market_code(market) == "KR":
+        session_len = 390
+    elif "프리" in horizon["session_label"]:
+        session_len = 330
+    elif "정규" in horizon["session_label"]:
+        session_len = 390
+    else:
+        session_len = 240
+    day_req = day_base * _clamp(elapsed / session_len, 0.08, 1.0)
+    hour_req = hour_base * _clamp(min(observed, 60) / 60.0, 0.15, 1.0)
+
+    rvol = _num(item.get("rvol"), 0.0)
+    phase = str(item.get("swing_current_phase", "FORMING"))
+    risk_state = str(item.get("post_entry_risk_state", "FORMING"))
+    if risk_state == "UPSIDE_BREAKOUT":
+        tier2_req = 1.50
+    elif phase == "FALLING":
+        tier2_req = 0.50
+    else:
+        tier2_req = 0.80
+
+    spread = _num(item.get("verified_spread_percent", item.get("repeat_spread_percent")), -1.0)
+    spread_limit = 0.35 if "레버리지" in str(item.get("asset_type", "")) else 0.25
+    tier3_known = spread >= 0
+    tier3_pass = (spread <= spread_limit) if tier3_known else True
+
+    t1 = day_value >= day_req and hour_value >= hour_req
+    t2 = rvol >= tier2_req if rvol > 0 else False
+    return {
+        "liquidity_tier1_pass": bool(t1),
+        "liquidity_tier2_pass": bool(t2),
+        "liquidity_tier3_pass": bool(tier3_pass),
+        "liquidity_tier3_known": bool(tier3_known),
+        "liquidity_day_value": day_value,
+        "liquidity_hour_value": hour_value,
+        "liquidity_day_required": day_req,
+        "liquidity_hour_required": hour_req,
+        "liquidity_rvol_required": tier2_req,
+        "liquidity_spread_limit": spread_limit,
+        "liquidity_score": (
+            (40 if t1 else min(40, 40 * day_value / max(day_req, 1)))
+            + (35 if t2 else min(35, 35 * rvol / max(tier2_req, 0.01)))
+            + (25 if tier3_pass else 0)
+        ),
+    }
+
+
+def _pattern_fatigue(item: dict) -> dict:
+    widths = [_num(x) for x in (item.get("swing_width_samples") or []) if _num(x) > 0]
+    representative = _num(item.get("swing_up_width_percent"))
+    fatigue = 0.0
+    reasons = []
+    if len(widths) >= 3:
+        last3 = widths[-3:]
+        if last3[0] > last3[1] > last3[2]:
+            fatigue += 25
+            reasons.append("최근 3개 상승스윙 연속 축소")
+        if representative > 0 and last3[-1] < representative * 0.70:
+            fatigue += 20
+            reasons.append("최근 스윙폭 대표값 대비 30% 이상 축소")
+    cycle = _num(item.get("swing_cycle_duration_minutes"))
+    elapsed = _num(item.get("swing_current_elapsed_minutes"))
+    if cycle > 0 and elapsed > cycle * 1.5:
+        fatigue += 15
+        reasons.append("현재 파동시간 장기화")
+    if str(item.get("intraday_regime_state", "")) in {"UPTREND_WEAKENING", "DOWNTREND"}:
+        fatigue += 20
+        reasons.append("큰 추세 약화")
+    sell_share = _num(item.get("post_entry_sell_volume_share"), 0.5)
+    if sell_share >= 0.62:
+        fatigue += 15
+        reasons.append("최근 매도거래량 비중 증가")
+    vol_burst = _num(item.get("swing_volume_burst_ratio"), 1.0)
+    if str(item.get("swing_current_phase", "")) == "RISING" and vol_burst < 0.60:
+        fatigue += 10
+        reasons.append("상승파동 거래량 약화")
+    fatigue = _clamp(fatigue, 0, 100)
+    return {"pattern_fatigue": fatigue, "pattern_fatigue_reasons": reasons}
+
+
+def _strategy_type(item: dict) -> str:
+    box_valid = bool(item.get("repeat_box_valid"))
+    regime = str(item.get("intraday_regime_state", ""))
+    hourly = str(item.get("hourly_structure_state", ""))
+    if box_valid and regime not in {"DOWNTREND"} and hourly not in {"BEAR", "STRONG_BEAR"}:
+        return "RANGE_SWING"
+    if regime in {"STRONG_UPTREND", "UPTREND_PULLBACK", "UPTREND_WEAKENING"} or hourly in {"BULL", "STRONG_BULL"}:
+        return "TREND_SWING"
+    return "NONE"
+
+
+def persistence_plan(item: dict, market: str, now_ts: float | None = None) -> dict:
+    now_ts = now_ts or time.time()
+    horizon = session_horizon(market, now_ts)
+    out = dict(horizon)
+
+    closes = _series(item, "chart_close_1m")
+    observed = min(len(closes), 360)
+    swing_count = int(_num(item.get("repeat_oscillation_count")))
+    width = _num(item.get("swing_up_width_percent", item.get("repeat_width_percent")))
+    consistency = _num(item.get("swing_width_consistency"))
+    cycle = _num(item.get("swing_cycle_duration_minutes"))
+    fatigue = _pattern_fatigue(item)
+    liq = tier_liquidity(item, market, horizon)
+
+    # 90/180/300분 가격흐름 안정성: 절대 수익률이 아니라 극단 붕괴 여부를 본다.
+    def ret(minutes: int) -> float:
+        if len(closes) > minutes and closes[-1 - minutes] > 0:
+            return (closes[-1] / closes[-1 - minutes] - 1.0) * 100
+        return 0.0
+    r90, r180, r300 = ret(90), ret(180), ret(300)
+
+    swing_score = 100 * _clamp(consistency, 0, 1)
+    if swing_count < MIN_SWINGS:
+        swing_score *= swing_count / MIN_SWINGS
+    width_score = 100 if SWING_MIN <= width <= SWING_MAX else 0
+
+    # VWAP 체류는 배열이 있으면 직접 계산.
+    c = _series(item, "chart_close_1m")
+    v = _series(item, "chart_vwap_1m")
+    n = min(len(c), len(v), 180)
+    if n >= 20:
+        vwap_hold = sum(1 for a, b in zip(c[-n:], v[-n:]) if b > 0 and a >= b) / n
+    else:
+        vwap_hold = 1.0 if _num(item.get("price")) >= _num(item.get("vwap")) > 0 else 0.45
+
+    hourly = str(item.get("hourly_structure_state", "FORMING"))
+    regime = str(item.get("intraday_regime_state", "UNKNOWN"))
+    box_valid = bool(item.get("repeat_box_valid"))
+    structure_score = 50.0
+    if hourly in {"BULL", "STRONG_BULL"}:
+        structure_score += 25
+    elif hourly in {"BEAR", "STRONG_BEAR"}:
+        structure_score -= 35
+    if regime in {"STRONG_UPTREND", "UPTREND_PULLBACK"}:
+        structure_score += 20
+    elif regime == "DOWNTREND":
+        structure_score -= 35
+    if box_valid:
+        structure_score = max(structure_score, 75)
+    structure_score = _clamp(structure_score, 0, 100)
+
+    # 주기 안정성은 현재 파동이 대표주기에서 너무 멀어지는지로 보수 평가.
+    elapsed = _num(item.get("swing_current_elapsed_minutes"))
+    if cycle > 0:
+        cycle_ratio = elapsed / cycle
+        cycle_score = 100 if cycle_ratio <= 1.2 else _clamp(100 - (cycle_ratio - 1.2) * 70, 20, 100)
+    else:
+        cycle_score = 35
+
+    # 회복력: shakeout은 회복으로 간주, warning/breakdown은 감점.
+    risk_state = str(item.get("post_entry_risk_state", "FORMING"))
+    recovery_score = {
+        "NORMAL_SWING": 90, "NORMAL_PULLBACK": 85, "SHAKEOUT": 80,
+        "WARNING": 45, "REAL_BREAKDOWN": 0, "HARD_EXIT": 0,
+        "UPSIDE_BREAKOUT": 92, "FORMING": 45
+    }.get(risk_state, 55)
+
+    spread_score = 100 if liq["liquidity_tier3_pass"] else 0
+
+    # 과거 90/180/300분이 심한 음수일수록 지속성 감점.
+    long_penalty = 0.0
+    for r, weight in ((r90, 5), (r180, 7), (r300, 8)):
+        if r < -2.0:
+            long_penalty += min(weight, abs(r) * 1.5)
+
+    score = (
+        0.20 * swing_score
+        + 0.10 * width_score
+        + 0.15 * (vwap_hold * 100)
+        + 0.15 * structure_score
+        + 0.10 * liq["liquidity_score"]
+        + 0.10 * cycle_score
+        + 0.10 * recovery_score
+        + 0.10 * spread_score
+        - 0.25 * fatigue["pattern_fatigue"]
+        - long_penalty
+    )
+    score = _clamp(score, 0, 100)
+
+    if observed >= 300:
+        mode = "OBSERVED_300"
+        confidence = 75 + min(20, (observed - 300) / 3)
+    elif observed >= 180:
+        mode = "PROJECTED_180"
+        confidence = 58 + min(17, (observed - 180) / 7)
+    elif observed >= 90:
+        mode = "PROJECTED_90"
+        confidence = 45 + min(13, (observed - 90) / 7)
+    elif observed >= 30:
+        mode = "EARLY_PROJECTED"
+        confidence = 30 + min(15, (observed - 30) / 4)
+    else:
+        mode = "EARLY_FORMING"
+        confidence = 15 + observed * 0.5
+
+    confidence += min(8, swing_count * 1.5)
+    confidence += max(0, consistency - 0.5) * 10
+    confidence = _clamp(confidence, 10, 95)
+
+    if score >= 80:
+        grade = "PERSISTENT_A"
+    elif score >= 70:
+        grade = "PERSISTENT_B"
+    elif score >= 60:
+        grade = "WATCH"
+    else:
+        grade = "UNSTABLE"
+
+    # 장후반에는 남은 시간에 한 번의 온전한 파동을 완료할 수 있어야 신규진입 가능.
+    minimum_trade_time = max(20, int(cycle * 1.2)) if cycle > 0 else 30
+    new_entry_time_ok = horizon["remaining_minutes"] >= minimum_trade_time
+    if horizon["remaining_minutes"] < 45:
+        new_entry_time_ok = False
+
     out.update(
-        online_reversal_threshold_percent=round(reversal,4), execution_cost_percent=round(cost,4),
-        online_confirmed_pivots=clean[-16:], online_provisional_pivot=provisional,
-        confirmed_swings=swings[-10:], confirmed_swing_count=len(swings),
-        swing_width_samples=[round(x,4) for x in widths[-10:]],
-        swing_up_width_percent=round(rep,4), net_swing_width_percent=round(netrep,4),
-        swing_width_consistency=round(consistency,4), swing_cycle_duration_minutes=round(cycle,2),
-        repeat_oscillation_count=len(swings), swing_cycle_valid=len(swings)>=MIN_SWINGS and SWING_MIN<=rep<=SWING_MAX,
-        online_swing_valid=len(swings)>=MIN_SWINGS and netrep>0,
-        online_swing_reason=("확정 Swing 3회 이상" if len(swings)>=MIN_SWINGS else f"확정 Swing {len(swings)}/3"),
+        observed_minutes=observed,
+        persistence_mode=mode,
+        persistence_score=round(score, 2),
+        persistence_confidence=round(confidence, 1),
+        persistence_grade=grade,
+        persistence_projected=mode != "OBSERVED_300",
+        persistence_new_entry_time_ok=bool(new_entry_time_ok),
+        persistence_min_trade_time=minimum_trade_time,
+        persistence_return_90m=r90,
+        persistence_return_180m=r180,
+        persistence_return_300m=r300,
+        persistence_vwap_hold_ratio=vwap_hold,
+        persistence_structure_score=structure_score,
+        persistence_cycle_score=cycle_score,
+        **fatigue,
+        **liq,
     )
     return out
 
-def _turnover(item,bars=None):
-    c=_series(item,"chart_close_1m"); v=_series(item,"chart_volume_1m"); n=min(len(c),len(v))
-    if n<=0:return 0.0
-    if bars:n=min(n,bars)
-    return sum(c[-i]*v[-i] for i in range(1,n+1))
 
-def tier_liquidity(item,market,h):
-    day=_turnover(item); hour=_turnover(item,60); elapsed=max(1,h["elapsed_minutes"])
-    if _market_code(market)=="KR": daybase,hourbase,slen=30e9,3e9,390
-    elif "정규" in h["session_label"]: daybase,hourbase,slen=50e6,5e6,390
-    elif "프리" in h["session_label"]: daybase,hourbase,slen=3e6,.5e6,330
-    else: daybase,hourbase,slen=2e6,.3e6,240
-    dayreq=daybase*_clamp(elapsed/slen,.08,1); hourreq=hourbase*_clamp(min(len(_series(item,"chart_close_1m")),60)/60,.15,1)
-    rvol=_num(item.get("rvol")); spread=_num(item.get("verified_spread_percent"),-1)
-    spread_limit=.35 if "레버리지" in str(item.get("asset_type","")) else .25
-    t1=day>=dayreq and hour>=hourreq; t2=rvol>=.8 if rvol>0 else False; known=spread>=0; t3=known and spread<=spread_limit
-    score=(40 if t1 else min(40,40*day/max(dayreq,1)))+(35 if t2 else min(35,35*rvol/.8))+(25 if t3 else 0)
-    return dict(liquidity_tier1_pass=t1,liquidity_tier2_pass=t2,liquidity_tier3_pass=t3,liquidity_tier3_known=known,
-                liquidity_score=round(score,2),liquidity_day_value=day,liquidity_hour_value=hour,liquidity_spread_limit=spread_limit)
+def dynamic_recovery_window(item: dict) -> int:
+    down_duration = _num(item.get("swing_down_duration_minutes"), 0)
+    if down_duration <= 0:
+        return 2
+    return int(round(_clamp(down_duration * 0.25, 1, 4)))
 
-def _strategy_type(item):
-    piv=item.get("online_confirmed_pivots",[]) or []
-    lows=[p[2] for p in piv if p[0]=="L"][-4:]; highs=[p[2] for p in piv if p[0]=="H"][-4:]
-    if len(lows)>=3 and len(highs)>=3:
-        hl=sum(b>a for a,b in zip(lows,lows[1:])); hh=sum(b>a for a,b in zip(highs,highs[1:]))
-        low_disp=(max(lows)-min(lows))/_median(lows)*100 if _median(lows)>0 else 99
-        high_disp=(max(highs)-min(highs))/_median(highs)*100 if _median(highs)>0 else 99
-        if hl>=2 and hh>=2:return "TREND_SWING"
-        if low_disp<=1.2 and high_disp<=1.2:return "RANGE_SWING"
-    return "NONE"
 
-def _fatigue(item):
-    widths=[_num(x) for x in item.get("swing_width_samples",[]) if _num(x)>0]; f=0; reasons=[]
-    if len(widths)>=3 and widths[-3]>widths[-2]>widths[-1]: f+=25; reasons.append("최근 3개 Swing 폭 축소")
-    rep=_num(item.get("swing_up_width_percent"))
-    if widths and rep>0 and widths[-1]<rep*.7:f+=20; reasons.append("최근 폭 대표값 대비 30% 이상 축소")
-    sell=_num(item.get("post_entry_sell_volume_share"),.5)
-    if sell>=.62:f+=15; reasons.append("매도거래량 증가")
-    down=_num(item.get("swing_down_duration_minutes")); cycle=_num(item.get("swing_cycle_duration_minutes"))
-    if cycle>0 and down>cycle*.65:f+=15; reasons.append("회복 지연")
-    return dict(pattern_fatigue=_clamp(f,0,100),pattern_fatigue_reasons=reasons)
-
-def persistence_plan(item,market,now_ts=None):
-    h=session_horizon(market,now_ts); c=_series(item,"chart_close_1m"); observed=min(len(c),360)
-    cnt=int(_num(item.get("confirmed_swing_count"))); rep=_num(item.get("swing_up_width_percent")); cons=_num(item.get("swing_width_consistency"))
-    liq=tier_liquidity(item,market,h); fat=_fatigue(item); st=_strategy_type(item)
-    swing=min(100,cnt/3*70+cons*30) if cnt else 0
-    structure=85 if st=="TREND_SWING" else 80 if st=="RANGE_SWING" else 30
-    net=_num(item.get("net_swing_width_percent")); netscore=100 if net>=.35 else max(0,net/.35*100)
-    score=_clamp(.30*swing+.20*structure+.20*liq["liquidity_score"]+.15*netscore+.15*(100-fat["pattern_fatigue"]),0,100)
-    if observed>=300: mode,conf="OBSERVED_300",min(95,78+(observed-300)/4)
-    elif observed>=180: mode,conf="PROJECTED_180",60+(observed-180)/7
-    elif observed>=90: mode,conf="PROJECTED_90",45+(observed-90)/7
-    elif observed>=30: mode,conf="EARLY_PROJECTED",30+(observed-30)/4
-    else: mode,conf="EARLY_FORMING",10+observed*.6
-    conf=_clamp(conf+min(8,cnt*1.5)+max(0,cons-.5)*10,10,95)
-    cycle=_num(item.get("swing_cycle_duration_minutes")); mintrade=max(20,int(cycle*1.25)+5) if cycle else 30
-    # 고정 45분 대신 cycle ETA 기반. 단 최소 15분 안전완충.
-    newtime=h["remaining_minutes"]>=max(15,mintrade)
-    grade="PERSISTENT_A" if score>=80 else "PERSISTENT_B" if score>=70 else "WATCH" if score>=60 else "UNSTABLE"
-    return dict(**h,observed_minutes=observed,persistence_mode=mode,persistence_score=round(score,2),
-                persistence_confidence=round(conf,1),evidence_confidence=round(conf,1),persistence_grade=grade,
-                persistence_projected=observed<300,persistence_new_entry_time_ok=newtime,persistence_min_trade_time=mintrade,
-                next_cycle_eta_minutes=round(cycle,1) if cycle else None,**liq,**fat)
-
-def _risk_state(item):
-    price=_num(item.get("price")); soft=_num(item.get("post_entry_soft_stop",item.get("soft_stop")))
-    hard=_num(item.get("post_entry_hard_stop",item.get("hard_stop",item.get("stop_loss"))))
-    given=str(item.get("post_entry_risk_state","FORMING"))
-    if hard>0 and price>0 and price<=hard:return "HARD_EXIT"
-    if given in {"REAL_BREAKDOWN","HARD_EXIT"}:return given
-    if soft>0 and price>0 and price<soft:
-        # LL/매도압/VWAP이탈 중 2개 이상이면 WARNING, 아니면 SHAKEOUT
-        lows=_series(item,"chart_low_1m"); ll=len(lows)>=3 and lows[-1]<min(lows[-3:-1])
-        sell=_num(item.get("post_entry_sell_volume_share"),.5)>=.65
-        vwap=_num(item.get("vwap")); below=vwap>0 and price<vwap
-        bad=sum((ll,sell,below))
-        return "WARNING" if bad>=2 else "SHAKEOUT"
-    return given if given not in {"FORMING",""} else "NORMAL_SWING"
-
-def dynamic_recovery_window(item):
-    d=_num(item.get("swing_down_duration_minutes")); c=_num(item.get("swing_cycle_duration_minutes"))
-    base=d if d>0 else (c*.35 if c>0 else 6)
-    return int(round(_clamp(base*.35,1,4)))
-
-def _plan_levels(item,market):
-    entry=_num(item.get("repeat_entry",item.get("repeat_scalp_buy_level",item.get("structural_support"))))
-    t1=_num(item.get("repeat_target1",item.get("structural_target1",item.get("structural_target"))))
-    t2=_num(item.get("repeat_target2",item.get("structural_target2")))
-    soft=_num(item.get("post_entry_soft_stop",item.get("soft_stop",item.get("stop_loss"))))
-    hard=_num(item.get("post_entry_hard_stop",item.get("hard_stop",item.get("stop_loss"))))
-    return tuple(_round_tick(x,market) if x>0 else None for x in (entry,t1,t2,soft,hard))
-
-def _plan_id(item,market,levels):
-    ticker=str(item.get("ticker") or item.get("code") or "?")
-    piv=item.get("online_confirmed_pivots",[]) or []
-    anchor=str(piv[-1][3]) if piv else "forming"
-    raw=f"{VERSION}|{market}|{ticker}|{anchor}|{levels}"
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-
-def data_freshness_plan(item,market,now_ts=None):
-    now_ts=now_ts or time.time(); age=_bar_age_seconds(item,market,now_ts)
-    q=_num(item.get("quote_age_seconds"),-1)
-    # quote_age를 공급하지 않는 기존 KIS 엔진은 현재가가 있으면 '미계측'으로 분리한다.
-    q_known=q>=0; q_ok=(q<=15) if q_known else _num(item.get("price"))>0
-    bar_ok=age is not None and age<=180
-    return dict(data_freshness_pass=bool(bar_ok and q_ok),data_bar_age_seconds=age,
-                data_quote_age_seconds=(q if q_known else None),quote_age_measured=q_known)
-
-def evaluate_strategy(item,market,now_ts=None,cycle_state=None,calibrated_probability=None,calibration_samples=0):
-    if not isinstance(item,dict):return item
-    now_ts=now_ts or time.time()
-    out=online_swing_plan(dict(item),market)
-    out.update(persistence_plan(out,market,now_ts)); out.update(data_freshness_plan(out,market,now_ts))
-    st=_strategy_type(out); risk=_risk_state(out); out["post_entry_risk_state"]=risk
-    out["strategy_type_v51"]=st; out["strategy_type"]=st; out["recovery_window_minutes"]=dynamic_recovery_window(out)
-    state=dict(cycle_state or {})
-    cooldown=now_ts<_num(state.get("cooldown_until")); hardkill=bool(state.get("hard_kill"))
-    out.update(cycle_cooldown_active=cooldown,cycle_cooldown_until=_num(state.get("cooldown_until")),
-               cycle_hard_kill=hardkill,cycle_breakdown_count=int(_num(state.get("breakdown_count"))),
-               cycle_hard_exit_count=int(_num(state.get("hard_exit_count"))))
-    cnt=int(_num(out.get("confirmed_swing_count"))); width=_num(out.get("swing_up_width_percent")); net=_num(out.get("net_swing_width_percent"))
-    # 기존 UI의 BUY_ZONE + 현재 위치를 함께 인정
-    rep_entry=_num(out.get("repeat_entry",out.get("repeat_scalp_buy_level",out.get("structural_support"))))
-    price=_num(out.get("price")); repwidth=max(width,.5)
-    near_entry=rep_entry>0 and price>0 and abs(price/rep_entry-1)*100<=min(.35,repwidth*.30)
-    buy_zone=str(out.get("repeat_state",out.get("repeat_scalp_state",""))) in {"BUY_ZONE","BUY_PULLBACK"} or near_entry
-    rr=_num(out.get("execution_effective_rr",out.get("risk_reward"))); safety=bool(out.get("execution_safety_passed"))
-    spread_known=bool(out.get("liquidity_tier3_known"))
-    observed=int(_num(out.get("observed_minutes"))); minconf=999 if observed<30 else 42 if observed<90 else 50 if observed<180 else 55
-    probgate=(calibrated_probability>=60) if calibrated_probability is not None and calibration_samples>=30 else True
-    checks={
-      "세션 거래가능":bool(out.get("tradable")),"남은시간 충분":bool(out.get("persistence_new_entry_time_ok")),
-      "데이터 최신":bool(out.get("data_freshness_pass")),"Tier1 유동성":bool(out.get("liquidity_tier1_pass")),
-      "Tier2 순간유동성":bool(out.get("liquidity_tier2_pass")),"스프레드 확인":spread_known,
-      "Tier3 스프레드":bool(out.get("liquidity_tier3_pass")),"확정 Swing 3회+":cnt>=3,
-      "대표폭 0.5~5%":SWING_MIN<=width<=SWING_MAX,"비용후 Swing 양수":net>0,
-      "Persistence 70+":_num(out.get("persistence_score"))>=70,"Evidence 신뢰":_num(out.get("evidence_confidence"))>=minconf,
-      "Trend/Range 확정":st in {"TREND_SWING","RANGE_SWING"},"현재 매수구간":buy_zone,
-      "실행 안전":safety,"RR 1.1+":rr>=1.10,"진짜 붕괴 아님":risk not in {"REAL_BREAKDOWN","HARD_EXIT","WARNING"},
-      "Cooldown 아님":not cooldown,"Hard Kill 아님":not hardkill,"확률게이트":probgate,
+def data_freshness_plan(item: dict, market: str, now_ts: float | None = None) -> dict:
+    now_ts = now_ts or time.time()
+    age = _bar_age_seconds(item, market, now_ts)
+    quote_age = _num(item.get("quote_age_seconds"), 0)
+    bar_ok = age is not None and age <= 180
+    quote_ok = quote_age <= 15 if quote_age > 0 else True
+    return {
+        "data_freshness_pass": bool(bar_ok and quote_ok),
+        "data_bar_age_seconds": age,
+        "data_quote_age_seconds": quote_age if quote_age > 0 else None,
     }
-    final=all(checks.values())
-    raw=.50*_num(out.get("persistence_score"))+.15*_num(out.get("liquidity_score"))+.15*(100-_num(out.get("pattern_fatigue")))+.10*(100 if safety else 0)+.10*_clamp(_num(out.get("target1_before_stop_probability")),0,100)
-    if risk=="WARNING":raw-=15
-    if risk in {"REAL_BREAKDOWN","HARD_EXIT"}:raw=min(raw,20)
-    levels=_plan_levels(out,market); pid=_plan_id(out,market,levels)
-    out.update(strategy_engine_version=VERSION,strategy_version=VERSION,schema_version=SCHEMA_VERSION,plan_version=PLAN_VERSION,
-               proposed_plan_id=pid,proposed_entry=levels[0],proposed_target1=levels[1],proposed_target2=levels[2],
-               proposed_soft_stop=levels[3],proposed_hard_stop=levels[4],
-               final_buy=final,final_buy_checks=checks,final_buy_reasons=[k for k,v in checks.items() if not v],
-               model_raw_score=round(_clamp(raw,0,100),2),calibrated_probability=calibrated_probability,
-               calibration_samples=int(calibration_samples),calibration_state=("보정완료" if calibrated_probability is not None and calibration_samples>=30 else "보정전"),
-               probability_gate_pass=probgate)
+
+
+def evaluate_strategy(
+    item: dict,
+    market: str,
+    now_ts: float | None = None,
+    cycle_state: dict | None = None,
+    calibrated_probability: float | None = None,
+    calibration_samples: int = 0,
+) -> dict:
+    """v5.1 단일 FINAL_BUY 판정."""
+    if not isinstance(item, dict):
+        return item
+    out = dict(item)
+    now_ts = now_ts or time.time()
+    persistence = persistence_plan(out, market, now_ts)
+    fresh = data_freshness_plan(out, market, now_ts)
+    out.update(persistence)
+    out.update(fresh)
+
+    strategy_type = _strategy_type(out)
+    out["strategy_type_v51"] = strategy_type
+    out["recovery_window_minutes"] = dynamic_recovery_window(out)
+
+    state = cycle_state or {}
+    cooldown_until = _num(state.get("cooldown_until"), 0)
+    hard_kill = bool(state.get("hard_kill", False))
+    cooldown = now_ts < cooldown_until
+    out.update(
+        cycle_cooldown_active=cooldown,
+        cycle_cooldown_until=cooldown_until,
+        cycle_hard_kill=hard_kill,
+        cycle_breakdown_count=int(_num(state.get("breakdown_count"))),
+        cycle_hard_exit_count=int(_num(state.get("hard_exit_count"))),
+    )
+
+    risk_state = str(out.get("post_entry_risk_state", "FORMING"))
+    swing_valid = bool(out.get("swing_cycle_valid"))
+    swing_count = int(_num(out.get("repeat_oscillation_count")))
+    width = _num(out.get("swing_up_width_percent", out.get("repeat_width_percent")))
+    buy_zone = str(out.get("repeat_state", out.get("repeat_scalp_state", ""))) in {
+        "BUY_ZONE", "BUY_PULLBACK"
+    }
+    safety = bool(out.get("execution_safety_passed"))
+    rr = _num(out.get("execution_effective_rr", out.get("risk_reward")))
+    t1_score = _num(out.get("target1_before_stop_probability"), 0)
+
+    # 초기 30분 미만은 관찰만. 90분 미만은 강한 조건에서만 허용할 수 있게 confidence gate를 둔다.
+    observed = int(_num(out.get("observed_minutes")))
+    if observed < 30:
+        min_conf = 999
+    elif observed < 90:
+        min_conf = 42
+    elif observed < 180:
+        min_conf = 50
+    else:
+        min_conf = 55
+
+    probability_gate = (
+        calibrated_probability >= 60 if calibrated_probability is not None
+        else t1_score >= 60
+    )
+    reasons = []
+    checks = {
+        "세션 거래가능": bool(out.get("tradable")),
+        "남은시간 충분": bool(out.get("persistence_new_entry_time_ok")),
+        "데이터 최신": bool(out.get("data_freshness_pass")),
+        "Tier1 유동성": bool(out.get("liquidity_tier1_pass")),
+        "Tier2 순간유동성": bool(out.get("liquidity_tier2_pass")),
+        "Tier3 스프레드": bool(out.get("liquidity_tier3_pass")),
+        "Swing 3회+": swing_valid and swing_count >= MIN_SWINGS,
+        "대표폭 0.5~5%": SWING_MIN <= width <= SWING_MAX,
+        "Persistence 70+": _num(out.get("persistence_score")) >= 70,
+        "Persistence 신뢰": _num(out.get("persistence_confidence")) >= min_conf,
+        "Trend/Range 분류": strategy_type in {"TREND_SWING", "RANGE_SWING"},
+        "현재 매수구간": buy_zone,
+        "실행 안전": safety,
+        "RR 1.1+": rr >= 1.10,
+        "진짜 붕괴 아님": risk_state not in {"REAL_BREAKDOWN", "HARD_EXIT"},
+        "Cooldown 아님": not cooldown,
+        "Hard Kill 아님": not hard_kill,
+        "확률게이트": probability_gate,
+    }
+    for k, ok in checks.items():
+        if not ok:
+            reasons.append(k)
+
+    final_buy = all(checks.values())
+
+    # raw_score는 calibration 전용. UI에서는 '%'가 아니라 모델점수로 표시.
+    raw = (
+        0.50 * _num(out.get("persistence_score"))
+        + 0.20 * _clamp(t1_score, 0, 100)
+        + 0.10 * _num(out.get("liquidity_score"))
+        + 0.10 * (100 - _num(out.get("pattern_fatigue")))
+        + 0.10 * (100 if safety else 0)
+    )
+    if risk_state == "WARNING":
+        raw -= 12
+    elif risk_state in {"REAL_BREAKDOWN", "HARD_EXIT"}:
+        raw = min(raw, 20)
+    raw = _clamp(raw, 0, 100)
+
+    out.update(
+        strategy_engine_version=VERSION,
+        final_buy=bool(final_buy),
+        final_buy_checks=checks,
+        final_buy_reasons=reasons,
+        model_raw_score=round(raw, 2),
+        calibrated_probability=calibrated_probability,
+        calibration_samples=int(calibration_samples),
+        calibration_state=("보정완료" if calibrated_probability is not None and calibration_samples >= 30 else "보정전"),
+        probability_gate_pass=bool(probability_gate),
+    )
     return out
 
-def update_cycle_state(item,state=None,now_ts=None):
-    now_ts=now_ts or time.time(); s=dict(state or {})
-    for k,v in {"cooldown_until":0.0,"breakdown_count":0,"hard_exit_count":0,"hard_kill":False,"last_risk_event":"",
-                "position_state":"PRE_ENTRY","active_plan":None}.items(): s.setdefault(k,v)
-    out=evaluate_strategy(item,"KR" if str(item.get("exchange","")).upper()=="KR" else "US",now_ts,s,
-                          item.get("calibrated_probability"),int(_num(item.get("calibration_samples"))))
-    risk=str(out.get("post_entry_risk_state")); times=out.get("chart_time_1m",[]) or []; bar=str(times[-1]) if times else str(int(now_ts//60))
-    eid=f"{risk}:{bar}"
-    if risk in {"REAL_BREAKDOWN","HARD_EXIT"} and eid!=s.get("last_risk_event"):
-        if risk=="REAL_BREAKDOWN":s["breakdown_count"]+=1; s["cooldown_until"]=max(_num(s["cooldown_until"]),now_ts+600)
-        else:s["hard_exit_count"]+=1; s["cooldown_until"]=max(_num(s["cooldown_until"]),now_ts+900)
-        s["last_risk_event"]=eid
-    if s["breakdown_count"]>=2 or s["hard_exit_count"]>=2:s["hard_kill"]=True
-    # FINAL BUY가 뜬 순간 계획을 잠근다. 가격이 진입가를 터치하면 IN_POSITION.
-    if out.get("final_buy") and not s.get("active_plan"):
-        s["active_plan"]={k:out.get(k) for k in ("proposed_plan_id","proposed_entry","proposed_target1","proposed_target2","proposed_soft_stop","proposed_hard_stop")}
-        s["position_state"]="PRE_ENTRY"
-    p=s.get("active_plan") or {}; entry=_num(p.get("proposed_entry")); price=_num(out.get("price"))
-    if s["position_state"]=="PRE_ENTRY" and entry>0 and price>0 and price<=entry:s["position_state"]="IN_POSITION"
-    if s["position_state"]=="IN_POSITION" and risk in {"REAL_BREAKDOWN","HARD_EXIT"}:s["position_state"]="EXITED"
-    if p:
-        out.update(plan_id=p.get("proposed_plan_id"),plan_entry=p.get("proposed_entry"),plan_target1=p.get("proposed_target1"),
-                   plan_target2=p.get("proposed_target2"),plan_soft_stop=p.get("proposed_soft_stop"),plan_hard_stop=p.get("proposed_hard_stop"))
-    out["position_state"]=s["position_state"]
-    out=evaluate_strategy(out,"KR" if str(out.get("exchange","")).upper()=="KR" else "US",now_ts,s,
-                          out.get("calibrated_probability"),int(_num(out.get("calibration_samples"))))
-    return s,out
 
-def calibrated_from_db(db_path,raw_score,strategy_type,min_samples=30,bucket_width=10,asof_ts=None):
-    """Walk-forward: asof_ts가 주어지면 그 시각 이전 완료표본만 사용."""
-    path=Path(db_path)
-    if not path.exists():return None,0
-    lo=int(raw_score//bucket_width)*bucket_width; hi=lo+bucket_width; vals=[]
+def update_cycle_state(item: dict, state: dict | None, now_ts: float | None = None) -> tuple[dict, dict]:
+    """종목별 세션 상태. 실제 체결횟수는 추정하지 않고 붕괴/쿨다운/하드킬만 자동 관리한다."""
+    now_ts = now_ts or time.time()
+    s = dict(state or {})
+    s.setdefault("cooldown_until", 0.0)
+    s.setdefault("breakdown_count", 0)
+    s.setdefault("hard_exit_count", 0)
+    s.setdefault("hard_kill", False)
+    s.setdefault("last_risk_event", "")
+
+    risk = str(item.get("post_entry_risk_state", "FORMING"))
+    times = item.get("chart_time_1m", []) or []
+    bar_id = str(times[-1]) if times else str(int(now_ts // 60))
+    event_id = f"{risk}:{bar_id}"
+
+    if risk in {"REAL_BREAKDOWN", "HARD_EXIT"} and event_id != s.get("last_risk_event"):
+        if risk == "REAL_BREAKDOWN":
+            s["breakdown_count"] += 1
+            s["cooldown_until"] = max(_num(s.get("cooldown_until")), now_ts + 10 * 60)
+        else:
+            s["hard_exit_count"] += 1
+            s["cooldown_until"] = max(_num(s.get("cooldown_until")), now_ts + 15 * 60)
+        s["last_risk_event"] = event_id
+
+    if s["breakdown_count"] >= 2 or s["hard_exit_count"] >= 2:
+        s["hard_kill"] = True
+
+    out = evaluate_strategy(item, "KR" if str(item.get("exchange","")).upper()=="KR" else "US", now_ts, s,
+                            item.get("calibrated_probability"), int(_num(item.get("calibration_samples"))))
+    return s, out
+
+
+def calibrated_from_db(
+    db_path: str | Path,
+    raw_score: float,
+    strategy_type: str,
+    min_samples: int = 30,
+    bucket_width: int = 10,
+) -> tuple[float | None, int]:
+    """signals.detail_json의 model_raw_score를 사용한 단순 구간 보정.
+    표본 30건 미만이면 None을 반환한다.
+    """
+    path = Path(db_path)
+    if not path.exists():
+        return None, 0
+    bucket_lo = int(raw_score // bucket_width) * bucket_width
+    bucket_hi = bucket_lo + bucket_width
+    successes = []
     try:
-        con=sqlite3.connect(path,timeout=3)
-        sql="SELECT issued,target1_before_stop,detail_json FROM signals WHERE result_done=1 AND target1_before_stop IS NOT NULL"
-        params=[]
-        if asof_ts is not None: sql+=" AND issued<?"; params.append(int(asof_ts))
-        sql+=" ORDER BY issued DESC LIMIT 5000"
-        rows=con.execute(sql,params).fetchall(); con.close()
-        for issued,res,detail in rows:
-            try:d=json.loads(detail or "{}")
-            except Exception:continue
-            rs=_num(d.get("model_raw_score"),-1); st=str(d.get("strategy_type_v51",d.get("strategy_type","")))
-            if lo<=rs<hi and (not strategy_type or st==strategy_type):vals.append(int(bool(res)))
-        if len(vals)<min_samples:return None,len(vals)
-        return round(sum(vals)/len(vals)*100,1),len(vals)
-    except Exception:return None,0
+        con = sqlite3.connect(path, timeout=3)
+        rows = con.execute(
+            """SELECT target1_before_stop,detail_json FROM signals
+               WHERE result_done=1 AND target1_before_stop IS NOT NULL
+               ORDER BY issued DESC LIMIT 2000"""
+        ).fetchall()
+        con.close()
+        for result, detail in rows:
+            try:
+                d = json.loads(detail or "{}")
+            except Exception:
+                continue
+            rs = _num(d.get("model_raw_score"), -1)
+            st = str(d.get("strategy_type_v51", d.get("strategy_type", "")))
+            if bucket_lo <= rs < bucket_hi and (not strategy_type or st == strategy_type):
+                successes.append(int(bool(result)))
+        if len(successes) < min_samples:
+            return None, len(successes)
+        return round(sum(successes) / len(successes) * 100, 1), len(successes)
+    except Exception:
+        return None, 0
+
+
+def evaluate_live_quote_risk(item: dict, price: float) -> dict:
+    """2~5초 quote 전용 위험판정.
+
+    무거운 Swing/Persistence를 다시 계산하지 않고, 마지막 확정 구조의
+    Soft/Hard Stop과 현재가만 비교한다. 구조 붕괴 확정은 1분봉 엔진이 담당한다.
+    """
+    out = dict(item or {})
+    try:
+        px = float(price or 0)
+    except Exception:
+        px = 0.0
+    if px <= 0:
+        out["live_risk_quote_valid"] = False
+        return out
+
+    out["price"] = px
+    soft = _num(out.get("post_entry_soft_stop", out.get("soft_stop_price")))
+    hard = _num(out.get("post_entry_hard_stop", out.get("hard_stop_price", out.get("stop_loss"))))
+    state = str(out.get("post_entry_risk_state") or "FORMING")
+
+    if hard > 0 and px <= hard:
+        out.update(
+            post_entry_risk_state="HARD_EXIT",
+            post_entry_risk_label="🚨 Hard Stop 실시간 이탈",
+            post_entry_action="즉시손절",
+        )
+    elif soft > 0 and px < soft and state not in {"REAL_BREAKDOWN", "HARD_EXIT"}:
+        out.update(
+            post_entry_risk_state="WARNING",
+            post_entry_risk_label="🟠 Soft Stop 아래 · 1분봉 회복/붕괴 확인 중",
+            post_entry_action="신규진입중지·회복확인",
+        )
+
+    out["live_risk_quote_valid"] = True
+    out["live_risk_price"] = px
+    return out
