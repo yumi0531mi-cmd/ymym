@@ -41,6 +41,13 @@ LOG_PATH = ROOT / "validation_data" / "collector.log"
 CSV_PATH = ROOT / "validation_data" / "validation_summary.csv"
 STOP = False
 
+FAST_DB_PATH = ROOT / "validation_data" / "fast_scanner.sqlite3"
+FAST_DAEMON_HEARTBEAT_SEC = 15
+FAST_POOL_REFRESH_SEC = 45
+FAST_PRECISE_PER_LOOP = 1
+FAST_FOCUS_QUOTE_SEC = 3
+FAST_FOCUS_FULL_SEC = 60
+
 
 KR_UNIVERSE = [
     ("005930", "삼성전자", "KR"), ("000660", "SK하이닉스", "KR"),
@@ -890,6 +897,267 @@ def discover_market_members(engine, market: str, limit: int = 18) -> list[tuple[
     return list(fallback)
 
 
+
+def fast_connect() -> sqlite3.Connection:
+    FAST_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(FAST_DB_PATH, timeout=10)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS fast_snapshot(
+            market TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            name TEXT,
+            exchange TEXT,
+            updated REAL NOT NULL,
+            precise_updated REAL NOT NULL DEFAULT 0,
+            quote_updated REAL NOT NULL DEFAULT 0,
+            score REAL NOT NULL DEFAULT 0,
+            final_buy INTEGER NOT NULL DEFAULT 0,
+            item_json TEXT NOT NULL,
+            PRIMARY KEY(market,ticker)
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS fast_daemon_state(
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            pid INTEGER,
+            heartbeat REAL,
+            last_error TEXT,
+            kr_pool_count INTEGER NOT NULL DEFAULT 0,
+            us_pool_count INTEGER NOT NULL DEFAULT 0,
+            kr_cursor INTEGER NOT NULL DEFAULT 0,
+            us_cursor INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS ui_focus(
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            market TEXT,
+            ticker TEXT,
+            name TEXT,
+            exchange TEXT,
+            updated REAL
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_fast_snapshot_rank ON fast_snapshot(market,final_buy,score,updated)")
+    db.commit()
+    return db
+
+
+def _fast_json(item: dict) -> str:
+    # UI는 최근 차트 일부만 필요하다. 무거운 raw payload/DataFrame은 저장하지 않는다.
+    clean = {}
+    keep_bars = 120
+    for key, value in (item or {}).items():
+        if key.startswith("raw_") or key in {"raw_response","raw_payload","intraday_frame","minute_frame","history_frame","orderbook_raw"}:
+            continue
+        if isinstance(value, pd.DataFrame):
+            continue
+        if isinstance(value, (list, tuple)) and key.startswith("chart_"):
+            clean[key] = list(value[-keep_bars:])
+        else:
+            clean[key] = value
+    try:
+        return json.dumps(clean, ensure_ascii=False, default=str)
+    except Exception:
+        return "{}"
+
+
+def save_fast_snapshot(db: sqlite3.Connection, market: str, member, item: dict, precise: bool = True) -> None:
+    ticker, name, exchange = member
+    now_ts = time.time()
+    score = f(item.get("model_raw_score", item.get("score")))
+    final_buy = int(bool(item.get("final_buy")))
+    existing = db.execute(
+        "SELECT precise_updated,quote_updated FROM fast_snapshot WHERE market=? AND ticker=?",
+        (market, ticker)
+    ).fetchone()
+    precise_updated = now_ts if precise else (f(existing[0]) if existing else 0)
+    quote_updated = now_ts
+    db.execute("""
+        INSERT INTO fast_snapshot(
+            market,ticker,name,exchange,updated,precise_updated,quote_updated,score,final_buy,item_json
+        ) VALUES(?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(market,ticker) DO UPDATE SET
+            name=excluded.name,exchange=excluded.exchange,updated=excluded.updated,
+            precise_updated=excluded.precise_updated,quote_updated=excluded.quote_updated,
+            score=excluded.score,final_buy=excluded.final_buy,item_json=excluded.item_json
+    """, (
+        market, ticker, str(item.get("name") or name), exchange, now_ts,
+        precise_updated, quote_updated, score, final_buy, _fast_json(item)
+    ))
+
+
+def refresh_fast_quote(engine, db: sqlite3.Connection, market: str, member) -> None:
+    ticker, name, exchange = member
+    row = db.execute(
+        "SELECT item_json,precise_updated FROM fast_snapshot WHERE market=? AND ticker=?",
+        (market, ticker)
+    ).fetchone()
+    if not row:
+        return
+    try:
+        item = json.loads(row[0] or "{}")
+    except Exception:
+        item = {}
+    price = refresh_quote_only(engine, market, member)
+    if price <= 0:
+        return
+    item["price"] = price
+    item["quote_age_seconds"] = 0.0
+
+    # 무거운 구조를 재계산하지 않고 이미 고정된 Hard/Soft 기준만 즉시 비교한다.
+    hard = f(item.get("plan_hard_stop", item.get("proposed_hard_stop", item.get("post_entry_hard_stop", item.get("stop_loss")))))
+    soft = f(item.get("plan_soft_stop", item.get("proposed_soft_stop", item.get("post_entry_soft_stop"))))
+    state = str(item.get("post_entry_risk_state") or "NORMAL_SWING")
+    if hard > 0 and price <= hard:
+        item["post_entry_risk_state"] = "HARD_EXIT"
+        item["post_entry_risk_label"] = "🚨 Hard Stop 실시간 이탈"
+    elif soft > 0 and price < soft and state not in {"REAL_BREAKDOWN","HARD_EXIT"}:
+        item["post_entry_risk_state"] = "WARNING"
+        item["post_entry_risk_label"] = "🟠 Soft Stop 아래 · 구조확인 중"
+
+    now_ts = time.time()
+    db.execute("""
+        UPDATE fast_snapshot SET updated=?,quote_updated=?,item_json=?
+        WHERE market=? AND ticker=?
+    """, (now_ts, now_ts, _fast_json(item), market, ticker))
+
+
+def _focus_member(db: sqlite3.Connection):
+    row = db.execute("SELECT market,ticker,name,exchange,updated FROM ui_focus WHERE singleton=1").fetchone()
+    if not row:
+        return None
+    market, ticker, name, exchange, updated = row
+    if not ticker or time.time() - f(updated) > 600:
+        return None
+    return str(market), (str(ticker), str(name or ticker), str(exchange or ("KR" if market=="KR" else "NASDAQ")))
+
+
+def claim_fast_daemon(db: sqlite3.Connection) -> bool:
+    now_ts = time.time()
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute("SELECT pid,heartbeat FROM fast_daemon_state WHERE singleton=1").fetchone()
+    if row and now_ts - f(row[1]) < FAST_DAEMON_HEARTBEAT_SEC and int(f(row[0])) != os.getpid():
+        db.rollback()
+        return False
+    db.execute("""
+        INSERT INTO fast_daemon_state(singleton,pid,heartbeat,last_error)
+        VALUES(1,?,?,?)
+        ON CONFLICT(singleton) DO UPDATE SET pid=excluded.pid,heartbeat=excluded.heartbeat,last_error=''
+    """, (os.getpid(), now_ts, ""))
+    db.commit()
+    return True
+
+
+def fast_heartbeat(db: sqlite3.Connection, **fields) -> None:
+    now_ts = time.time()
+    db.execute("INSERT OR IGNORE INTO fast_daemon_state(singleton,pid,heartbeat,last_error) VALUES(1,?,?,?)",
+               (os.getpid(), now_ts, ""))
+    sets = ["pid=?","heartbeat=?"]
+    vals = [os.getpid(), now_ts]
+    for k, val in fields.items():
+        if k in {"last_error","kr_pool_count","us_pool_count","kr_cursor","us_cursor"}:
+            sets.append(f"{k}=?")
+            vals.append(val)
+    vals.append(1)
+    db.execute(f"UPDATE fast_daemon_state SET {','.join(sets)} WHERE singleton=?", vals)
+
+
+def fast_daemon(markets: str = "BOTH") -> int:
+    """UI와 완전히 분리된 초고속 백그라운드 스캐너.
+
+    UI는 이 프로세스의 SQLite snapshot만 읽는다.
+    """
+    setup_logging()
+    try:
+        engine, policy, finalize = load_engine()
+    except Exception as exc:
+        with fast_connect() as db:
+            fast_heartbeat(db, last_error=f"KIS 엔진 시작 실패: {type(exc).__name__}: {exc}")
+            db.commit()
+        return 2
+
+    selected = ["KR","US"] if markets == "BOTH" else [markets]
+    pools = {"KR": [], "US": []}
+    pool_at = {"KR": 0.0, "US": 0.0}
+    cursor = {"KR": 0, "US": 0}
+    focus_full_at = {}
+    focus_quote_at = {}
+
+    with fast_connect() as db:
+        if not claim_fast_daemon(db):
+            return 0
+        while True:
+            loop_started = time.time()
+            try:
+                focus = _focus_member(db)
+
+                for market in selected:
+                    now = datetime.now(KST)
+                    # 후보 pool은 UI와 무관하게 저빈도로만 갱신
+                    if not pools[market] or time.time() - pool_at[market] >= FAST_POOL_REFRESH_SEC:
+                        pools[market] = discover_market_members(engine, market, 10000)
+                        pool_at[market] = time.time()
+                        cursor[market] %= max(1, len(pools[market]))
+
+                    # 집중종목은 현재가만 3초 주기. 전체 구조는 최대 60초/새 분석 주기.
+                    if focus and focus[0] == market:
+                        fm = focus[1]
+                        fk = f"{market}:{fm[0]}"
+                        if time.time() - focus_quote_at.get(fk, 0) >= FAST_FOCUS_QUOTE_SEC:
+                            refresh_fast_quote(engine, db, market, fm)
+                            focus_quote_at[fk] = time.time()
+                            db.commit()
+                        if time.time() - focus_full_at.get(fk, 0) >= FAST_FOCUS_FULL_SEC:
+                            cs = load_cycle_state_v51(db, market, fm[0], int(time.time()))
+                            item = analyze_one(engine, policy, finalize, market, fm, cs)
+                            if item:
+                                new_cs = item.pop("_cycle_state_v51", cs)
+                                save_cycle_state_v51(db, market, fm[0], new_cs)
+                                save_fast_snapshot(db, market, fm, item, precise=True)
+                                focus_full_at[fk] = time.time()
+                                db.commit()
+
+                    # 일반 후보는 매 loop 딱 1종목만 정밀분석
+                    pool = pools[market]
+                    if pool:
+                        member = pool[cursor[market] % len(pool)]
+                        cursor[market] = (cursor[market] + 1) % len(pool)
+                        # focus와 같은 종목이면 중복 정밀분석 생략
+                        if not (focus and focus[0] == market and focus[1][0] == member[0]):
+                            cs = load_cycle_state_v51(db, market, member[0], int(time.time()))
+                            item = analyze_one(engine, policy, finalize, market, member, cs)
+                            if item:
+                                new_cs = item.pop("_cycle_state_v51", cs)
+                                save_cycle_state_v51(db, market, member[0], new_cs)
+                                save_fast_snapshot(db, market, member, item, precise=True)
+                                db.commit()
+
+                    fast_heartbeat(
+                        db,
+                        kr_pool_count=len(pools["KR"]),
+                        us_pool_count=len(pools["US"]),
+                        kr_cursor=cursor["KR"],
+                        us_cursor=cursor["US"],
+                    )
+                    db.commit()
+
+                # UI가 빠르게 읽을 수 있도록 loop 자체는 짧게 유지
+                elapsed = time.time() - loop_started
+                time.sleep(max(0.5, 1.5 - elapsed))
+
+            except KeyboardInterrupt:
+                return 0
+            except Exception as exc:
+                logging.exception("fast daemon loop 오류")
+                fast_heartbeat(db, last_error=f"{type(exc).__name__}: {exc}")
+                db.commit()
+                time.sleep(2)
+
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--markets", default="KR", choices=("KR", "US", "BOTH"))
@@ -899,7 +1167,11 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=6, help="한 루프에서 정밀분석할 동적 후보 수")
     parser.add_argument("--run-until", default="AUTO")
     parser.add_argument("--once", action="store_true")
+    parser.add_argument("--fast-daemon", action="store_true", help="Streamlit용 초고속 snapshot 백그라운드 스캐너")
     args = parser.parse_args()
+
+    if args.fast_daemon:
+        return fast_daemon(args.markets)
 
     setup_logging()
     signal.signal(signal.SIGINT, stop_handler)
