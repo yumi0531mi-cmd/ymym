@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """KIS 초단타 신호 무인 수집·사후검증기.
 
-app_scalp_fixed.py의 0.5~1.5% 반복폭, 실제 1차/2차 목표, 추가상승 판정을
-signals.detail_json에 보존한다. +1/+2/+3%는 검증 통계 전용이며 매매 목표가와 무관하다.
+app.py 번들 반복단타 엔진의 실제 confirmed Swing 0.5~5%, TREND/RANGE,
+Persistence, Evidence Confidence, Pattern Fatigue, 실제 1차/2차 목표,
+SHAKEOUT/REAL_BREAKDOWN/HARD_EXIT를 저장하고 사후검증한다.
++1/+2/+3% 고정 목표는 매매 목표로 사용하지 않는다.
 """
 from __future__ import annotations
 
@@ -120,7 +122,13 @@ def connect() -> sqlite3.Connection:
             max_up30 REAL, max_down30 REAL, result_done INTEGER NOT NULL DEFAULT 0,
             stop_price REAL, data_valid INTEGER NOT NULL DEFAULT 0,
             hit1_before_stop INTEGER, hit2_before_stop INTEGER, hit3_before_stop INTEGER,
-            stop_first INTEGER, detail_json TEXT, UNIQUE(market,ticker,issued)
+            stop_first INTEGER,
+            target1_price REAL, target2_price REAL, soft_stop REAL, hard_stop REAL,
+            target1_hit INTEGER, target2_hit INTEGER, hard_stop_first INTEGER,
+            max_up300 REAL, max_down300 REAL,
+            persistence60 REAL, persistence180 REAL, persistence300 REAL,
+            result_5h_done INTEGER NOT NULL DEFAULT 0,
+            detail_json TEXT, UNIQUE(market,ticker,issued)
         )
     """)
     db.execute("""
@@ -142,6 +150,12 @@ def connect() -> sqlite3.Connection:
         "stop_price": "REAL", "data_valid": "INTEGER NOT NULL DEFAULT 0",
         "hit1_before_stop": "INTEGER", "hit2_before_stop": "INTEGER",
         "hit3_before_stop": "INTEGER", "stop_first": "INTEGER",
+        "target1_price": "REAL", "target2_price": "REAL",
+        "soft_stop": "REAL", "hard_stop": "REAL",
+        "target1_hit": "INTEGER", "target2_hit": "INTEGER", "hard_stop_first": "INTEGER",
+        "max_up300": "REAL", "max_down300": "REAL",
+        "persistence60": "REAL", "persistence180": "REAL", "persistence300": "REAL",
+        "result_5h_done": "INTEGER NOT NULL DEFAULT 0",
     }
     for column, definition in migrations.items():
         if column not in existing:
@@ -187,7 +201,7 @@ def row_for(ticker: str, name: str, exchange: str) -> dict:
 
 def analyze_one(engine, policy, finalize, market: str, member: tuple[str, str, str]) -> dict | None:
     ticker, name, exchange = member
-    mode = "국내 30분 1% 타점" if market == "KR" else "미국 30분 1% 타점"
+    mode = "국내 반복단타" if market == "KR" else "미국 반복단타"
     try:
         result = engine.analyze(row_for(ticker, name, exchange), mode)
         result = policy(finalize(result), mode)
@@ -200,45 +214,24 @@ def analyze_one(engine, policy, finalize, market: str, member: tuple[str, str, s
 
 
 DETAIL_KEYS = (
-    "chart_verdict", "entry_checks_passed",
-    "risk_reward", "risk_reward_target1", "risk_reward_target2",
+    "chart_verdict", "entry_checks_passed", "FINAL_BUY", "score",
+    "repeat_strategy_valid", "repeat_strategy_state", "repeat_strategy_reason",
+    "swing_type", "confirmed_swing_count", "confirmed_swing_widths", "confirmed_swing_signature",
+    "repeat_swing_width_percent", "repeat_swing_min_percent", "repeat_swing_max_percent",
+    "persistence_score", "persistence_5h_status", "structure_observed_minutes",
+    "evidence_confidence", "pattern_fatigue",
     "rvol", "vwap", "ema9", "ema20", "rsi", "five_min_risk_score",
     "change_percent", "screen_change", "change", "data_completeness",
-    "pullback_entry", "breakout_entry", "stop_loss",
-    "structural_entry", "structural_support", "structural_target",
-    "structural_target1", "structural_target2",
+    "structural_entry", "structural_support", "structural_hard_stop",
+    "soft_stop", "hard_stop", "structural_target1", "structural_target2",
     "target1_upside_percent", "target2_upside_percent",
+    "target1_timeframe", "target2_timeframe", "target1_basis", "target2_basis",
     "structure_support_5m", "structure_support_15m", "structure_support_60m",
     "structure_resistance_5m", "structure_resistance_15m", "structure_resistance_60m",
-    "macro_support", "macro_support_timeframe",
-    "macro_resistance", "macro_resistance_timeframe",
-    "structural_hard_stop", "net_swing_percent", "FINAL_BUY",
-    "structure_support_5m_time", "target1_confirmed_time", "target2_confirmed_time",
-    "confirmed_swing_signature", "fresh_swing_for_reentry",
-    "target1_timeframe", "target2_timeframe",
-    "confirmed_swing_5m_count", "confirmed_swing_15m_count", "confirmed_swing_60m_count",
-    "target_basis", "target1_basis", "target2_basis", "stop_basis",
-    "level_plan_valid", "level_plan_reason",
-    "chart_resistance_levels", "chart_box_high", "chart_box_low", "chart_box_width",
-    "breakout_active",
-    "continuous_rise", "continuous_rise_score", "continuous_rise_checks",
-    "trend_return_5m", "trend_return_15m", "trend_return_30m",
-    "up_down_volume_ratio",
-    "mtf_alignment", "mtf_exit", "mtf_higher_trend", "mtf_short_pullback",
-    "mtf_checks", "mtf_status", "mtf_detail",
-    "repeat_scalp_state", "repeat_scalp_label", "repeat_scalp_reason",
-    "repeat_scalp_buy_level", "repeat_scalp_sell_level", "repeat_scalp_invalidation",
-    "repeat_scalp_median_bar_range", "repeat_scalp_range_percent", "repeat_scalp_preferred_range",
-    "repeat_box_valid", "repeat_box_low", "repeat_box_high", "repeat_box_range_percent",
-    "repeat_rsi_recovery",
-    "repeat_scalp_can_extend", "repeat_scalp_extension_label",
-    "repeat_scalp_extension_reason", "repeat_scalp_extension_percent",
-    "upside_continuation_state", "upside_continuation_label",
-    "upside_continuation_score", "upside_continuation_checks",
-    "additional_upside_after_target1", "target2_total_upside",
-    "repeat_scalp_reversal_score", "repeat_scalp_reversal_checks",
-    "trailing_stop_enabled", "trailing_stop_percent", "trailing_stop_price",
-    "data_gate_passed", "verified_spread_percent",
+    "net_swing_percent", "net_swing_basis",
+    "breakdown_state", "SHAKEOUT", "REAL_BREAKDOWN", "HARD_EXIT",
+    "rsi_pullback_reference", "ma20_reference_status",
+    "verified_spread_percent", "spread_pct", "data_gate_passed",
 )
 
 
@@ -276,15 +269,18 @@ def store_result(db: sqlite3.Connection, market: str, item: dict, now_ts: int, b
     db.execute("""
         INSERT INTO signals(
             market,ticker,name,issued,base_price,verdict,score,entry_ok,
-            forecast5,forecast10,forecast20,forecast30,stop_price,data_valid,detail_json
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            forecast5,forecast10,forecast20,forecast30,stop_price,data_valid,
+            target1_price,target2_price,soft_stop,hard_stop,detail_json
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         market, ticker, str(item.get("name") or ticker), now_ts, price,
         str(item.get("chart_verdict") or "WAIT"), f(item.get("score")),
-        int(bool(item.get("entry_checks_passed"))),
+        int(bool(item.get("FINAL_BUY"))),
         f(item.get("forecast_5m")), f(item.get("forecast_10m")),
         f(item.get("forecast_20m")), f(item.get("forecast_30m")),
-        f(item.get("stop_loss")), data_valid,
+        f(item.get("soft_stop", item.get("stop_loss"))), data_valid,
+        f(item.get("structural_target1")), f(item.get("structural_target2")),
+        f(item.get("soft_stop")), f(item.get("hard_stop")),
         json.dumps(detail, ensure_ascii=False, default=str),
     ))
 
@@ -307,76 +303,127 @@ def nearest_quote(db: sqlite3.Connection, market: str, ticker: str, target: int,
     """, (market, ticker, target - tolerance, target + tolerance, target)).fetchone()
 
 
+def nearest_persistence_snapshot(
+    db: sqlite3.Connection, market: str, ticker: str, target: int, tolerance: int = 600
+) -> float | None:
+    rows = db.execute("""
+        SELECT issued,detail_json FROM signals
+        WHERE market=? AND ticker=? AND issued BETWEEN ? AND ?
+        ORDER BY ABS(issued-?) LIMIT 5
+    """, (market,ticker,target-tolerance,target+tolerance,target)).fetchall()
+    for _, detail_json in rows:
+        try:
+            detail=json.loads(detail_json or "{}")
+            value=detail.get("persistence_score")
+            if value is not None:
+                return f(value)
+        except Exception:
+            continue
+    return None
+
+
+def _first_index(path: list[tuple[int, float]], predicate) -> int | None:
+    return next((i for i, (_, price) in enumerate(path) if predicate(f(price))), None)
+
+
 def grade_pending(db: sqlite3.Connection, now_ts: int) -> None:
     rows = db.execute("""
-        SELECT id,market,ticker,issued,base_price,actual5,actual10,actual20,actual30,stop_price
-        FROM signals WHERE result_done=0 AND issued>=?
-    """, (now_ts - 3 * 86400,)).fetchall()
+        SELECT id,market,ticker,issued,base_price,actual5,actual10,actual20,actual30,
+               target1_price,target2_price,soft_stop,hard_stop,result_done,result_5h_done,
+               persistence60,persistence180,persistence300,detail_json
+        FROM signals
+        WHERE (result_done=0 OR result_5h_done=0) AND issued>=?
+    """, (now_ts - 7 * 86400,)).fetchall()
 
-    for signal_id, market, ticker, issued, base, a5, a10, a20, a30, stop_price in rows:
+    for row in rows:
+        (signal_id, market, ticker, issued, base, a5, a10, a20, a30,
+         target1, target2, soft_stop, hard_stop, result_done, result_5h_done,
+         persistence60, persistence180, persistence300, detail_json) = row
         updates = {}
-        for minutes, existing in ((5, a5), (10, a10), (20, a20), (30, a30)):
-            if existing is None and now_ts >= issued + minutes * 60:
-                quote = nearest_quote(db, market, ticker, issued + minutes * 60)
+
+        # Persistence는 최초값 복사가 아니라 60/180/300분 시점의 재분석 신호에서 가져온다.
+        for minutes, existing in ((60,persistence60),(180,persistence180),(300,persistence300)):
+            if existing is None and now_ts >= issued + minutes*60:
+                snapshot = nearest_persistence_snapshot(db, market, ticker, issued + minutes*60)
+                if snapshot is not None:
+                    updates[f"persistence{minutes}"] = snapshot
+        for minutes, existing in ((5,a5),(10,a10),(20,a20),(30,a30)):
+            if existing is None and now_ts >= issued + minutes*60:
+                quote = nearest_quote(db, market, ticker, issued + minutes*60)
                 if quote and base > 0:
-                    updates[f"actual{minutes}"] = (f(quote[0]) / base - 1) * 100
+                    updates[f"actual{minutes}"] = (f(quote[0])/base - 1)*100
 
-        if now_ts >= issued + 30 * 60:
-            extrema = db.execute("""
-                SELECT MAX(price),MIN(price) FROM quotes
-                WHERE market=? AND ticker=? AND captured BETWEEN ? AND ?
-            """, (market, ticker, issued, issued + 30 * 60)).fetchone()
-            if extrema and extrema[0] is not None:
-                updates["max_up30"] = (f(extrema[0]) / base - 1) * 100
-                updates["max_down30"] = (f(extrema[1]) / base - 1) * 100
-
-            path = db.execute("""
+        path30 = []
+        if now_ts >= issued + 30*60 and not result_done:
+            path30 = db.execute("""
                 SELECT captured,price FROM quotes
                 WHERE market=? AND ticker=? AND captured BETWEEN ? AND ? ORDER BY captured
-            """, (market, ticker, issued, issued + 30 * 60)).fetchall()
+            """, (market,ticker,issued,issued+30*60)).fetchall()
+            if path30:
+                prices=[f(p) for _,p in path30 if f(p)>0]
+                if prices and base>0:
+                    updates["max_up30"]=(max(prices)/base-1)*100
+                    updates["max_down30"]=(min(prices)/base-1)*100
+                t1i=_first_index(path30, lambda p: f(target1)>0 and p>=f(target1))
+                t2i=_first_index(path30, lambda p: f(target2)>0 and p>=f(target2))
+                hardi=_first_index(path30, lambda p: f(hard_stop)>0 and p<=f(hard_stop))
+                updates["target1_hit"] = int(t1i is not None and (hardi is None or t1i<hardi)) if f(target1)>0 else None
+                updates["target2_hit"] = int(t2i is not None and (hardi is None or t2i<hardi)) if f(target2)>0 else None
+                updates["hard_stop_first"] = int(hardi is not None and (t1i is None or hardi<t1i)) if f(hard_stop)>0 else None
+            projected={5:updates.get("actual5",a5),10:updates.get("actual10",a10),20:updates.get("actual20",a20),30:updates.get("actual30",a30)}
+            if all(v is not None for v in projected.values()) or now_ts>=issued+45*60:
+                updates["result_done"]=1
 
-            stop = f(stop_price)
-            stop_index = next((i for i, (_, p) in enumerate(path) if stop > 0 and f(p) <= stop), None)
-            first_target_index = next((i for i, (_, p) in enumerate(path) if f(p) >= base * 1.01), None)
-            updates["stop_first"] = int(stop_index is not None and (first_target_index is None or stop_index < first_target_index))
+        # 5시간 지속성은 실제 300분 시세가 있는 표본만 완료 처리한다.
+        if now_ts >= issued + 300*60 and not result_5h_done:
+            path300 = db.execute("""
+                SELECT captured,price FROM quotes
+                WHERE market=? AND ticker=? AND captured BETWEEN ? AND ? ORDER BY captured
+            """, (market,ticker,issued,issued+300*60)).fetchall()
+            if path300:
+                prices=[f(p) for _,p in path300 if f(p)>0]
+                if prices and base>0:
+                    updates["max_up300"]=(max(prices)/base-1)*100
+                    updates["max_down300"]=(min(prices)/base-1)*100
 
-            # 검증 통계 전용. 앱의 1차/2차 목표가와 연결하지 않는다.
-            for goal in (1, 2, 3):
-                target = base * (1 + goal / 100)
-                target_index = next((i for i, (_, p) in enumerate(path) if f(p) >= target), None)
-                hit = target_index is not None and (stop_index is None or target_index < stop_index)
-                updates[f"hit{goal}_before_stop"] = int(hit)
+                # 실제 1·2차 목표/Hard Stop은 30분 한정이 아니라
+                # 최대 5시간 경로에서 최종 선도달 순서를 다시 판정한다.
+                t1i=_first_index(path300, lambda p: f(target1)>0 and p>=f(target1))
+                t2i=_first_index(path300, lambda p: f(target2)>0 and p>=f(target2))
+                hardi=_first_index(path300, lambda p: f(hard_stop)>0 and p<=f(hard_stop))
+                if f(target1)>0:
+                    updates["target1_hit"] = int(t1i is not None and (hardi is None or t1i<hardi))
+                if f(target2)>0:
+                    updates["target2_hit"] = int(t2i is not None and (hardi is None or t2i<hardi))
+                if f(hard_stop)>0:
+                    updates["hard_stop_first"] = int(hardi is not None and (t1i is None or hardi<t1i))
 
-            projected = {
-                5: updates.get("actual5", a5), 10: updates.get("actual10", a10),
-                20: updates.get("actual20", a20), 30: updates.get("actual30", a30),
-            }
-            if all(value is not None for value in projected.values()) or now_ts >= issued + 45 * 60:
-                updates["result_done"] = 1
+                if len(path300) >= 240:  # at least 80% of expected minute samples
+                    # 300분 Persistence는 위의 실제 재분석 snapshot이 있을 때만 기록된다.
+                    updates["result_5h_done"] = 1
 
         if updates:
-            assignments = ",".join(f"{key}=?" for key in updates)
-            db.execute(f"UPDATE signals SET {assignments} WHERE id=?", (*updates.values(), signal_id))
+            assignments=",".join(f"{k}=?" for k in updates)
+            db.execute(f"UPDATE signals SET {assignments} WHERE id=?", (*updates.values(),signal_id))
 
 
 def export_summary(db: sqlite3.Connection) -> None:
-    rows = db.execute("""
+    rows=db.execute("""
         SELECT market,ticker,name,datetime(issued,'unixepoch','+9 hours'),base_price,
                verdict,score,entry_ok,forecast5,actual5,forecast10,actual10,
                forecast20,actual20,forecast30,actual30,max_up30,max_down30,
-               stop_price,data_valid,hit1_before_stop,hit2_before_stop,hit3_before_stop,stop_first
+               target1_price,target1_hit,target2_price,target2_hit,soft_stop,hard_stop,hard_stop_first,
+               max_up300,max_down300,persistence300,result_5h_done
         FROM signals ORDER BY issued DESC
     """).fetchall()
-    headers = [
-        "시장","티커","종목명","신호시각(KST)","기준가","판정","점수","진입통과",
-        "예상5분","실제5분","예상10분","실제10분","예상20분","실제20분",
-        "예상30분","실제30분","30분최대상승","30분최대하락","손절가","데이터유효",
-        "+1%선도달","+2%선도달","+3%선도달","손절선도달",
+    headers=[
+        "시장","티커","종목명","신호시각(KST)","기준가","판정","점수","FINAL_BUY",
+        "예상5분","실제5분","예상10분","실제10분","예상20분","실제20분","예상30분","실제30분",
+        "30분최대상승","30분최대하락","실제1차목표","1차선도달","실제2차목표","2차선도달",
+        "SoftStop","HardStop","HardStop먼저","5시간최대상승","5시간최대하락","Persistence300","5시간검증완료",
     ]
-    with CSV_PATH.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(headers)
-        writer.writerows(rows)
+    with CSV_PATH.open("w",newline="",encoding="utf-8-sig") as handle:
+        writer=csv.writer(handle); writer.writerow(headers); writer.writerows(rows)
     export_html_report(db)
 
 
@@ -396,35 +443,32 @@ def wilson_interval(values: list[bool], z: float = 1.96) -> tuple[float, float] 
 
 
 def export_html_report(db: sqlite3.Connection) -> None:
-    report_path = DB_PATH.parent / "validation_report.html"
-    completed = db.execute("""
+    report_path=DB_PATH.parent/"validation_report.html"
+    completed=db.execute("""
         SELECT market,ticker,name,entry_ok,data_valid,forecast5,actual5,forecast10,actual10,
-               forecast20,actual20,forecast30,actual30,hit1_before_stop,hit2_before_stop,
-               hit3_before_stop,stop_first,max_up30,max_down30
+               forecast20,actual20,forecast30,actual30,target1_hit,target2_hit,hard_stop_first,
+               max_up30,max_down30,result_5h_done,max_up300,max_down300,persistence300
         FROM signals WHERE result_done=1 ORDER BY issued DESC
     """).fetchall()
-    valid = [row for row in completed if row[4] == 1]
-    entries = [row for row in valid if row[3] == 1]
-    cards = []
-    for label, expected_index, actual_index in (("5분 방향",5,6),("10분 방향",7,8),("20분 방향",9,10),("30분 방향",11,12)):
-        judged = [((f(row[expected_index]) >= 0) == (f(row[actual_index]) >= 0)) for row in valid if row[actual_index] is not None]
-        cards.append((label, ratio(judged), len(judged), wilson_interval(judged)))
-
-    recent_rows = "".join(
-        "<tr>" + "".join(f"<td>{html.escape(str(value if value is not None else '-'))}</td>" for value in (
-            row[0], row[1], row[2], "통과" if row[3] else "관찰", "유효" if row[4] else "제외",
-            row[13], row[14], row[15], row[16], round(f(row[17]),3), round(f(row[18]),3),
-        )) + "</tr>" for row in completed[:100]
-    )
-    card_html = "".join(
-        f'<div class="card"><small>{html.escape(label)}</small><b>{value}</b><span>표본 {samples}건</span></div>'
-        for label, value, samples, _ in cards
-    )
-    document = f"""<!doctype html><html lang='ko'><meta charset='utf-8'><title>초단타 자동검증 결과</title>
-    <style>body{{font-family:Arial,sans-serif;max-width:1200px;margin:30px auto;padding:0 16px}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}}.card{{background:#f4f6fa;border-radius:12px;padding:16px}}.card b,.card span{{display:block}}table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:1px solid #ddd;padding:8px}}</style>
-    <h1>초단타 자동검증 결과</h1><p>완료 {len(completed)}건 · 유효 {len(valid)}건 · 진입통과 {len(entries)}건</p><div class='cards'>{card_html}</div>
-    <h2>최근 완료 신호</h2><table><tbody>{recent_rows}</tbody></table></html>"""
-    report_path.write_text(document, encoding="utf-8")
+    valid=[r for r in completed if r[4]==1]
+    entries=[r for r in valid if r[3]==1]
+    cards=[]
+    for label,ei,ai in (("5분 방향",5,6),("10분 방향",7,8),("20분 방향",9,10),("30분 방향",11,12)):
+        judged=[(f(r[ei])>=0)==(f(r[ai])>=0) for r in valid if r[ai] is not None]
+        cards.append((label,ratio(judged),len(judged)))
+    t1=[bool(r[13]) for r in entries if r[13] is not None]
+    t2=[bool(r[14]) for r in entries if r[14] is not None]
+    hard_avoid=[not bool(r[15]) for r in entries if r[15] is not None]
+    cards += [("실제 1차 선도달",ratio(t1),len(t1)),("실제 2차 선도달",ratio(t2),len(t2)),("HardStop 선도달 회피",ratio(hard_avoid),len(hard_avoid))]
+    fiveh=[r for r in entries if r[18]==1]
+    card_html="".join(f'<div class="card"><small>{html.escape(label)}</small><b>{value}</b><span>표본 {n}건</span></div>' for label,value,n in cards)
+    recent="".join("<tr>"+"".join(f"<td>{html.escape(str(v if v is not None else '-'))}</td>" for v in (r[0],r[1],r[2],"YES" if r[3] else "NO",r[13],r[14],r[15],round(f(r[16]),3),round(f(r[17]),3),r[18],round(f(r[19]),3),round(f(r[20]),3),r[21]))+"</tr>" for r in completed[:100])
+    warning=("5시간 실전표본이 아직 없습니다. Persistence 5시간 성공률을 추정하지 않았습니다." if not fiveh else f"5시간 검증완료 {len(fiveh)}건. 서로 다른 날짜·장세에서 추가 검증이 필요합니다.")
+    doc=f"""<!doctype html><html lang='ko'><meta charset='utf-8'><title>반복단타 자동검증</title>
+    <style>body{{font-family:Arial,sans-serif;max-width:1200px;margin:30px auto;padding:0 16px;color:#20242c}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}}.card{{background:#f4f6fa;border-radius:12px;padding:16px}}.card b,.card span{{display:block}}.card b{{font-size:26px;margin:8px 0}}.warn{{background:#fff4dc;padding:15px;border-radius:10px;margin:18px 0}}table{{border-collapse:collapse;width:100%;font-size:12px}}th,td{{border-bottom:1px solid #ddd;padding:7px}}</style>
+    <h1>반복단타 자동검증</h1><p>완료 {len(completed)}건 · 유효 {len(valid)}건 · FINAL_BUY {len(entries)}건</p><div class='warn'>{warning}</div><div class='cards'>{card_html}</div>
+    <h2>최근 신호</h2><table><thead><tr><th>시장</th><th>티커</th><th>종목</th><th>FINAL_BUY</th><th>1차</th><th>2차</th><th>Hard먼저</th><th>30m최대+</th><th>30m최대-</th><th>5h완료</th><th>5h최대+</th><th>5h최대-</th><th>Persistence</th></tr></thead><tbody>{recent}</tbody></table></html>"""
+    report_path.write_text(doc,encoding="utf-8")
 
 
 def stop_handler(*_):
@@ -510,7 +554,18 @@ def main() -> int:
                     continue
 
                 for market in active:
-                    members = KR_UNIVERSE if market == "KR" else US_UNIVERSE
+                    repeat_mode = "국내 반복단타" if market == "KR" else "미국 반복단타"
+                    fallback_members = KR_UNIVERSE if market == "KR" else US_UNIVERSE
+                    try:
+                        discovered = engine.candidates(repeat_mode)
+                    except Exception as discovery_error:
+                        logging.warning("후보검색 실패 %s: %s", market, discovery_error)
+                        discovered = []
+                    dynamic_members = [
+                        (str(row.get("ticker")), str(row.get("name") or row.get("ticker")), str(row.get("exchange") or ("KR" if market=="KR" else "NASDAQ")))
+                        for row in discovered if row.get("ticker")
+                    ]
+                    members = dynamic_members[:20] or fallback_members
                     issuing = signal_window_open(market, now)
                     for member in members:
                         if STOP:
