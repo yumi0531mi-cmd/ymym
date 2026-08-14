@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+.test_cache/
+.scanner_cache/
+.scanner_data/
+.streamlit/secrets.toml
+.pytest_cache/
+streamlit-smoke.*
