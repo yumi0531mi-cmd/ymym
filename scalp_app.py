@@ -2,7 +2,7 @@
 """초단타 전용 Streamlit 앱.
 
 같은 폴더의 app.py에 번들된 KIS 엔진을 읽어 사용한다.
-반복단타 기본 후보는 실제 차트의 지지→1차 저항 폭 0.5~1.5%만 표시한다.
+반복단타 핵심 후보는 실제 confirmed Swing 폭 0.5~5.0%만 표시한다.
 1차·2차 목표가는 임의 +1%/+2%가 아니라 실제 분봉 저항/돌파 구조로 계산한다.
 """
 from __future__ import annotations
@@ -55,6 +55,14 @@ except Exception as exc:
 KST = timezone(timedelta(hours=9), name="KST")
 ET = ZoneInfo("America/New_York")
 HISTORY_DB = Path(tempfile.gettempdir()) / "ymym_scalp_validation.sqlite3"
+
+# 반복단타 공통 기준: app.py 전략엔진과 동일하게 한 곳에서만 관리한다.
+REPEAT_SWING_MIN = 0.50
+REPEAT_SWING_MAX = 5.00
+MIN_RISK_REWARD = 1.50
+KR_MIN_TRADING_VALUE = 30_000_000_000      # 300억원
+KR_PREFERRED_TRADING_VALUE = 50_000_000_000 # 500억원 · 참고 우선순위
+US_MIN_TRADING_VALUE = 30_000_000
 
 KR_UNIVERSE = [
     {"ticker":"005930","name":"삼성전자","exchange":"KR","asset_type":"우량주"},
@@ -670,7 +678,7 @@ def structural_trade_plan(item:dict,market:str):
 
         # 후보 필터용 실제 Swing 폭
         repeat_scalp_range_percent=repeat_width,
-        repeat_scalp_preferred_range=0.50<=repeat_width<=1.50,
+        repeat_scalp_preferred_range=REPEAT_SWING_MIN<=repeat_width<=REPEAT_SWING_MAX,
 
         # 디버그/표시용 수준
         chart_resistance_levels=[float(row["price"]) for row in target_rows],
@@ -730,8 +738,14 @@ def repeat_scalp_plan(item:dict):
     closes=[float(x) for x in (item.get("chart_close_1m",[]) or []) if float(x or 0)>0]; highs=[float(x) for x in (item.get("chart_high_1m",[]) or []) if float(x or 0)>0]; lows=[float(x) for x in (item.get("chart_low_1m",[]) or []) if float(x or 0)>0]; volumes=[float(x or 0) for x in (item.get("chart_volume_1m",[]) or [])]
     if not item.get("level_plan_valid") or min(price,support,target)<=0 or len(closes)<12: item.update(repeat_scalp_state="UNAVAILABLE",repeat_scalp_label="⚪ 반복단타 판정 대기",repeat_scalp_reason="실제 지지·저항 확인 대기"); return item
     ranges=[max(0,highs[i]-lows[i]) for i in range(max(0,len(highs)-20),len(highs))]; median_range=float(pd.Series(ranges).median()) if ranges else 0; median_vol=float(pd.Series(volumes[-20:]).median()) if volumes else 0; last_vol=volumes[-1] if volumes else 0
-    trend=int(item.get("continuous_rise_score",0) or 0); ret15=float(item.get("trend_return_15m",0) or 0); width=(target/support-1)*100 if target>support>0 else 0; mtf=bool(item.get("mtf_alignment")); mtf_exit=bool(item.get("mtf_exit")); rsi=float(item.get("rsi",50) or 50); prior_rsi=float(item.get("rsi_previous",rsi) or rsi)
-    box_high=max(highs[-30:]) if len(highs)>=30 else 0; box_low=min(lows[-30:]) if len(lows)>=30 else 0; box_range=(box_high/box_low-1)*100 if box_high>box_low>0 else 0; box_valid=0.5<=box_range<=4; lower_zone=box_low>0 and price<=box_low+(box_high-box_low)*0.35; upper_zone=box_high>0 and price>=box_low+(box_high-box_low)*0.75; rsi_recovery=(prior_rsi<=35 and rsi>prior_rsi) or 40<=rsi<=68; trend_intact=mtf and price>=vwap>0 and ema9>=ema20>0 and trend>=6 and ret15>=0; near_support=support<=price<=support+max(median_range,1e-9); near_target=target>=price and target-price<=max(median_range,1e-9); bounce=len(closes)>=2 and closes[-1]>closes[-2] and lows[-1]<=support+max(median_range,1e-9); volume_returns=median_vol<=0 or last_vol>=median_vol
+    trend=int(item.get("continuous_rise_score",0) or 0); ret15=float(item.get("trend_return_15m",0) or 0)
+    structural_width=(target/support-1)*100 if target>support>0 else 0
+    engine_width=float(item.get("repeat_swing_width_percent",0) or 0)
+    width=engine_width if engine_width>0 else structural_width
+    engine_repeat_present="repeat_strategy_valid" in item
+    engine_repeat_valid=bool(item.get("repeat_strategy_valid")) if engine_repeat_present else True
+    mtf=bool(item.get("mtf_alignment")); mtf_exit=bool(item.get("mtf_exit")); rsi=float(item.get("rsi",50) or 50); prior_rsi=float(item.get("rsi_previous",rsi) or rsi)
+    box_high=max(highs[-30:]) if len(highs)>=30 else 0; box_low=min(lows[-30:]) if len(lows)>=30 else 0; box_range=(box_high/box_low-1)*100 if box_high>box_low>0 else 0; box_valid=REPEAT_SWING_MIN<=box_range<=REPEAT_SWING_MAX; lower_zone=box_low>0 and price<=box_low+(box_high-box_low)*0.35; upper_zone=box_high>0 and price>=box_low+(box_high-box_low)*0.75; rsi_recovery=(prior_rsi<=35 and rsi>prior_rsi) or 40<=rsi<=68; trend_intact=mtf and price>=vwap>0 and ema9>=ema20>0 and trend>=6 and ret15>=0; near_support=support<=price<=support+max(median_range,1e-9); near_target=target>=price and target-price<=max(median_range,1e-9); bounce=len(closes)>=2 and closes[-1]>closes[-2] and lows[-1]<=support+max(median_range,1e-9); volume_returns=median_vol<=0 or last_vol>=median_vol
     recent_high=max(highs[-6:]); prior_high=max(highs[-12:-6]); recent_low=min(lows[-6:]); prior_low=min(lows[-12:-6]); lower_structure=recent_high<prior_high and recent_low<prior_low; vwap_break=len(closes)>=3 and vwap>0 and all(x<vwap for x in closes[-3:]); ema_bear=ema9<ema20 and ema20>0; macd_bear=float(item.get("macd_histogram",0) or 0)<0
     down=up=0
     for i in range(max(1,len(closes)-12),len(closes)):
@@ -740,14 +754,15 @@ def repeat_scalp_plan(item:dict):
         elif closes[i]>closes[i-1]: up+=vol
     reversal_checks={"VWAP 아래 3개 봉":vwap_break,"EMA9·EMA20 하락 정렬":ema_bear,"고점·저점 동시 하락":lower_structure,"MACD 음전환":macd_bear,"하락봉 거래량 우세":down>up*1.15}; reversal=sum(map(bool,reversal_checks.values())); breakdown=price<support or reversal>=3 or mtf_exit
     if breakdown: state,label,reason="EXIT","🔴 추세 꺾임·매도",f"하락 전환 {reversal}/5"
-    elif width<0.5: state,label,reason="RANGE_TOO_NARROW",f"⚪ 반복폭 부족 +{width:.2f}%","0.5% 미만"
-    elif width>1.5: state,label,reason="RANGE_TOO_WIDE",f"🔵 반복폭 넓음 +{width:.2f}%","상승여력은 있으나 기본 반복후보 범위 밖"
+    elif width<REPEAT_SWING_MIN: state,label,reason="RANGE_TOO_NARROW",f"⚪ 반복폭 부족 +{width:.2f}%",f"{REPEAT_SWING_MIN:.1f}% 미만"
+    elif width>REPEAT_SWING_MAX: state,label,reason="RANGE_TOO_WIDE",f"🔵 반복폭 과다 +{width:.2f}%",f"{REPEAT_SWING_MAX:.1f}% 초과"
+    elif engine_repeat_present and not engine_repeat_valid: state,label,reason="WAIT_REPEAT","⚪ confirmed 반복 Swing 추가 확인",str(item.get("repeat_strategy_reason") or "confirmed 반복 횟수/구조 미충족")
     elif price>=target or near_target or upper_zone: state,label,reason="TAKE_PROFIT","🟠 1차 목표 접근·분할매도",f"실제 차트 저항 {fmt(target)}"
     elif trend_intact and box_valid and (near_support or lower_zone) and bounce and volume_returns and rsi_recovery: state,label,reason="BUY_PULLBACK","🟢 눌림 반등 매수",f"지지 {fmt(support)} 반등"
     elif trend_intact and box_valid and price>ema9 and volume_returns: state,label,reason="HOLD_OR_BREAKOUT","🟢 보유·돌파 매수 검토",f"1차 {fmt(target)}까지 공간"
     elif trend_intact: state,label,reason="WAIT_PULLBACK","🟡 눌림목 재매수 대기",f"지지 {fmt(support)} 대기"
     else: state,label,reason="WAIT_TREND","🔵 추세 재확인 대기","상위시간대 정렬 대기"
-    item.update(repeat_scalp_state=state,repeat_scalp_label=label,repeat_scalp_reason=reason,repeat_scalp_buy_level=support,repeat_scalp_sell_level=target,repeat_scalp_invalidation=support,repeat_scalp_median_bar_range=median_range,repeat_scalp_reversal_score=reversal,repeat_scalp_reversal_checks=reversal_checks,repeat_scalp_range_percent=width,repeat_scalp_preferred_range=0.5<=width<=1.5,repeat_box_valid=box_valid,repeat_box_low=box_low,repeat_box_high=box_high,repeat_box_range_percent=box_range,repeat_rsi_recovery=rsi_recovery,trailing_stop_enabled=state in {"HOLD_OR_BREAKOUT","TAKE_PROFIT"},trailing_stop_percent=0.5,trailing_stop_price=max(highs[-10:])*0.995 if highs else 0)
+    item.update(repeat_scalp_state=state,repeat_scalp_label=label,repeat_scalp_reason=reason,repeat_scalp_buy_level=support,repeat_scalp_sell_level=target,repeat_scalp_invalidation=support,repeat_scalp_median_bar_range=median_range,repeat_scalp_reversal_score=reversal,repeat_scalp_reversal_checks=reversal_checks,repeat_scalp_range_percent=width,repeat_scalp_preferred_range=REPEAT_SWING_MIN<=width<=REPEAT_SWING_MAX,repeat_box_valid=box_valid,repeat_box_low=box_low,repeat_box_high=box_high,repeat_box_range_percent=box_range,repeat_rsi_recovery=rsi_recovery,trailing_stop_enabled=state in {"HOLD_OR_BREAKOUT","TAKE_PROFIT"},trailing_stop_percent=0.5,trailing_stop_price=max(highs[-10:])*0.995 if highs else 0)
     return item
 
 
@@ -813,12 +828,16 @@ def live_filtered_universe(market:str):
         except Exception: pass
     for c in ranked.values():
         price=float(c.get("screen_price",0) or 0); change=float(c.get("screen_change",0) or 0); volume=int(c.get("screen_volume",0) or 0); value=price*volume
-        valid=(2000<=price<=300000 and 0.3<=change<15 and volume>=100000 and value>=30_000_000_000) if market=="국내" else (3<=price<=200 and 0.2<=change<12 and volume>=100000 and value>=30_000_000)
-        if valid: accepted.append(c)
+        c["screen_trading_value"]=value
+        c["liquidity_label"]=("500억+ 우선" if value>=KR_PREFERRED_TRADING_VALUE else "300억+ 통과") if market=="국내" else ("유동성 통과" if value>=US_MIN_TRADING_VALUE else "유동성 부족")
+        valid=(2000<=price<=300000 and 0.3<=change<15 and volume>=100000 and value>=KR_MIN_TRADING_VALUE) if market=="국내" else (3<=price<=200 and 0.2<=change<12 and volume>=100000 and value>=US_MIN_TRADING_VALUE)
+        if valid:
+            c["candidate_source"]="KIS 상승/거래대금 1차 후보"
+            accepted.append(c)
     fallback=[] if accepted else source[:12]
     def fetch(row):
         try:
-            q=scanner().client.kr_quote(row["ticker"]) if market=="국내" else scanner().client.us_quote(row["ticker"],row["exchange"]); c=dict(row); c["screen_price"]=float(q.get("price",0) or 0); c["screen_volume"]=int(float(q.get("volume",q.get("accumulated_volume",0)) or 0)); c["screen_change"]=float(q.get("change",0) or 0) if market=="국내" else verified_us_change(q)[2]; return c if c["screen_price"]>0 else None
+            q=scanner().client.kr_quote(row["ticker"]) if market=="국내" else scanner().client.us_quote(row["ticker"],row["exchange"]); c=dict(row); c["screen_price"]=float(q.get("price",0) or 0); c["screen_volume"]=int(float(q.get("volume",q.get("accumulated_volume",0)) or 0)); c["screen_change"]=float(q.get("change",0) or 0) if market=="국내" else verified_us_change(q)[2]; c["screen_trading_value"]=c["screen_price"]*c["screen_volume"]; c["candidate_source"]="장애대비 감시목록 · 확정 후보 아님"; c["asset_type"]="감시목록 · 후보 아님"; return c if c["screen_price"]>0 else None
         except Exception: return None
     if fallback:
         with ThreadPoolExecutor(max_workers=4) as pool:
@@ -830,6 +849,7 @@ def live_filtered_universe(market:str):
 
 @st.cache_data(ttl=5,show_spinner=False)
 def latest_entry_candidates(market:str,minimum_score:float,limit:int=5):
+    """검증 DB에서 공통 전략엔진의 0.5~5% confirmed Swing 후보를 재사용한다."""
     if AUDIT_IMPORT_ERROR: return []
     code="KR" if market=="국내" else "US"; cutoff=int(time.time())-15*60
     try:
@@ -842,15 +862,31 @@ def latest_entry_candidates(market:str,minimum_score:float,limit:int=5):
         except Exception: d={}
         score=float(score or 0)
         if score<minimum_score: continue
-        width=float(d.get("repeat_scalp_range_percent",0) or 0); rr=float(d.get("risk_reward",0) or 0); spread=d.get("verified_spread_percent")
+        width=float(d.get("repeat_swing_width_percent",d.get("repeat_scalp_range_percent",0)) or 0)
+        support=float(d.get("structural_support",d.get("soft_stop",0)) or 0)
+        t1=float(d.get("structural_target1",d.get("structural_target",0)) or 0)
+        t2=float(d.get("structural_target2",0) or 0)
+        rr=float(d.get("risk_reward",0) or 0)
+        if rr<=0 and float(price or 0)>support>0 and t1>float(price or 0):
+            rr=(t1-float(price))/(float(price)-support)
+        spread=d.get("verified_spread_percent",d.get("spread_pct"))
         try: spread=float(spread) if spread is not None else None
         except Exception: spread=None
-        if not (data_valid and d.get("level_plan_valid") and rr>=1.5 and 0.5<=width<=1.5 and spread is not None and spread<=(0.35 if code=="KR" else 0.25)): continue
-        state=str(d.get("repeat_scalp_state","UNAVAILABLE"))
-        if state in {"UNAVAILABLE","EXIT","TAKE_PROFIT","RANGE_TOO_NARROW","RANGE_TOO_WIDE"}: continue
-        stage,priority=("🟢 눌림 반등 매수",4) if state=="BUY_PULLBACK" else ("🟢 돌파 매수 검토",3) if state=="HOLD_OR_BREAKOUT" else ("🟡 눌림목 재매수 대기",2) if state=="WAIT_PULLBACK" else ("🔵 추세 재확인 대기",1)
-        t1=float(d.get("structural_target1",d.get("structural_target",0)) or 0); t2=float(d.get("structural_target2",0) or 0); ext=str(d.get("upside_continuation_label",d.get("repeat_scalp_extension_label","⚪ 추가상승 미확인"))); extpct=float(d.get("additional_upside_after_target1",d.get("repeat_scalp_extension_percent",0)) or 0); trend=int(d.get("continuous_rise_score",0) or 0); rvol=float(d.get("rvol",0) or 0); positive=sum(float(x or 0)>=0.35 for x in (f5,f10,f20,f30)); rank=priority*100+trend*12+score+positive*5+min(rvol,5)*2+min(rr,4)*2+(25 if d.get("upside_continuation_state")=="STRONG" else 0)
-        out.append({"ticker":ticker,"name":name or ticker,"stage":stage,"price":float(price or 0),"score":score,"rvol":rvol,"risk_reward":rr,"issued":int(issued),"rank":rank,"trend_score":trend,"repeat_width":width,"support":float(d.get("structural_support",0) or 0),"target1":t1,"target2":t2,"extension_label":ext,"extension_percent":extpct})
+        repeat_valid=bool(d.get("repeat_strategy_valid",d.get("level_plan_valid",False)))
+        if not (data_valid and repeat_valid and rr>=MIN_RISK_REWARD and REPEAT_SWING_MIN<=width<=REPEAT_SWING_MAX and spread is not None and spread<=(0.35 if code=="KR" else 0.25)): continue
+        state=str(d.get("repeat_strategy_state",d.get("repeat_scalp_state","UNAVAILABLE")))
+        if state in {"UNAVAILABLE","EXIT","TAKE_PROFIT","RANGE_TOO_NARROW","RANGE_TOO_WIDE","NO_REPEAT","SHAKEOUT","REAL_BREAKDOWN","HARD_EXIT"}: continue
+        if bool(d.get("FINAL_BUY")) or state=="FINAL_BUY": stage,priority="🟢 FINAL_BUY",5
+        elif state=="BUY_PULLBACK": stage,priority="🟢 눌림 반등 매수",4
+        elif state=="HOLD_OR_BREAKOUT": stage,priority="🟢 돌파 매수 검토",3
+        elif state in {"WAIT_PULLBACK","WAIT_ENTRY"}: stage,priority="🟡 진입 타점 대기",2
+        else: stage,priority="🔵 구조 재확인 대기",1
+        ext=str(d.get("upside_continuation_label",d.get("repeat_scalp_extension_label","⚪ 추가상승 미확인")))
+        extpct=float(d.get("additional_upside_after_target1",d.get("repeat_scalp_extension_percent",0)) or 0)
+        persistence=int(d.get("persistence_score",0) or 0); evidence=int(d.get("evidence_confidence",0) or 0); fatigue=int(d.get("pattern_fatigue",0) or 0); swing_type=str(d.get("swing_type","") or "미확인")
+        trend=int(d.get("continuous_rise_score",0) or 0); rvol=float(d.get("rvol",0) or 0); positive=sum(float(x or 0)>=0.35 for x in (f5,f10,f20,f30))
+        rank=priority*100+persistence*1.2+evidence*0.8-fatigue*0.7+trend*5+score+positive*3+min(rvol,5)*2+min(rr,4)*2
+        out.append({"ticker":ticker,"name":name or ticker,"stage":stage,"price":float(price or 0),"score":score,"rvol":rvol,"risk_reward":rr,"issued":int(issued),"rank":rank,"trend_score":trend,"repeat_width":width,"support":support,"target1":t1,"target2":t2,"extension_label":ext,"extension_percent":extpct,"swing_type":swing_type,"persistence":persistence,"evidence":evidence,"fatigue":fatigue})
     return sorted(out,key=lambda x:x["rank"],reverse=True)[:limit]
 
 
@@ -1330,7 +1366,7 @@ def calibration_stats(ticker: str) -> dict:
 st.title("⚡ 초단타 VWAP 매수타점")
 st.caption(
     "집중 모드에서는 현재가를 빠르게 갱신하고, 구조 계산은 별도 주기로 수행합니다. "
-    "반복단타 기본 후보는 실제 차트의 지지→1차 저항 폭 0.5~1.5%입니다."
+    f"반복단타 핵심 후보는 실제 confirmed Swing {REPEAT_SWING_MIN:.1f}~{REPEAT_SWING_MAX:.1f}%입니다."
 )
 
 with st.sidebar:
@@ -1360,7 +1396,7 @@ with st.sidebar:
         True,
         help="선택 종목의 실제 5·10분 검증표본이 쌓이기 전에는 초록색 매수 신호를 잠급니다.",
     )
-    st.caption("반복단타 기본폭 0.5~1.5% · 1차/2차 목표는 차트 저항 기반")
+    st.caption(f"반복단타 confirmed Swing {REPEAT_SWING_MIN:.1f}~{REPEAT_SWING_MAX:.1f}% · 1차/2차 목표는 차트 저항 기반")
 
 now = time.time()
 manual_search_active = bool(manual_ticker)
@@ -1450,7 +1486,7 @@ candidate_board = [] if manual_search_active else latest_entry_candidates(market
 
 st.subheader("실시간 반복단타 후보")
 st.caption(
-    "실제 지지→실제 1차 저항 폭이 0.5~1.5%인 종목만 기본 후보로 표시합니다. "
+    f"실제 confirmed Swing 폭이 {REPEAT_SWING_MIN:.1f}~{REPEAT_SWING_MAX:.1f}%인 종목만 핵심 후보로 표시합니다. "
     "2차 목표와 추가상승 가능성은 별도로 보여줍니다."
 )
 
@@ -1465,7 +1501,11 @@ elif candidate_board:
             "현재가": candidate["price"],
             "반복 매수": candidate["support"],
             "반복 매도/1차": candidate["target1"],
+            "Swing유형": candidate.get("swing_type", "미확인"),
             "반복폭": f"{candidate['repeat_width']:.2f}%",
+            "Persistence": candidate.get("persistence", 0),
+            "Evidence": candidate.get("evidence", 0),
+            "Fatigue": candidate.get("fatigue", 0),
             "2차 목표": candidate["target2"] if candidate["target2"] > 0 else None,
             "추가상승": candidate["extension_label"],
             "1차→2차": (
@@ -1480,12 +1520,12 @@ elif candidate_board:
             "분석시각": datetime.fromtimestamp(candidate["issued"], KST).strftime("%H:%M:%S"),
         })
     st.dataframe(pd.DataFrame(board_rows), hide_index=True, use_container_width=True)
-    st.caption("후보표의 0.5~1.5%는 목표가 고정값이 아니라 실제 지지→실제 1차 저항의 차트폭입니다.")
+    st.caption("후보표의 반복폭은 고정 목표가가 아니라 공통 전략엔진에서 확인한 실제 confirmed Swing 폭입니다.")
 else:
     if focus_only:
-        st.info("현재 0.5~1.5% 반복폭과 필수 조건을 동시에 통과한 후보가 없습니다. 아래에서 직접 종목을 집중 분석할 수 있습니다.")
+        st.info(f"현재 {REPEAT_SWING_MIN:.1f}~{REPEAT_SWING_MAX:.1f}% confirmed Swing과 필수 조건을 동시에 통과한 후보가 없습니다. 아래에서 직접 종목을 집중 분석할 수 있습니다.")
     else:
-        st.info("현재 0.5~1.5% 반복폭과 필수 조건을 동시에 통과한 후보가 없습니다.")
+        st.info(f"현재 {REPEAT_SWING_MIN:.1f}~{REPEAT_SWING_MAX:.1f}% confirmed Swing과 필수 조건을 동시에 통과한 후보가 없습니다.")
 
 
 # 종목 선택
@@ -1522,12 +1562,13 @@ if not options:
     st.warning("현재 자동 후보가 없습니다. 원하는 종목을 직접 검색해 주세요.")
     st.stop()
 
+st.caption("아래 드롭다운은 1차 유동성/상승 후보 또는 장애대비 감시목록입니다. 위의 반복단타 후보표와는 다릅니다.")
 selected_ticker = st.selectbox(
-    "집중 분석할 종목 (자동 목록은 정밀검증 대기, 위 표만 확정 후보)",
+    "집중 분석할 종목 (드롭다운=1차 분석대상, 위 표=반복단타 핵심 후보)",
     [str(row.get("ticker", "")) for row in options],
     format_func=lambda ticker: next(
         (
-            f"{ticker} · {row.get('name', ticker)} · {row.get('asset_type', '')}"
+            f"{ticker} · {row.get('name', ticker)} · {row.get('candidate_source', row.get('asset_type', ''))}"
             for row in options
             if str(row.get("ticker", "")) == ticker
         ),
@@ -1748,6 +1789,8 @@ elif buy_votes < 6 or sell_votes > 0:
     level, label = "warning", f"🟡 대기 · 매수 합의 {buy_votes}/10 · 매도 경고 {sell_votes}/10"
 
 latest["entry_checks_passed"] = level == "success"
+engine_final_buy_present = "FINAL_BUY" in latest
+engine_final_buy = bool(latest.get("FINAL_BUY")) if engine_final_buy_present else True
 live_hard_stop = float(latest.get("structural_hard_stop", 0) or 0)
 live_net_swing = ((target1 / price) - 1) * 100 if target1 > price > 0 else 0.0
 live_signature = str(latest.get("confirmed_swing_signature", "") or "")
@@ -1765,8 +1808,9 @@ fresh_swing_for_reentry = bool(
 latest["net_swing_percent"] = live_net_swing
 latest["fresh_swing_for_reentry"] = fresh_swing_for_reentry
 latest["FINAL_BUY"] = bool(
-    level == "success"
-    and 0.50 <= repeat_width <= 1.50
+    engine_final_buy
+    and level == "success"
+    and REPEAT_SWING_MIN <= repeat_width <= REPEAT_SWING_MAX
     and live_net_swing >= 0.50
     and live_hard_stop > 0
     and live_hard_stop < float(latest.get("structural_support", 0) or 0) < price
@@ -1866,7 +1910,7 @@ elif repeat_state == "RANGE_TOO_NARROW":
     action_line = "실제 지지→1차 저항 폭이 0.5% 미만입니다."
 elif repeat_state == "RANGE_TOO_WIDE":
     action_class, action_title = "wait", f"🔵 반복폭 넓음 +{repeat_width:.2f}%"
-    action_line = "상승여력은 있지만 기본 0.5~1.5% 반복단타 후보 범위 밖입니다."
+    action_line = f"confirmed Swing이 {REPEAT_SWING_MAX:.1f}%를 초과해 기본 반복단타 범위 밖입니다."
 else:
     action_class, action_title = "wait", "🟡 지금은 대기"
     action_line = f"{fmt(repeat_buy)} 지지 반등 또는 매수 합의를 기다리세요."
@@ -2009,7 +2053,7 @@ else:
 
     can_start_cycle = bool(
         level == "success"
-        and 0.50 <= repeat_width <= 1.50
+        and REPEAT_SWING_MIN <= repeat_width <= REPEAT_SWING_MAX
         and actual_net_swing >= 0.50
         and actual_rr >= 1.50
         and preview_hard > 0
@@ -2020,7 +2064,7 @@ else:
 
     if not can_start_cycle:
         reasons = []
-        if not (0.50 <= repeat_width <= 1.50):
+        if not (REPEAT_SWING_MIN <= repeat_width <= REPEAT_SWING_MAX):
             reasons.append(f"confirmed Swing {repeat_width:.2f}%")
         if actual_net_swing < 0.50:
             reasons.append(f"Net Swing {actual_net_swing:.2f}%")
@@ -2137,7 +2181,7 @@ with st.expander("큰 구조 지지·저항 · 60분→15분→5분", expanded=F
             "지지": fmt(latest.get("structure_support_5m")),
             "저항": fmt(latest.get("structure_resistance_5m")),
             "confirmed Swing": int(latest.get("confirmed_swing_5m_count",0) or 0),
-            "역할": "0.5~1.5% 반복 Swing",
+            "역할": f"{REPEAT_SWING_MIN:.1f}~{REPEAT_SWING_MAX:.1f}% confirmed Swing",
         },
         {
             "시간대": "1분",
@@ -2156,6 +2200,19 @@ st.caption(
     f"30분 {'상승' if float(latest.get('trend_return_30m', 0) or 0) > 0 else '하락'}"
 )
 
+
+# 반복단타 핵심 근거 + 참고지표
+with st.expander("반복단타 핵심 근거 · 20일선/RSI는 참고", expanded=False):
+    ref_cols = st.columns(5)
+    ref_cols[0].metric("Swing 유형", str(latest.get("swing_type", "미확인") or "미확인"))
+    ref_cols[1].metric("Persistence", f"{int(latest.get('persistence_score',0) or 0)}점")
+    ref_cols[2].metric("Evidence", f"{int(latest.get('evidence_confidence',0) or 0)}점")
+    ref_cols[3].metric("Pattern Fatigue", f"{int(latest.get('pattern_fatigue',0) or 0)}점")
+    ref_cols[4].metric("RSI 눌림 참고", "40~55" if latest.get("rsi_pullback_reference") else "비해당")
+    st.caption(
+        "20일선/RSI는 매수 필수조건이 아니라 참고 근거입니다. "
+        + str(latest.get("ma20_reference_status", "20일선 자료가 없으면 필터에 사용하지 않음"))
+    )
 
 # 추가상승 배너
 extension_state = str(latest.get("upside_continuation_state", "NO_TARGET2"))
