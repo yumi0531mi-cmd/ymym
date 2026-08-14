@@ -581,81 +581,896 @@ def render_chart(item:dict):
     st.altair_chart(chart.properties(height=430),use_container_width=True)
 
 
-def calibration_stats(ticker:str):
-    stats={}
+
+def update_prediction_audit(ticker: str, price: float, item: dict, now_ts: float) -> list[dict]:
+    """선택 종목의 5/10/20/30분 예측을 별도 로컬 DB에 저장·사후 채점한다."""
+    bucket = float(int(now_ts // 300) * 300)
     with db_connect() as db:
-        for m in (5,10,20,30):
-            rows=db.execute(f"SELECT f{m},actual{m} FROM predictions WHERE ticker=? AND actual{m} IS NOT NULL ORDER BY issued DESC LIMIT 300",(ticker,)).fetchall()
-            if not rows: stats[m]={"samples":0,"accuracy":0,"bias":0,"mae":0}; continue
-            errors=[float(e)-float(a) for e,a in rows]; accuracy=sum((float(e)>=0)==(float(a)>=0) for e,a in rows)/len(rows)*100; stats[m]={"samples":len(rows),"accuracy":accuracy,"bias":sum(errors)/len(errors),"mae":sum(abs(x) for x in errors)/len(errors)}
+        if price > 0:
+            db.execute(
+                "INSERT OR IGNORE INTO predictions(ticker,issued,base_price,f5,f10,f20,f30) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (
+                    ticker,
+                    bucket,
+                    price,
+                    float(item.get("forecast_5m", 0) or 0),
+                    float(item.get("forecast_10m", 0) or 0),
+                    float(item.get("forecast_20m", 0) or 0),
+                    float(item.get("forecast_30m", 0) or 0),
+                ),
+            )
+
+        pending = db.execute(
+            "SELECT id,issued,base_price,f5,f10,f20,f30,actual5,actual10,actual20,actual30 "
+            "FROM predictions WHERE ticker=? AND issued>=?",
+            (ticker, now_ts - 86400),
+        ).fetchall()
+
+        for row in pending:
+            record_id, issued, base_price, f5, f10, f20, f30, a5, a10, a20, a30 = row
+            if base_price <= 0:
+                continue
+            elapsed = now_ts - issued
+            updates = {}
+            if elapsed >= 300 and a5 is None:
+                updates["actual5"] = (price / base_price - 1) * 100
+            if elapsed >= 600 and a10 is None:
+                updates["actual10"] = (price / base_price - 1) * 100
+            if elapsed >= 1200 and a20 is None:
+                updates["actual20"] = (price / base_price - 1) * 100
+            if elapsed >= 1800 and a30 is None:
+                updates["actual30"] = (price / base_price - 1) * 100
+            for column, value in updates.items():
+                db.execute(f"UPDATE predictions SET {column}=? WHERE id=?", (value, record_id))
+
+        rows = db.execute(
+            "SELECT issued,base_price,f5,f10,f20,f30,actual5,actual10,actual20,actual30 "
+            "FROM predictions WHERE ticker=? ORDER BY issued DESC LIMIT 100",
+            (ticker,),
+        ).fetchall()
+
+    records = []
+    for issued, base_price, f5, f10, f20, f30, a5, a10, a20, a30 in rows:
+        record = {
+            "ticker": ticker,
+            "issued": issued,
+            "기준시각": datetime.fromtimestamp(issued, KST).strftime("%m-%d %H:%M"),
+            "기준가": base_price,
+            "예상5분": f5,
+            "예상10분": f10,
+            "예상20분": f20,
+            "예상30분": f30,
+        }
+        for minutes, expected, actual in (
+            (5, f5, a5),
+            (10, f10, a10),
+            (20, f20, a20),
+            (30, f30, a30),
+        ):
+            if actual is not None:
+                record[f"실제{minutes}분"] = round(actual, 3)
+                record[f"적중{minutes}분"] = (float(expected) >= 0) == (float(actual) >= 0)
+        records.append(record)
+    return records
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def calibration_stats(ticker: str) -> dict:
+    stats = {}
+    with db_connect() as db:
+        for minutes in (5, 10, 20, 30):
+            rows = db.execute(
+                f"SELECT f{minutes},actual{minutes} FROM predictions "
+                f"WHERE ticker=? AND actual{minutes} IS NOT NULL "
+                "ORDER BY issued DESC LIMIT 300",
+                (ticker,),
+            ).fetchall()
+            if not rows:
+                stats[minutes] = {"samples": 0, "accuracy": 0.0, "bias": 0.0, "mae": 0.0}
+                continue
+            errors = [float(expected) - float(actual) for expected, actual in rows]
+            accuracy = (
+                sum((float(expected) >= 0) == (float(actual) >= 0) for expected, actual in rows)
+                / len(rows)
+                * 100
+            )
+            stats[minutes] = {
+                "samples": len(rows),
+                "accuracy": accuracy,
+                "bias": sum(errors) / len(errors),
+                "mae": sum(abs(value) for value in errors) / len(errors),
+            }
     return stats
 
 
-def update_prediction_audit(ticker,price,item,now_ts):
-    bucket=float(int(now_ts//300)*300)
-    with db_connect() as db:
-        if price>0: db.execute("INSERT OR IGNORE INTO predictions(ticker,issued,base_price,f5,f10,f20,f30) VALUES(?,?,?,?,?,?,?)",(ticker,bucket,price,float(item.get("forecast_5m",0) or 0),float(item.get("forecast_10m",0) or 0),float(item.get("forecast_20m",0) or 0),float(item.get("forecast_30m",0) or 0)))
-    return []
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
 
 st.title("⚡ 초단타 VWAP 매수타점")
-st.caption("반복단타 후보는 실제 차트의 지지→1차 저항 폭 0.5~1.5%만 기본 표시합니다. 1차·2차 목표는 실제 차트 저항으로 계산합니다.")
+st.caption(
+    "집중 모드에서는 현재가를 빠르게 갱신하고, 구조 계산은 별도 주기로 수행합니다. "
+    "반복단타 기본 후보는 실제 차트의 지지→1차 저항 폭 0.5~1.5%입니다."
+)
+
 with st.sidebar:
-    market=st.radio("시장",["국내","미국"],horizontal=True); session_info=market_clock(market); st.caption(f"{session_info['session']} · {session_info['local_time']}"); mode="국내 30분 1% 타점" if market=="국내" else "미국 30분 1% 타점"; minimum_score=st.slider("최소 점수",30,90,50,5); manual_ticker=st.text_input("종목명 또는 종목코드 검색",placeholder="현대차, 005380, SOXL").strip(); run_mode=st.radio("실행 모드",["가벼운 현재가","선택 종목 집중","시장 자동검증"],key="scalp_run_mode"); focus_only=run_mode=="선택 종목 집중"; auto_audit=run_mode=="시장 자동검증"; require_validation=st.toggle("실전 검증 잠금",True); st.caption("반복단타 기본폭 0.5~1.5%")
-now=time.time(); live_refresh_active=focus_only or auto_audit; st_autorefresh(interval=1500 if focus_only else 10000 if auto_audit else 8000,key="scalp_tick")
-if auto_audit and not AUDIT_IMPORT_ERROR and not manual_ticker: background_audit_tick(True,now,market)
+    st.header("초단타 설정")
+    market = st.radio("시장", ["국내", "미국"], horizontal=True)
+    session_info = market_clock(market)
+    st.caption(f"{session_info['session']} · {session_info['local_time']}")
 
-candidate_board=[] if manual_ticker else latest_entry_candidates(market,minimum_score)
+    mode = "국내 30분 1% 타점" if market == "국내" else "미국 30분 1% 타점"
+    minimum_score = st.slider("최소 점수", 30, 90, 50, 5)
+    manual_ticker = st.text_input(
+        "종목명 또는 종목코드 검색",
+        placeholder="현대차, 005380, SOXL",
+    ).strip()
+
+    run_mode = st.radio(
+        "실행 모드",
+        ["가벼운 현재가", "선택 종목 집중", "시장 자동검증"],
+        horizontal=False,
+        key="scalp_run_mode",
+        help="한 번에 하나의 모드만 실행해 API 과호출과 상태 충돌을 줄입니다.",
+    )
+    focus_only = run_mode == "선택 종목 집중"
+    auto_audit = run_mode == "시장 자동검증"
+    require_validation = st.toggle(
+        "실전 검증 잠금",
+        True,
+        help="선택 종목의 실제 5·10분 검증표본이 쌓이기 전에는 초록색 매수 신호를 잠급니다.",
+    )
+    st.caption("반복단타 기본폭 0.5~1.5% · 1차/2차 목표는 차트 저항 기반")
+
+now = time.time()
+manual_search_active = bool(manual_ticker)
+live_refresh_active = bool(focus_only or auto_audit)
+
+st_autorefresh(
+    interval=1500 if focus_only else 10000 if auto_audit else 8000,
+    key="scalp_tick",
+)
+
+# 자동검증 상태/다운로드 메뉴 복원
+if AUDIT_IMPORT_ERROR:
+    st.sidebar.error("자동검증 파일 오류: " + AUDIT_IMPORT_ERROR)
+elif auto_audit:
+    audit_paused_for_focus = manual_search_active or focus_only
+    if not audit_paused_for_focus:
+        background_audit_tick(True, now, market)
+
+    audit_now = datetime.fromtimestamp(now, KST)
+    audit_minute = audit_now.hour * 60 + audit_now.minute
+
+    if market == "미국":
+        if session_info["tradable"]:
+            audit_phase = f"{session_info['session']} · 신호 수집·사후 채점 중"
+        else:
+            audit_phase = f"{session_info['session']} · 다음 미국 세션 대기"
+    elif audit_now.weekday() >= 5:
+        audit_phase = "휴장일 · 다음 영업일 대기"
+    elif audit_minute < 8 * 60 + 50:
+        audit_phase = "준비 완료 · 08:50 자동 시작"
+    elif audit_minute < 9 * 60:
+        audit_phase = "사전 시세 확인 중 · 09:00 신호 시작"
+    elif audit_minute < 15 * 60:
+        audit_phase = "한국 정규장 · 신호 수집·사후 채점 중"
+    elif audit_minute <= 15 * 60 + 35:
+        audit_phase = "신규 신호 종료 · 30분 사후 채점 중"
+    else:
+        audit_phase = "한국장 검증 완료 · 결과 다운로드 가능"
+
+    displayed_phase = (
+        "집중분석 우선 · 후보 수집 일시정지"
+        if audit_paused_for_focus
+        else audit_phase
+    )
+    last_audit_ok = st.session_state.get("audit_last_ok")
+    st.sidebar.success(
+        "자동검증 · "
+        + displayed_phase
+        + (f"\n\n최근 처리: {last_audit_ok}" if last_audit_ok else "")
+    )
+
+    if st.session_state.get("audit_last_error"):
+        st.sidebar.warning(st.session_state["audit_last_error"])
+
+    if AUDIT_CSV_PATH.exists():
+        st.sidebar.download_button(
+            "검증 CSV 내려받기",
+            AUDIT_CSV_PATH.read_bytes(),
+            file_name="validation_summary.csv",
+            mime="text/csv",
+            key="audit_csv_download",
+        )
+
+    audit_report_path = AUDIT_DB_PATH.parent / "validation_report.html"
+    if audit_report_path.exists():
+        st.sidebar.download_button(
+            "검증 보고서 내려받기",
+            audit_report_path.read_bytes(),
+            file_name="validation_report.html",
+            mime="text/html",
+            key="audit_report_download",
+        )
+
+    try:
+        with audit_connect() as audit_db:
+            total_signals = int(audit_db.execute("SELECT COUNT(*) FROM signals").fetchone()[0])
+            completed_signals = int(
+                audit_db.execute("SELECT COUNT(*) FROM signals WHERE result_done=1").fetchone()[0]
+            )
+        st.sidebar.caption(f"저장 {total_signals}건 · 30분 채점완료 {completed_signals}건")
+    except Exception:
+        pass
+
+
+# 실시간 반복단타 후보
+candidate_board = [] if manual_search_active else latest_entry_candidates(market, minimum_score)
+
 st.subheader("실시간 반복단타 후보")
-if candidate_board:
-    st.dataframe(pd.DataFrame([{"판정":c["stage"],"종목":f"{c['ticker']} · {c['name']}","현재가":c["price"],"반복 매수":c["support"],"반복 매도/1차":c["target1"],"반복폭":f"{c['repeat_width']:.2f}%","2차 목표":c["target2"] if c["target2"]>0 else None,"추가상승":c["extension_label"],"1차→2차":f"+{c['extension_percent']:.2f}%" if c["extension_percent"]>0 else "-","점수":round(c["score"]),"RVOL":round(c["rvol"],1),"손익비":round(c["risk_reward"],2)} for c in candidate_board]),hide_index=True,use_container_width=True)
-else: st.info("현재 0.5~1.5% 반복폭과 필수 조건을 동시에 통과한 후보가 없습니다.")
+st.caption(
+    "실제 지지→실제 1차 저항 폭이 0.5~1.5%인 종목만 기본 후보로 표시합니다. "
+    "2차 목표와 추가상승 가능성은 별도로 보여줍니다."
+)
 
-options=[]
+if manual_search_active:
+    st.caption("직접 검색 우선 모드 · 자동 후보 수집을 잠시 멈추고 선택 종목만 분석합니다.")
+elif candidate_board:
+    board_rows = []
+    for candidate in candidate_board:
+        board_rows.append({
+            "판정": candidate["stage"],
+            "종목": f"{candidate['ticker']} · {candidate['name']}",
+            "현재가": candidate["price"],
+            "반복 매수": candidate["support"],
+            "반복 매도/1차": candidate["target1"],
+            "반복폭": f"{candidate['repeat_width']:.2f}%",
+            "2차 목표": candidate["target2"] if candidate["target2"] > 0 else None,
+            "추가상승": candidate["extension_label"],
+            "1차→2차": (
+                f"+{candidate['extension_percent']:.2f}%"
+                if candidate["extension_percent"] > 0
+                else "-"
+            ),
+            "지속상승": f"{candidate['trend_score']}/10",
+            "점수": round(candidate["score"]),
+            "RVOL": round(candidate["rvol"], 1),
+            "손익비": round(candidate["risk_reward"], 2),
+            "분석시각": datetime.fromtimestamp(candidate["issued"], KST).strftime("%H:%M:%S"),
+        })
+    st.dataframe(pd.DataFrame(board_rows), hide_index=True, use_container_width=True)
+    st.caption("후보표의 0.5~1.5%는 목표가 고정값이 아니라 실제 지지→실제 1차 저항의 차트폭입니다.")
+else:
+    if focus_only:
+        st.info("현재 0.5~1.5% 반복폭과 필수 조건을 동시에 통과한 후보가 없습니다. 아래에서 직접 종목을 집중 분석할 수 있습니다.")
+    else:
+        st.info("현재 0.5~1.5% 반복폭과 필수 조건을 동시에 통과한 후보가 없습니다.")
+
+
+# 종목 선택
+options = live_filtered_universe(market) if not manual_ticker else []
+resolved_manual = None
+
 if manual_ticker:
-    resolved=resolve_manual(manual_ticker,market)
-    if resolved: options=[resolved]
-else: options=live_filtered_universe(market)
-if not options: st.warning("자동 후보가 없습니다. 종목을 직접 검색해 주세요."); st.stop()
-selected_ticker=st.selectbox("집중 분석할 종목",[str(r.get("ticker","")) for r in options],format_func=lambda t:next((f"{t} · {r.get('name',t)}" for r in options if str(r.get('ticker',''))==t),t)); selected_row=next(r for r in options if str(r.get("ticker",""))==selected_ticker); selected_row.setdefault("exchange","KR" if market=="국내" else "NASDAQ")
-if st.session_state.get("scalp_selected")!=selected_ticker: st.session_state["scalp_selected"]=selected_ticker; st.session_state["scalp_last_precise"]=0.0; st.session_state.pop("scalp_latest",None)
-latest=dict(st.session_state.get("scalp_latest",{})); due=not latest or (live_refresh_active and now-float(st.session_state.get("scalp_last_precise",0))>=(5 if focus_only else 60))
-if due:
-    try: latest=precise_analysis(selected_row,mode); st.session_state["scalp_latest"]=latest; st.session_state["scalp_last_precise"]=now
-    except Exception as e: st.error(f"분석 대기: {e}"); st.stop()
-price=float(latest.get("price",0) or 0); change=float(latest.get("change_percent",0) or 0)
-if price<=0: st.error("현재가 미확인"); st.stop()
-quality_rows,quality_passed,_=data_quality_gate(latest,market); regime_name,regime_method=market_regime(latest); strategy_rows,buy_votes,sell_votes,wait_votes=strategy_consensus(latest); weighted_score,weighted_buy=weighted_strategy_score(strategy_rows,regime_name); context=benchmark_context(market,selected_ticker); context_aligned=bool(context.get("confirmed")) and (float(context.get("change",0) or 0)>=-0.05 and float(context.get("intraday",0) or 0)>=-0.10); rr=float(latest.get("risk_reward",0) or 0); state=str(latest.get("repeat_scalp_state","UNAVAILABLE")); width=float(latest.get("repeat_scalp_range_percent",0) or 0); support=float(latest.get("structural_support",0) or 0); t1=float(latest.get("structural_target1",latest.get("structural_target",0)) or 0); t2=float(latest.get("structural_target2",0) or 0)
-cal=calibration_stats(selected_ticker) if require_validation else {m:{"samples":0,"accuracy":0,"bias":0,"mae":0} for m in (5,10,20,30)}; validated=cal[5]["samples"]>=20 and cal[10]["samples"]>=20 and cal[5]["accuracy"]>=55 and cal[10]["accuracy"]>=55
-level="success"
-if not quality_passed or not latest.get("level_plan_valid") or not context_aligned or rr<1.5 or state in {"EXIT","TAKE_PROFIT","RANGE_TOO_NARROW","RANGE_TOO_WIDE"} or sell_votes>=3: level="error"
-elif require_validation and not validated: level="warning"
-elif state not in {"BUY_PULLBACK","HOLD_OR_BREAKOUT"} or buy_votes<4: level="warning"
-latest["entry_checks_passed"]=level=="success"
-if level=="success": st.success(f"🟢 매수 검토 · 반복폭 {width:.2f}% · 1차 {fmt(t1)}")
-elif state=="TAKE_PROFIT": st.warning(f"🟠 1차 목표 접근 · {fmt(t1)}")
-else: st.info(f"🟡 대기 · 반복폭 {width:.2f}%")
+    resolved = resolve_manual(manual_ticker, market)
+    if resolved:
+        resolved_manual = resolved
+        options.insert(0, resolved)
+    else:
+        st.sidebar.error("종목을 찾지 못했습니다. 이름 또는 코드를 다시 확인해 주세요.")
+        options = live_filtered_universe(market)
 
-cols=st.columns(5); cols[0].metric(f"{selected_ticker} · {latest.get('name','')}",fmt(price),f"{change:+.2f}%"); cols[1].metric("진입 기준가",fmt(latest.get("structural_entry"))); cols[2].metric("1차 목표가",fmt(t1),f"{float(latest.get('target1_upside_percent',0) or 0):+.2f}%"); cols[3].metric("2차 목표가",fmt(t2) if t2>0 else "-",f"{float(latest.get('target2_upside_percent',0) or 0):+.2f}%" if t2>0 else None); cols[4].metric("손절·지지",fmt(support))
-ext_state=str(latest.get("upside_continuation_state","NO_TARGET2")); ext_label=str(latest.get("upside_continuation_label","⚪ 추가상승 미확인")); ext_pct=float(latest.get("additional_upside_after_target1",0) or 0); ext_score=int(latest.get("upside_continuation_score",0) or 0)
-if ext_state=="STRONG": st.success(f"{ext_label} · 근거 {ext_score}/10 · 1차→2차 +{ext_pct:.2f}%")
-elif ext_state=="WATCH": st.warning(f"{ext_label} · 근거 {ext_score}/10")
-elif ext_state=="LIMITED": st.error(f"{ext_label} · 근거 {ext_score}/10")
-else: st.info(ext_label)
-st.caption(f"1차 근거: {latest.get('target1_basis','-')} · 2차 근거: {latest.get('target2_basis','-')}")
+dedup = {}
+for row in options:
+    ticker = str(row.get("ticker", "")).upper()
+    if ticker:
+        dedup[ticker] = row
+options = list(dedup.values())
 
-st.subheader("실시간 차트 · 지지 / 1차 / 2차 목표")
+if market == "국내" and not resolved_manual:
+    options = [
+        row for row in options
+        if 0
+        < float(
+            row.get("screen_change", row.get("change_percent", row.get("change", 0))) or 0
+        )
+        < 20.0
+    ]
+
+if not options:
+    st.warning("현재 자동 후보가 없습니다. 원하는 종목을 직접 검색해 주세요.")
+    st.stop()
+
+selected_ticker = st.selectbox(
+    "집중 분석할 종목 (자동 목록은 정밀검증 대기, 위 표만 확정 후보)",
+    [str(row.get("ticker", "")) for row in options],
+    format_func=lambda ticker: next(
+        (
+            f"{ticker} · {row.get('name', ticker)} · {row.get('asset_type', '')}"
+            for row in options
+            if str(row.get("ticker", "")) == ticker
+        ),
+        ticker,
+    ),
+    key=f"focus_ticker::{market}::{resolved_manual.get('ticker') if resolved_manual else 'default'}",
+)
+
+selected_row = next(row for row in options if str(row.get("ticker", "")) == selected_ticker)
+selected_row.setdefault("exchange", "KR" if market == "국내" else "NASDAQ")
+
+if st.session_state.get("scalp_selected") != selected_ticker:
+    st.session_state["scalp_selected"] = selected_ticker
+    st.session_state["scalp_last_precise"] = 0.0
+    st.session_state["scalp_last_quote"] = 0.0
+    st.session_state.pop("scalp_latest", None)
+    st.session_state["scalp_live_history"] = []
+
+
+# 정밀계산 주기와 현재가 갱신 주기 분리 복원
+latest = dict(st.session_state.get("scalp_latest", {}))
+precise_refresh_seconds = 5 if focus_only else 60
+
+precise_due = bool(
+    not latest
+    or (
+        live_refresh_active
+        and now - float(st.session_state.get("scalp_last_precise", 0))
+        >= precise_refresh_seconds
+    )
+)
+
+if precise_due or not latest:
+    with st.spinner(f"{selected_ticker} 1분봉 정밀분석 중..."):
+        try:
+            latest = precise_analysis(selected_row, mode)
+            st.session_state["scalp_latest"] = latest
+            st.session_state["scalp_last_precise"] = now
+            st.session_state.pop("scalp_error", None)
+        except Exception as error:
+            st.session_state["scalp_error"] = str(error)
+
+elif now - float(st.session_state.get("scalp_last_quote", 0)) >= (1 if focus_only else 5):
+    # 현재가/호가만 빠르게 새로 받고, 기존 1분봉 구조를 재사용한다.
+    try:
+        refreshed = scanner().refresh_quotes([latest], mode)
+        if refreshed:
+            latest.update(refreshed[0])
+            if market == "미국":
+                latest = normalize_us_item(latest, selected_row)
+
+            # 가격이 달라지면 기존 분봉을 재사용하여 구조값만 경량 재판정.
+            latest = structural_trade_plan(latest, market)
+            latest = multi_timeframe_plan(latest, market)
+            latest = upside_continuation_plan(latest)
+            latest = repeat_scalp_plan(latest)
+
+            _, fast_gate_ok, fast_spread = data_quality_gate(latest, market)
+            latest["data_gate_passed"] = bool(fast_gate_ok)
+            latest["verified_spread_percent"] = fast_spread
+            st.session_state["scalp_latest"] = latest
+
+        st.session_state["scalp_last_quote"] = now
+        st.session_state.pop("scalp_quote_error", None)
+    except Exception as error:
+        st.session_state["scalp_quote_error"] = str(error)
+
+if st.session_state.get("scalp_error"):
+    st.error(f"분석 대기: {st.session_state['scalp_error']}")
+if st.session_state.get("scalp_quote_error"):
+    st.caption(f"현재가 갱신 경고: {st.session_state['scalp_quote_error']}")
+
+if not latest:
+    st.stop()
+
+if latest.get("intraday_fallback"):
+    st.warning(
+        "KIS 분봉이 부족해 보조 분봉이 사용된 상태입니다. "
+        "이 경우 실시간 매수 신호는 잠그고 관찰용으로만 봅니다."
+    )
+
+price = float(latest.get("price", 0) or 0)
+change = float(latest.get("change_percent", 0) or 0)
+
+if price <= 0:
+    st.error("⛔ 현재가가 확인되지 않아 분석과 매수 판정을 중단했습니다.")
+    st.stop()
+
+
+# 예측 Calibration
+calibration = (
+    calibration_stats(selected_ticker)
+    if require_validation
+    else {
+        horizon: {"samples": 0, "accuracy": 0.0, "mae": 0.0, "bias": 0.0}
+        for horizon in (5, 10, 20, 30)
+    }
+)
+
+for horizon in (5, 10, 20, 30):
+    stat = calibration[horizon]
+    if stat["samples"] >= 20:
+        key = f"forecast_{horizon}m"
+        latest[key] = round(
+            float(latest.get(key, 0) or 0) - float(stat["bias"]),
+            3,
+        )
+
+validated_signal = (
+    calibration[5]["samples"] >= 20
+    and calibration[10]["samples"] >= 20
+    and calibration[5]["accuracy"] >= 55
+    and calibration[10]["accuracy"] >= 55
+)
+
+
+# 공통 판정값
+quality_rows, quality_passed, spread_pct = data_quality_gate(latest, market)
+regime_name, regime_method = market_regime(latest)
+strategy_rows, buy_votes, sell_votes, wait_votes = strategy_consensus(latest)
+weighted_score, weighted_buy = weighted_strategy_score(strategy_rows, regime_name)
+
+context_key = f"scalp_context::{market}::{selected_ticker}"
+if live_refresh_active or context_key not in st.session_state:
+    st.session_state[context_key] = benchmark_context(market, selected_ticker)
+context = st.session_state[context_key]
+
+forecast_up = float(latest.get("forecast_5m", 0) or 0) >= 0.35
+context_aligned = bool(context.get("confirmed")) and (
+    not forecast_up
+    or (
+        float(context.get("change", 0) or 0) >= -0.05
+        and float(context.get("intraday", 0) or 0) >= -0.10
+    )
+)
+
+risk_reward = float(latest.get("risk_reward", 0) or 0)
+is_manual_search = str(selected_row.get("asset_type", "")) == "직접 검색"
+continuous_rise = bool(latest.get("continuous_rise"))
+continuous_rise_score = int(latest.get("continuous_rise_score", 0) or 0)
+
+repeat_state = str(latest.get("repeat_scalp_state", "UNAVAILABLE"))
+repeat_label = str(latest.get("repeat_scalp_label", "⚪ 반복단타 판정 대기"))
+repeat_buy = float(latest.get("repeat_scalp_buy_level", 0) or 0)
+repeat_sell = float(latest.get("repeat_scalp_sell_level", 0) or 0)
+repeat_stop = float(
+    latest.get("stop_loss", latest.get("repeat_scalp_invalidation", 0)) or 0
+)
+repeat_width = float(latest.get("repeat_scalp_range_percent", 0) or 0)
+
+higher_trend = bool(latest.get("mtf_higher_trend"))
+short_pullback = bool(latest.get("mtf_short_pullback"))
+
+target1 = float(
+    latest.get("structural_target1", latest.get("structural_target", 0)) or 0
+)
+target2 = float(latest.get("structural_target2", 0) or 0)
+target1_pct = float(latest.get("target1_upside_percent", 0) or 0)
+target2_pct = float(latest.get("target2_upside_percent", 0) or 0)
+
+label, level = verdict_text(latest)
+
+if repeat_state == "EXIT":
+    regime_name = "하락 전환"
+    regime_method = "신규 매수 중단 · 실제 지지 회복과 하락 전환 해소 확인"
+
+if not quality_passed:
+    level, label = "error", "🔴 판정 불가 · 실시간 데이터 검문 미통과"
+elif not bool(latest.get("level_plan_valid")):
+    level, label = "error", "🔴 진입 금지 · 실제 지지·저항 가격대 미확인"
+elif not is_manual_search and not continuous_rise:
+    level, label = "error", f"🔴 후보 제외 · 장중 지속상승 {continuous_rise_score}/10"
+elif not context_aligned:
+    level, label = "error", f"🔴 진입 금지 · 기초지수/시장({context.get('name')}) 동조 미확인"
+elif risk_reward < 1.5:
+    level, label = "error", f"🔴 진입 금지 · 손익비 {risk_reward:.2f} (최소 1.50)"
+elif repeat_state == "EXIT":
+    level, label = "error", repeat_label
+elif repeat_state == "TAKE_PROFIT":
+    level, label = "warning", repeat_label
+elif repeat_state in {"RANGE_TOO_NARROW", "RANGE_TOO_WIDE"}:
+    level, label = "warning", repeat_label
+elif sell_votes >= 3:
+    level, label = "error", f"🔴 진입 금지 · 매도/약세 기법 {sell_votes}개 감지"
+elif require_validation and not validated_signal:
+    level, label = "warning", "🟡 모의검증 중 · 실제 적중표본이 쌓이기 전 실전 신호 잠금"
+elif (
+    repeat_state in {"BUY_PULLBACK", "HOLD_OR_BREAKOUT"}
+    and buy_votes >= 4
+    and sell_votes <= 2
+):
+    level, label = "success", repeat_label
+elif weighted_score < 35 or weighted_buy < 55:
+    level, label = "warning", f"🟡 대기 · 장세가중 합의 {weighted_score:+.1f}점"
+elif buy_votes < 6 or sell_votes > 0:
+    level, label = "warning", f"🟡 대기 · 매수 합의 {buy_votes}/10 · 매도 경고 {sell_votes}/10"
+
+latest["entry_checks_passed"] = level == "success"
+
+
+# 상단 한 줄 행동지시 복원
+if not quality_passed:
+    action_class, action_title = "wait", "⚪ 시세 확인 중·주문 대기"
+    action_line = "현재가·분봉·호가 중 미수신 항목을 확인 중입니다."
+elif repeat_state == "BUY_PULLBACK" and level == "success":
+    action_class, action_title = "buy", "🟢 지금 매수 구간"
+    action_line = f"{fmt(repeat_buy)} 부근 분할매수 → 1차 {fmt(target1)}"
+elif repeat_state == "HOLD_OR_BREAKOUT" and level == "success":
+    action_class, action_title = "buy", "🟢 돌파 확인 후 매수"
+    action_line = f"현재가 지지 확인 → 1차 {fmt(target1)}"
+elif repeat_state == "TAKE_PROFIT":
+    action_class, action_title = "sell", "🟠 1차 목표 접근·분할매도"
+    action_line = f"실제 차트 저항 {fmt(target1)} 도달 구간 · 추격매수 금지"
+elif repeat_state == "EXIT":
+    action_class, action_title = "stop", "🔴 반복단타 종료·매도"
+    action_line = f"추세가 꺾였습니다. {fmt(repeat_stop)} 이탈 시 재진입하지 마세요."
+elif short_pullback:
+    action_class, action_title = "wait", "🟡 상승 추세 속 단기 조정·매수 대기"
+    action_line = f"{fmt(repeat_buy)} 지지 후 5분봉 재상승을 기다리세요."
+elif higher_trend:
+    action_class, action_title = "wait", "🔵 상승 방향 유지·매수 타점 대기"
+    action_line = f"{fmt(repeat_buy)} 지지 후 VWAP 회복 시만 진입하세요."
+elif repeat_state == "RANGE_TOO_NARROW":
+    action_class, action_title = "wait", f"⚪ 반복폭 부족 +{repeat_width:.2f}%"
+    action_line = "실제 지지→1차 저항 폭이 0.5% 미만입니다."
+elif repeat_state == "RANGE_TOO_WIDE":
+    action_class, action_title = "wait", f"🔵 반복폭 넓음 +{repeat_width:.2f}%"
+    action_line = "상승여력은 있지만 기본 0.5~1.5% 반복단타 후보 범위 밖입니다."
+else:
+    action_class, action_title = "wait", "🟡 지금은 대기"
+    action_line = f"{fmt(repeat_buy)} 지지 반등 또는 매수 합의를 기다리세요."
+
+st.markdown(
+    f'<div class="trade-action {action_class}">'
+    f'<h2>{action_title}</h2>'
+    f'<p><b>{action_line}</b></p>'
+    f'<p>손절·무효 기준: {fmt(repeat_stop)} · 확인된 반복폭: {repeat_width:.2f}%</p>'
+    f'</div>',
+    unsafe_allow_html=True,
+)
+
+if action_class in {"buy", "sell", "stop"}:
+    alert_key = f"signal_alert::{market}::{selected_ticker}::{action_class}"
+    last_alert = float(st.session_state.get(alert_key, 0) or 0)
+    if now - last_alert >= 180:
+        st.toast(f"{selected_ticker} · {action_title}")
+        st.session_state[alert_key] = now
+
+
+# 트레일링 스탑 표시 복원
+trailing_price = float(latest.get("trailing_stop_price", 0) or 0)
+if latest.get("trailing_stop_enabled") and trailing_price > 0:
+    st.caption(
+        f"상방 돌파 대응: 고점 추적 중 · 고점 대비 "
+        f"{float(latest.get('trailing_stop_percent', 0.5) or 0.5):.1f}% 하락 "
+        f"또는 {fmt(trailing_price)} 이탈 시 수익 보존 매도 알림"
+    )
+
+
+# 핵심 수치
+top = st.columns([1.4, 1, 1, 1, 1])
+top[0].metric(f"{latest.get('ticker')} · {latest.get('name')}", fmt(price), f"{change:+.2f}%")
+top[1].metric("VWAP", fmt(latest.get("vwap")))
+top[2].metric("단기 평균선(EMA9)", fmt(latest.get("ema9")))
+top[3].metric("평소 대비 거래량", f"{float(latest.get('rvol', 0) or 0):.1f}배")
+top[4].metric("하락위험", f"{int(latest.get('five_min_risk_score', 0) or 0)}점")
+
+status_cols = st.columns(4)
+status_cols[0].metric("데이터 검문", "통과" if quality_passed else "실패")
+status_cols[1].metric("현재 장세", regime_name)
+status_cols[2].metric(
+    f"기초지수 {context.get('name')}",
+    f"{float(context.get('change', 0) or 0):+.2f}%",
+    (
+        f"최근 5분 {float(context.get('intraday', 0) or 0):+.2f}%"
+        if context.get("confirmed")
+        else "분봉 미확인"
+    ),
+)
+status_cols[3].metric("예상수익÷예상손실", f"{risk_reward:.2f}배")
+st.caption(f"현재 적용 기법: {regime_method}")
+
+
+# 1차/2차 목표 전체 표시
+level_cols = st.columns(5)
+level_cols[0].metric("진입 기준가", fmt(latest.get("structural_entry")))
+level_cols[1].metric(
+    "1차 목표가",
+    fmt(target1),
+    f"{target1_pct:+.2f}%" if target1 > 0 else None,
+)
+level_cols[2].metric(
+    "2차 목표가",
+    fmt(target2) if target2 > 0 else "-",
+    f"{target2_pct:+.2f}%" if target2 > 0 else None,
+)
+level_cols[3].metric("확인된 지지선", fmt(latest.get("structural_support")))
+level_cols[4].metric("시나리오 무효·손절", fmt(latest.get("stop_loss")))
+
+st.caption(
+    f"1차 근거: {latest.get('target1_basis', latest.get('target_basis', '미확인'))} · "
+    f"2차 근거: {latest.get('target2_basis', '미확인')} · "
+    f"손절 근거: {latest.get('stop_basis', latest.get('level_plan_reason', '미확인'))}"
+)
+
+st.caption(
+    f"장중 지속상승 판정 {continuous_rise_score}/10 · "
+    f"5분 {'상승' if float(latest.get('trend_return_5m', 0) or 0) > 0 else '하락'} · "
+    f"15분 {'상승' if float(latest.get('trend_return_15m', 0) or 0) > 0 else '하락'} · "
+    f"30분 {'상승' if float(latest.get('trend_return_30m', 0) or 0) > 0 else '하락'}"
+)
+
+
+# 추가상승 배너
+extension_state = str(latest.get("upside_continuation_state", "NO_TARGET2"))
+extension_label = str(latest.get("upside_continuation_label", "⚪ 추가상승 미확인"))
+extension_score = int(latest.get("upside_continuation_score", 0) or 0)
+extension_pct = float(latest.get("additional_upside_after_target1", 0) or 0)
+
+if extension_state == "STRONG":
+    st.success(
+        f"{extension_label} · 근거 {extension_score}/10 · "
+        f"1차→2차 추가여력 +{extension_pct:.2f}%"
+    )
+elif extension_state == "WATCH":
+    st.warning(
+        f"{extension_label} · 근거 {extension_score}/10 · "
+        "1차 목표 돌파 시 거래량과 VWAP 유지를 확인하세요."
+    )
+elif extension_state == "LIMITED":
+    st.error(f"{extension_label} · 근거 {extension_score}/10")
+else:
+    st.info(extension_label)
+
+
+# 누락됐던 근거 메뉴 전부 복원
+with st.expander("장중 지속상승 판정 근거", expanded=False):
+    trend_rows = [
+        {"조건": key, "통과": "✅" if value else "❌"}
+        for key, value in (latest.get("continuous_rise_checks", {}) or {}).items()
+    ]
+    if trend_rows:
+        st.dataframe(pd.DataFrame(trend_rows), hide_index=True, use_container_width=True)
+    else:
+        st.info("지속상승 근거 계산값이 아직 없습니다.")
+
+with st.expander("다중 시간대 승인 · 일봉→60분→15분→5분→1분", expanded=False):
+    mtf_status = latest.get("mtf_status", {}) or {}
+    mtf_rows = [{"시간대 역할": key, "현재 판정": value} for key, value in mtf_status.items()]
+    if mtf_rows:
+        st.dataframe(pd.DataFrame(mtf_rows), hide_index=True, use_container_width=True)
+    else:
+        st.info("다중 시간대 계산값이 아직 없습니다.")
+
+    mtf_detail = latest.get("mtf_detail", {}) or {}
+    if mtf_detail:
+        st.caption(
+            " · ".join(
+                f"{minutes}분 {float(detail.get('return', 0) or 0):+.2f}%"
+                f"({'상승' if detail.get('bullish') else '하락' if detail.get('bearish') else '중립'})"
+                for minutes, detail in mtf_detail.items()
+            )
+        )
+
+with st.expander("추가상승 판정 근거", expanded=False):
+    extension_rows = [
+        {"조건": key, "충족": "✅" if value else "❌"}
+        for key, value in (latest.get("upside_continuation_checks", {}) or {}).items()
+    ]
+    if extension_rows:
+        st.dataframe(pd.DataFrame(extension_rows), hide_index=True, use_container_width=True)
+    else:
+        st.info("2차 목표 또는 추가상승 근거가 아직 형성되지 않았습니다.")
+
+
+# 추세 반복단타 섹션 복원
+st.subheader("추세 반복단타")
+repeat_reason = str(latest.get("repeat_scalp_reason", "실제 지지·저항 확인 대기"))
+repeat_message = (
+    f"{repeat_label} · 매수 기준 {fmt(latest.get('repeat_scalp_buy_level'))} · "
+    f"1차 매도 기준 {fmt(latest.get('repeat_scalp_sell_level'))} · "
+    f"반복폭 {repeat_width:.2f}% · {repeat_reason}"
+)
+
+if action_class == "buy":
+    st.success(f"{action_title} · {action_line}")
+elif action_class in {"sell", "stop"}:
+    st.error(f"{action_title} · {action_line}")
+else:
+    st.info(f"{action_title} · {action_line}")
+
+st.caption(f"세부 계산: {repeat_message}")
+
+with st.expander("추세 꺾임 판정 근거", expanded=repeat_state == "EXIT"):
+    reversal_rows = [
+        {"하락 전환 조건": key, "감지": "예" if value else "아니오"}
+        for key, value in (latest.get("repeat_scalp_reversal_checks", {}) or {}).items()
+    ]
+    if reversal_rows:
+        st.dataframe(pd.DataFrame(reversal_rows), hide_index=True, use_container_width=True)
+    else:
+        st.info("하락전환 근거 계산값이 아직 없습니다.")
+
+
+# 최종 판정 상세 복원
+with st.expander("최종 판정의 세부 차단·허용 근거", expanded=False):
+    getattr(st, level)(label)
+
+    if level == "success":
+        st.write(
+            f"진입: **{fmt(latest.get('structural_entry'))}** · "
+            f"1차 목표: **{fmt(target1)}** · "
+            f"2차 목표: **{fmt(target2) if target2 > 0 else '-'}** · "
+            f"손절: **{fmt(latest.get('stop_loss'))}**"
+        )
+    elif level == "error":
+        st.write(
+            latest.get(
+                "invalidation_reason",
+                latest.get(
+                    "level_plan_reason",
+                    "VWAP·이동평균·호가·구조 조건을 다시 확인하세요.",
+                ),
+            )
+        )
+    else:
+        st.write(
+            latest.get(
+                "entry_trigger",
+                f"{fmt(repeat_buy)} 지지와 VWAP 회복, 거래량 재증가를 기다리세요.",
+            )
+        )
+
+st.caption(f"한 줄 결론: {action_title} · {action_line}")
+
+
+# 기법 합의/검문 복원
+consensus_cols = st.columns(4)
+consensus_cols[0].metric("매수 기법", f"{buy_votes}/10")
+consensus_cols[1].metric("매도 기법", f"{sell_votes}/10")
+consensus_cols[2].metric("대기 기법", f"{wait_votes}/10")
+consensus_cols[3].metric(
+    "종합 매수 강도",
+    f"{weighted_score:+.1f}점",
+    f"매수 근거 비중 {weighted_buy:.1f}%",
+)
+
+with st.expander("매수·매도 기법별 판정 근거", expanded=False):
+    st.dataframe(pd.DataFrame(strategy_rows), hide_index=True, use_container_width=True)
+
+with st.expander("실시간 데이터 검문 내역", expanded=not quality_passed):
+    st.dataframe(pd.DataFrame(quality_rows), hide_index=True, use_container_width=True)
+
+
+# 5/10/20/30분 전망 카드 복원
+f5 = float(latest.get("forecast_5m", 0) or 0)
+f10 = float(latest.get("forecast_10m", 0) or 0)
+f20 = float(latest.get("forecast_20m", 0) or 0)
+f30 = float(latest.get("forecast_30m", 0) or 0)
+
+forecast_cols = st.columns(4)
+for column, minutes, forecast in zip(
+    forecast_cols,
+    (5, 10, 20, 30),
+    (f5, f10, f20, f30),
+):
+    direction = forecast_label(forecast)
+
+    if forecast >= 0.35:
+        grounded_price = fmt(target1)
+        basis = latest.get("target1_basis", "실제 차트 1차 저항")
+    elif forecast <= -0.35:
+        grounded_price = fmt(latest.get("structural_support"))
+        basis = latest.get("stop_basis", "실제 차트 지지")
+    else:
+        grounded_price = (
+            f"{fmt(latest.get('structural_support'))}<br>~ {fmt(target1)}"
+        )
+        basis = "확인된 지지·1차 저항 사이"
+
+    column.markdown(
+        f'<div class="forecast-card">'
+        f'<div class="title">{minutes}분 판정 · {direction}</div>'
+        f'<div class="price">{grounded_price}</div>'
+        f'<div class="basis">{basis}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+forecasts = (f5, f10, f20, f30)
+if level == "success" and all(value >= 0.35 for value in forecasts):
+    st.success("🚦 매수 전 조건 통과 · 5·10·20·30분 모두 상승 우세")
+elif any(value <= -0.35 for value in forecasts):
+    st.error("⛔ 단기 예상에 하락 위험 구간이 있습니다. 신규 진입을 보류하세요.")
+else:
+    st.warning("⏳ 시간대별 방향이 완전히 정렬되지 않았습니다. 진입을 기다리세요.")
+
+st.caption(
+    "1차·2차 목표 가격은 +1%/+2% 고정값이 아니라 실제 차트 저항/돌파 구조에서 계산합니다. "
+    "+1/+2/+3%는 자동검증 통계에서만 별도로 사용됩니다."
+)
+
+
+# 차트
+st.subheader("실시간 차트 분석 · 지지 / 1차 / 2차 목표")
+st.caption("5·15·60분으로 방향을 확인하고, 아래 1분봉에서 실제 지지·1차·2차 목표를 표시합니다.")
 render_chart(latest)
-with st.expander("추가상승 판정 근거"):
-    st.dataframe(pd.DataFrame([{"조건":k,"충족":"✅" if v else "❌"} for k,v in (latest.get("upside_continuation_checks",{}) or {}).items()]),hide_index=True,use_container_width=True)
-with st.expander("매수·매도 기법별 판정"):
-    st.dataframe(pd.DataFrame(strategy_rows),hide_index=True,use_container_width=True)
-with st.expander("실시간 데이터 검문",expanded=not quality_passed):
-    st.dataframe(pd.DataFrame(quality_rows),hide_index=True,use_container_width=True)
-with st.expander("진입 전 뉴스·공시 위험 확인"):
-    if st.button("뉴스·SEC·거래정지 확인",use_container_width=True):
-        try: st.session_state["scalp_risk_check"]=scanner().analyze_candidate(selected_row,mode)
-        except Exception as e: st.error(str(e))
-    checked=st.session_state.get("scalp_risk_check")
-    if checked and str(checked.get("ticker"))==selected_ticker: st.write(checked.get("news_summary","뉴스 확인 완료")); st.write("거래정지:",checked.get("halt_active",False))
 
-st.caption(f"화면 시각: {datetime.now(KST).strftime('%H:%M:%S')}")
+
+# 뉴스/공시 위험 메뉴 복원 — scalp_latest를 덮어쓰지 않음
+with st.expander("진입 전 뉴스·공시 위험을 지금 한 번 확인"):
+    if st.button("뉴스·SEC·거래정지 확인", use_container_width=True):
+        with st.spinner("위험자료 확인 중..."):
+            try:
+                checked = scanner().analyze_candidate(selected_row, mode)
+                st.session_state["scalp_risk_check"] = checked
+            except Exception as error:
+                st.error(str(error))
+
+    checked = st.session_state.get("scalp_risk_check")
+    if checked and str(checked.get("ticker")) == selected_ticker:
+        st.write(checked.get("news_summary", "뉴스 확인 완료"))
+        st.write(
+            "규제검증:",
+            checked.get("regulatory_checked", False),
+            "· 거래정지:",
+            checked.get("halt_active", False),
+        )
+
+
+# 자동 적중률 기록 메뉴 복원
+audit_records = (
+    update_prediction_audit(selected_ticker, price, latest, now)
+    if require_validation
+    else []
+)
+
+completed = []
+for record in audit_records:
+    if record["ticker"] != selected_ticker:
+        continue
+    for minutes in (5, 10, 20, 30):
+        if f"실제{minutes}분" in record:
+            completed.append({
+                "기준시각": record["기준시각"],
+                "구간": f"{minutes}분",
+                "예상(%)": record[f"예상{minutes}분"],
+                "실제(%)": record[f"실제{minutes}분"],
+                "방향 적중": "적중" if record[f"적중{minutes}분"] else "실패",
+            })
+
+with st.expander("자동 적중률 검증 기록", expanded=False):
+    stat_cols = st.columns(4)
+    for column, minutes in zip(stat_cols, (5, 10, 20, 30)):
+        stat = calibration[minutes]
+        column.metric(
+            f"{minutes}분 검증",
+            f"{stat['accuracy']:.1f}%",
+            f"표본 {stat['samples']}건 · 평균오차 {stat['mae']:.2f}%",
+        )
+
+    if completed:
+        execution_accuracy = (
+            sum(row["방향 적중"] == "적중" for row in completed)
+            / len(completed)
+            * 100
+        )
+        st.metric(
+            "이번 앱 기록 방향 적중률",
+            f"{execution_accuracy:.1f}%",
+            f"검증 {len(completed)}건",
+        )
+        st.dataframe(
+            pd.DataFrame(completed[-30:]),
+            hide_index=True,
+            use_container_width=True,
+        )
+    else:
+        st.info("신호를 자동 저장했습니다. 해당 시간 경과 후 실제 결과와 비교합니다.")
+
+
+st.caption(
+    f"마지막 정밀분석: {latest.get('updated_at', '-')} · "
+    f"화면 시각: {datetime.now(KST).strftime('%H:%M:%S')}"
+)
