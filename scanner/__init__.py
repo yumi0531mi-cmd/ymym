@@ -1,2 +1,1 @@
 """Hybrid intraday scanner package."""
-
