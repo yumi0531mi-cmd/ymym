@@ -262,6 +262,32 @@ def fmt(value):
     except Exception: return "-"
 
 
+def verdict_text(item: dict) -> tuple[str, str]:
+    """chart_verdict를 Streamlit 표시 문구와 레벨로 변환한다."""
+    verdict = str(item.get("chart_verdict", "WAIT") or "WAIT").upper()
+    entry_ok = bool(item.get("entry_checks_passed"))
+    if verdict == "BUY_READY" and entry_ok:
+        return "🟢 매수 검토", "success"
+    if verdict == "BUY_READY":
+        return "🟡 차트 매수 준비·위험확인 필요", "warning"
+    if verdict == "NO_ENTRY":
+        return "🔴 매수 금지·매도 검토", "error"
+    return "🟡 대기", "warning"
+
+
+def forecast_label(percent: float) -> str:
+    """예측 퍼센트를 화면용 방향 문구로 변환한다."""
+    try:
+        value = float(percent)
+    except (TypeError, ValueError, OverflowError):
+        return "데이터 부족"
+    if value >= 0.35:
+        return "상승 우세"
+    if value <= -0.35:
+        return "하락 위험"
+    return "횡보·불확실"
+
+
 def verified_us_change(quote:dict,fallback_price:float=0.0):
     price=float(quote.get("price",fallback_price) or fallback_price or 0)
     previous=float(quote.get("previous",quote.get("previous_close",quote.get("base",0))) or 0)
