@@ -333,57 +333,350 @@ def data_quality_gate(item:dict,market:str):
     return checks,all(bool(r["통과"]) for r in checks[:5]),spread
 
 
+
 def _dedupe_price_levels(levels:list[float],tol=0.08):
     result=[]
     for level in sorted(float(x) for x in levels if float(x or 0)>0):
-        if not result: result.append(level); continue
-        if abs(level/result[-1]-1)*100<=tol: result[-1]=max(result[-1],level)
-        else: result.append(level)
+        if not result:
+            result.append(level)
+            continue
+        if abs(level/result[-1]-1)*100<=tol:
+            result[-1]=max(result[-1],level)
+        else:
+            result.append(level)
     return result
 
 
+def _confirmed_swing_points(bars:list[dict], left:int=2, right:int=2) -> tuple[list[dict], list[dict]]:
+    """완성된 봉에서만 confirmed swing high/low를 찾는다.
+
+    오른쪽 봉이 형성된 뒤에만 확정하므로 현재 진행 중인 고점/저점을
+    지지·저항으로 미리 확정하지 않는다.
+    """
+    if not bars:
+        return [], []
+    size=len(bars)
+    if size < left + right + 1:
+        return [], []
+
+    highs=[]
+    lows=[]
+    for i in range(left, size-right):
+        h=float(bars[i].get("high",0) or 0)
+        l=float(bars[i].get("low",0) or 0)
+        if h<=0 or l<=0:
+            continue
+
+        left_high=max(float(bars[j].get("high",0) or 0) for j in range(i-left,i))
+        right_high=max(float(bars[j].get("high",0) or 0) for j in range(i+1,i+right+1))
+        left_low=min(float(bars[j].get("low",0) or 0) for j in range(i-left,i))
+        right_low=min(float(bars[j].get("low",0) or 0) for j in range(i+1,i+right+1))
+
+        if h >= left_high and h > right_high:
+            highs.append({"price":h,"index":i,"time":bars[i].get("time")})
+        if l <= left_low and l < right_low:
+            lows.append({"price":l,"index":i,"time":bars[i].get("time")})
+    return highs,lows
+
+
+def _nearest_level(levels:list[dict], price:float, side:str) -> dict|None:
+    valid=[]
+    for row in levels:
+        level=float(row.get("price",0) or 0)
+        if side=="below" and 0<level<price:
+            valid.append(row)
+        elif side=="above" and level>price:
+            valid.append(row)
+    if not valid:
+        return None
+    if side=="below":
+        return max(valid,key=lambda row:float(row.get("price",0) or 0))
+    return min(valid,key=lambda row:float(row.get("price",0) or 0))
+
+
+
+def _epoch_seconds(value) -> float:
+    """Timestamp/문자열을 비교 가능한 epoch seconds로 변환한다."""
+    if value is None:
+        return 0.0
+    try:
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(KST)
+        return float(ts.timestamp())
+    except Exception:
+        return 0.0
+
+
+def _meaningful_resistance_candidates(
+    price:float,
+    support:float,
+    five_highs:list[dict],
+    fifteen_highs:list[dict],
+    hourly_highs:list[dict],
+) -> list[dict]:
+    """미세 1분봉 저항을 버리고 5/15/60분 confirmed 저항만 정렬한다."""
+    rows=[]
+    for timeframe,points,priority in (
+        ("5분",five_highs,1),
+        ("15분",fifteen_highs,2),
+        ("60분",hourly_highs,3),
+    ):
+        for point in points:
+            level=float(point.get("price",0) or 0)
+            if level<=price or support<=0:
+                continue
+            width=(level/support-1)*100
+            # 반복단타의 최소 실전 폭 0.5%도 안 되는 저항은 '미세저항'으로
+            # 분류하고 1차 목표가로 사용하지 않는다.
+            if width < 0.50:
+                continue
+            rows.append({
+                "price":level,
+                "timeframe":timeframe,
+                "priority":priority,
+                "range_from_support":width,
+                "time":point.get("time"),
+            })
+
+    rows=sorted(rows,key=lambda row:(float(row["price"]),-int(row["priority"])))
+    dedup=[]
+    for row in rows:
+        if not dedup:
+            dedup.append(row)
+            continue
+        gap=abs(float(row["price"])/float(dedup[-1]["price"])-1)*100
+        if gap<=0.10:
+            # 비슷한 가격이면 더 큰 시간대(60 > 15 > 5)를 신뢰한다.
+            if int(row["priority"])>int(dedup[-1]["priority"]):
+                dedup[-1]=row
+        else:
+            dedup.append(row)
+    return dedup
+
+
 def structural_trade_plan(item:dict,market:str):
+    """60/15분 큰 구조 → 5분 confirmed swing → 1분 실행 순서로 가격대를 만든다."""
     price=float(item.get("price",0) or 0)
-    highs=[float(x) for x in (item.get("chart_high_1m",[]) or []) if float(x or 0)>0]
-    lows=[float(x) for x in (item.get("chart_low_1m",[]) or []) if float(x or 0)>0]
+    one_highs=[float(x) for x in (item.get("chart_high_1m",[]) or []) if float(x or 0)>0]
+    one_lows=[float(x) for x in (item.get("chart_low_1m",[]) or []) if float(x or 0)>0]
     closes=[float(x) for x in (item.get("chart_close_1m",[]) or []) if float(x or 0)>0]
     volumes=[float(x or 0) for x in (item.get("chart_volume_1m",[]) or [])]
-    if price<=0 or len(highs)<12 or len(lows)<12 or len(closes)<12:
-        item.update(level_plan_valid=False,level_plan_reason="분봉 고가·저가 자료 부족"); return item
-    vwap=float(item.get("vwap",0) or 0); ema9=float(item.get("ema9",0) or 0); ema20=float(item.get("ema20",0) or 0)
-    ret5=(closes[-1]/closes[-6]-1)*100 if len(closes)>=6 else 0; ret15=(closes[-1]/closes[-16]-1)*100 if len(closes)>=16 else 0; ret30=(closes[-1]/closes[-31]-1)*100 if len(closes)>=31 else 0
-    higher_high=len(highs)>=12 and max(highs[-6:])>max(highs[-12:-6]); higher_low=len(lows)>=12 and min(lows[-6:])>min(lows[-12:-6])
+
+    if price<=0 or len(closes)<30 or len(one_highs)<30 or len(one_lows)<30:
+        item.update(
+            level_plan_valid=False,
+            level_plan_reason="큰 구조 계산에 필요한 1분봉 자료가 부족함",
+        )
+        return item
+
+    vwap=float(item.get("vwap",0) or 0)
+    ema9=float(item.get("ema9",0) or 0)
+    ema20=float(item.get("ema20",0) or 0)
+
+    # 큰 구조는 완성된 5/15/60분봉으로만 계산한다.
+    bars5=_aggregate_ohlcv(item,5,market)
+    bars15=_aggregate_ohlcv(item,15,market)
+    bars60=_aggregate_ohlcv(item,60,market)
+
+    if len(bars5)<5:
+        item.update(
+            level_plan_valid=False,
+            level_plan_reason="완성된 5분봉이 부족해 confirmed Swing을 확정할 수 없음",
+        )
+        return item
+
+    swing5_h,swing5_l=_confirmed_swing_points(bars5,2,2)
+    # 15/60분은 당일 데이터가 짧을 수 있어 최소 3개 봉이면 1-1 pivot을 사용한다.
+    swing15_h,swing15_l=_confirmed_swing_points(
+        bars15,1 if len(bars15)<5 else 2,1 if len(bars15)<5 else 2
+    )
+    swing60_h,swing60_l=_confirmed_swing_points(bars60,1,1)
+
+    support5=_nearest_level(swing5_l,price,"below")
+    support15=_nearest_level(swing15_l,price,"below")
+    support60=_nearest_level(swing60_l,price,"below")
+    resistance5=_nearest_level(swing5_h,price,"above")
+    resistance15=_nearest_level(swing15_h,price,"above")
+    resistance60=_nearest_level(swing60_h,price,"above")
+
+    if not support5:
+        item.update(
+            level_plan_valid=False,
+            level_plan_reason="현재가 아래 confirmed 5분 Swing 지지가 아직 없음",
+            confirmed_swing_5m_count=len(swing5_h)+len(swing5_l),
+        )
+        return item
+
+    execution_support=float(support5["price"])
+    macro_support_candidates=[
+        ("15분",float(support15["price"])) if support15 else None,
+        ("60분",float(support60["price"])) if support60 else None,
+    ]
+    macro_support_candidates=[row for row in macro_support_candidates if row and row[1]>0]
+    macro_support=max(macro_support_candidates,key=lambda row:row[1]) if macro_support_candidates else None
+
+    target_rows=_meaningful_resistance_candidates(
+        price,execution_support,swing5_h,swing15_h,swing60_h
+    )
+    if not target_rows:
+        item.update(
+            level_plan_valid=False,
+            level_plan_reason=(
+                "현재가 위 5/15/60분 confirmed 저항 중 "
+                "지지 대비 0.5% 이상인 실제 목표가가 없음"
+            ),
+            structure_support_5m=execution_support,
+            structure_support_15m=float(support15["price"]) if support15 else 0.0,
+            structure_support_60m=float(support60["price"]) if support60 else 0.0,
+            confirmed_swing_5m_count=len(swing5_h)+len(swing5_l),
+        )
+        return item
+
+    t1_row=target_rows[0]
+    t2_row=target_rows[1] if len(target_rows)>=2 else None
+    t1=float(t1_row["price"])
+    t2=float(t2_row["price"]) if t2_row else 0.0
+
+    # 2차는 1차와 사실상 같은 가격이면 인정하지 않는다.
+    if t2>0 and (t2/t1-1)*100<0.20:
+        t2=0.0
+        t2_row=None
+
+    risk=price-execution_support
+    reward1=t1-price
+    reward2=t2-price if t2>price else 0.0
+    rr1=reward1/risk if risk>0 else 0.0
+    rr2=reward2/risk if risk>0 and reward2>0 else 0.0
+    t1pct=(t1/price-1)*100
+    t2pct=(t2/price-1)*100 if t2>price else 0.0
+    repeat_width=(t1/execution_support-1)*100 if t1>execution_support>0 else 0.0
+
+    # 기존 장중 상승 점수는 유지하되 1분 미세 저항과 분리한다.
+    ret5=(closes[-1]/closes[-6]-1)*100 if len(closes)>=6 else 0.0
+    ret15=(closes[-1]/closes[-16]-1)*100 if len(closes)>=16 else 0.0
+    ret30=(closes[-1]/closes[-31]-1)*100 if len(closes)>=31 else 0.0
+    higher_high=len(one_highs)>=12 and max(one_highs[-6:])>max(one_highs[-12:-6])
+    higher_low=len(one_lows)>=12 and min(one_lows[-6:])>min(one_lows[-12:-6])
+
     up=down=0.0
     for i in range(max(1,len(closes)-20),len(closes)):
-        vol=volumes[i] if i<len(volumes) else 0
-        if closes[i]>closes[i-1]: up+=vol
-        elif closes[i]<closes[i-1]: down+=vol
-    volume_dom=up/down if down>0 else (2.0 if up>0 else 0.0); vgap=(price/vwap-1)*100 if vwap>0 else 99
-    checks={"VWAP 위":price>vwap>0,"EMA 정배열":price>=ema9>ema20>0,"5분 상승":ret5>0,"15분 상승":ret15>0,"30분 상승":ret30>0,"고점 상승":higher_high,"저점 상승":higher_low,"상승봉 거래량 우세":volume_dom>=1.05,"VWAP 과대이격 아님":0<=vgap<=(2.5 if market=="국내" else 3.0),"최근 고가권 유지":price>=max(highs[-30:])*0.97}
+        vol=volumes[i] if i<len(volumes) else 0.0
+        if closes[i]>closes[i-1]:
+            up+=vol
+        elif closes[i]<closes[i-1]:
+            down+=vol
+    volume_dom=up/down if down>0 else (2.0 if up>0 else 0.0)
+    vgap=(price/vwap-1)*100 if vwap>0 else 99.0
+
+    checks={
+        "VWAP 위":price>vwap>0,
+        "EMA 정배열":price>=ema9>ema20>0,
+        "5분 상승":ret5>0,
+        "15분 상승":ret15>0,
+        "30분 상승":ret30>0,
+        "고점 상승":higher_high,
+        "저점 상승":higher_low,
+        "상승봉 거래량 우세":volume_dom>=1.05,
+        "VWAP 과대이격 아님":0<=vgap<=(2.5 if market=="국내" else 3.0),
+        "confirmed 5분 Swing 존재":bool(swing5_h and swing5_l),
+    }
     trend_score=sum(map(bool,checks.values()))
-    swing_highs=[highs[i] for i in range(2,len(highs)-2) if highs[i]>=max(highs[i-2:i]) and highs[i]>=max(highs[i+1:i+3])]
-    resistances=_dedupe_price_levels(swing_highs); above=[x for x in resistances if x>price]
-    swing_lows=[lows[i] for i in range(2,len(lows)-2) if lows[i]<=min(lows[i-2:i]) and lows[i]<=min(lows[i+1:i+3])]
-    supports=[(x,"최근 실제 1분봉 스윙 저점") for x in swing_lows if 0<x<price]
-    if 0<vwap<price: supports.append((vwap,"VWAP"))
-    if 0<ema9<price: supports.append((ema9,"EMA9"))
-    if 0<ema20<price: supports.append((ema20,"EMA20"))
-    if not supports: item.update(level_plan_valid=False,level_plan_reason="현재가 아래 실제 지지선 없음"); return item
-    support,support_reason=max(supports,key=lambda x:x[0])
-    lookback=min(30,len(highs)); box_high=max(highs[-lookback:]); box_low=min(lows[-lookback:]); box_width=max(0,box_high-box_low); prior_high=max(highs[-lookback:-1]) if lookback>=2 else box_high; breakout=price>prior_high>0
-    t1=t2=0.0; b1=b2=""
-    if above:
-        t1=above[0]; b1="현재가 위 가장 가까운 실제 1분봉 스윙 저항"
-        if len(above)>=2: t2=above[1]; b2="1차 위 다음 실제 1분봉 스윙 저항"
-        elif box_width>0 and trend_score>=7: t2=t1+box_width; b2="다음 저항 미형성 · 최근 실제 30분 박스폭 투영"
-    elif breakout and box_width>0:
-        t1=prior_high+box_width; t2=t1+box_width; b1="기존 고점 돌파 · 최근 실제 박스폭 1회 투영"; b2="돌파 유지 시 실제 박스폭 2회 투영"
-    if t1<=price: item.update(level_plan_valid=False,level_plan_reason="현재가 위 차트 기반 1차 목표 미확인"); return item
-    if t2<=t1: t2=0.0
-    risk=price-support; reward1=t1-price; reward2=t2-price if t2>price else 0
-    rr1=reward1/risk if risk>0 else 0; rr2=reward2/risk if risk>0 and reward2>0 else 0
-    t1pct=(t1/price-1)*100; t2pct=(t2/price-1)*100 if t2>price else 0; repeat_width=(t1/support-1)*100 if t1>support>0 else 0
-    item.update(continuous_rise=trend_score>=7 and ret15>0 and ret30>0,continuous_rise_score=trend_score,continuous_rise_checks=checks,trend_return_5m=ret5,trend_return_15m=ret15,trend_return_30m=ret30,up_down_volume_ratio=volume_dom,structural_entry=price,structural_support=support,stop_loss=support,structural_target=t1,structural_target1=t1,structural_target2=t2,target1_upside_percent=t1pct,target2_upside_percent=t2pct,risk_reward=rr1,risk_reward_target1=rr1,risk_reward_target2=rr2,level_plan_valid=risk>0 and reward1>0,target_basis=b1,target1_basis=b1,target2_basis=b2,stop_basis=f"{support_reason} 이탈 시 상승 시나리오 무효",level_plan_reason=f"1차 {fmt(t1)} ({t1pct:+.2f}%) / 2차 {fmt(t2) if t2 else '-'} / 지지 {fmt(support)}",chart_resistance_levels=resistances,chart_box_high=box_high,chart_box_low=box_low,chart_box_width=box_width,breakout_active=breakout,repeat_scalp_range_percent=repeat_width,repeat_scalp_preferred_range=0.50<=repeat_width<=1.50)
+
+    macro_support_price=float(macro_support[1]) if macro_support else 0.0
+    macro_support_tf=str(macro_support[0]) if macro_support else ""
+    macro_resistance_candidates=[
+        ("15분",float(resistance15["price"])) if resistance15 else None,
+        ("60분",float(resistance60["price"])) if resistance60 else None,
+    ]
+    macro_resistance_candidates=[
+        row for row in macro_resistance_candidates
+        if row and row[1]>price
+    ]
+    macro_resistance=min(
+        macro_resistance_candidates,key=lambda row:row[1]
+    ) if macro_resistance_candidates else None
+
+    target1_basis=(
+        f"{t1_row['timeframe']} confirmed Swing 저항 "
+        f"(지지→저항 실제폭 {repeat_width:.2f}%)"
+    )
+    target2_basis=(
+        f"{t2_row['timeframe']} confirmed Swing/큰 구조 저항"
+        if t2_row else
+        "1차 위 confirmed 15/60분 저항 미확인"
+    )
+    stop_basis="confirmed 5분 Swing 지지 이탈 시 단기 반복 시나리오 무효"
+    if macro_support:
+        stop_basis+=f" · 큰 구조 {macro_support_tf} 지지 {fmt(macro_support_price)} 별도 감시"
+
+    item.update(
+        continuous_rise=trend_score>=7 and ret15>0 and ret30>0,
+        continuous_rise_score=trend_score,
+        continuous_rise_checks=checks,
+        trend_return_5m=ret5,
+        trend_return_15m=ret15,
+        trend_return_30m=ret30,
+        up_down_volume_ratio=volume_dom,
+
+        # 실행 가격대
+        structural_entry=price,
+        structural_support=execution_support,
+        stop_loss=execution_support,
+        structural_target=t1,
+        structural_target1=t1,
+        structural_target2=t2,
+        target1_upside_percent=t1pct,
+        target2_upside_percent=t2pct,
+        risk_reward=rr1,
+        risk_reward_target1=rr1,
+        risk_reward_target2=rr2,
+        level_plan_valid=risk>0 and reward1>0,
+
+        # 근거
+        target_basis=target1_basis,
+        target1_basis=target1_basis,
+        target2_basis=target2_basis,
+        stop_basis=stop_basis,
+        level_plan_reason=(
+            f"5분 confirmed 지지 {fmt(execution_support)} → "
+            f"1차 {fmt(t1)} ({repeat_width:.2f}% Swing) → "
+            f"2차 {fmt(t2) if t2 else '-'}"
+        ),
+
+        # 시간대별 큰 구조
+        structure_support_5m=execution_support,
+        structure_support_15m=float(support15["price"]) if support15 else 0.0,
+        structure_support_60m=float(support60["price"]) if support60 else 0.0,
+        structure_resistance_5m=float(resistance5["price"]) if resistance5 else 0.0,
+        structure_resistance_15m=float(resistance15["price"]) if resistance15 else 0.0,
+        structure_resistance_60m=float(resistance60["price"]) if resistance60 else 0.0,
+        macro_support=macro_support_price,
+        macro_support_timeframe=macro_support_tf,
+        macro_resistance=float(macro_resistance[1]) if macro_resistance else 0.0,
+        macro_resistance_timeframe=str(macro_resistance[0]) if macro_resistance else "",
+        target1_timeframe=str(t1_row["timeframe"]),
+        target2_timeframe=str(t2_row["timeframe"]) if t2_row else "",
+        structure_support_5m_time=_epoch_seconds(support5.get("time")),
+        target1_confirmed_time=_epoch_seconds(t1_row.get("time")),
+        target2_confirmed_time=_epoch_seconds(t2_row.get("time")) if t2_row else 0.0,
+        confirmed_swing_signature=(
+            f"{round(execution_support,8)}|{round(t1,8)}|"
+            f"{int(_epoch_seconds(support5.get('time')))}|{int(_epoch_seconds(t1_row.get('time')))}"
+        ),
+        confirmed_swing_5m_count=len(swing5_h)+len(swing5_l),
+        confirmed_swing_15m_count=len(swing15_h)+len(swing15_l),
+        confirmed_swing_60m_count=len(swing60_h)+len(swing60_l),
+
+        # 후보 필터용 실제 Swing 폭
+        repeat_scalp_range_percent=repeat_width,
+        repeat_scalp_preferred_range=0.50<=repeat_width<=1.50,
+
+        # 디버그/표시용 수준
+        chart_resistance_levels=[float(row["price"]) for row in target_rows],
+        chart_support_levels_5m=[float(row["price"]) for row in swing5_l],
+    )
+    item["structural_hard_stop"] = _structural_hard_stop(item)
     return item
 
 
@@ -561,6 +854,323 @@ def latest_entry_candidates(market:str,minimum_score:float,limit:int=5):
     return sorted(out,key=lambda x:x["rank"],reverse=True)[:limit]
 
 
+
+CYCLE_COOLDOWN_SECONDS = 180
+HARD_KILL_SECONDS = 900
+
+
+def _cycle_key(market: str, ticker: str) -> str:
+    return f"trade_cycle::{market}::{ticker}"
+
+
+def _empty_cycle() -> dict:
+    return {
+        "state": "IDLE",
+        "entry_price": 0.0,
+        "target1": 0.0,
+        "target2": 0.0,
+        "soft_stop": 0.0,
+        "hard_stop": 0.0,
+        "started_at": 0.0,
+        "closed_at": 0.0,
+        "target1_hit": False,
+        "target2_hit": False,
+        "soft_breach_count": 0,
+        "breakdown_state": "NORMAL",
+        "exit_reason": "",
+        "cooldown_until": 0.0,
+        "hard_kill_until": 0.0,
+        "cycle_no": 0,
+        "last_swing_signature": "",
+        "last_closed_at": 0.0,
+        "entry_structure": {},
+    }
+
+
+def _structural_hard_stop(item: dict) -> float:
+    """Soft Stop 아래의 다음 confirmed 큰 지지를 Hard Stop으로 선택한다."""
+    soft = float(item.get("structural_support", 0) or 0)
+    candidates = []
+    for key in (
+        "structure_support_15m",
+        "structure_support_60m",
+        "macro_support",
+    ):
+        value = float(item.get(key, 0) or 0)
+        if value > 0 and (soft <= 0 or value < soft):
+            candidates.append(value)
+
+    # 5분 confirmed 지지 목록 중 현재 Soft Stop 아래의 다음 지지도 허용.
+    for value in item.get("chart_support_levels_5m", []) or []:
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if value > 0 and (soft <= 0 or value < soft):
+            candidates.append(value)
+
+    if candidates:
+        return max(candidates)
+
+    # 아래 큰 지지가 아직 형성되지 않았다면 Hard Stop을 임의 퍼센트로 만들지 않는다.
+    # 이 경우 Soft Stop만 표시하고 Hard Stop 미확인으로 둔다.
+    return 0.0
+
+
+def start_trade_cycle(
+    item: dict,
+    market: str,
+    ticker: str,
+    actual_entry_price: float,
+    now_ts: float,
+    prior_cycle: dict | None = None,
+) -> dict:
+    """실제 매수 시점의 계획을 고정한다. 이후 live 구조가 바뀌어도 이 값은 유지된다."""
+    target1 = float(item.get("structural_target1", item.get("structural_target", 0)) or 0)
+    target2 = float(item.get("structural_target2", 0) or 0)
+    soft_stop = float(item.get("structural_support", 0) or 0)
+    hard_stop = _structural_hard_stop(item)
+
+    if actual_entry_price <= 0:
+        raise ValueError("실제 진입가가 0 이하입니다.")
+    if target1 <= actual_entry_price:
+        raise ValueError("1차 목표가가 실제 진입가보다 높지 않아 Cycle을 시작할 수 없습니다.")
+    if soft_stop <= 0 or soft_stop >= actual_entry_price:
+        raise ValueError("Soft Stop으로 사용할 confirmed 지지가 진입가 아래에 없습니다.")
+    if hard_stop <= 0 or hard_stop >= soft_stop:
+        raise ValueError("Soft Stop 아래 confirmed 큰 구조 Hard Stop이 아직 없습니다.")
+
+    net_swing_percent = (target1 / actual_entry_price - 1) * 100
+    actual_risk_reward = (
+        (target1 - actual_entry_price) / (actual_entry_price - soft_stop)
+        if actual_entry_price > soft_stop
+        else 0.0
+    )
+    if net_swing_percent < 0.50:
+        raise ValueError(
+            f"실제 체결가 기준 1차 순수 목표여력이 {net_swing_percent:.2f}%로 0.5% 미만입니다."
+        )
+    if actual_risk_reward < 1.50:
+        raise ValueError(
+            f"실제 체결가 기준 손익비가 {actual_risk_reward:.2f}로 1.50 미만입니다."
+        )
+
+    prior_cycle = prior_cycle or _empty_cycle()
+
+    current_signature = str(item.get("confirmed_swing_signature", "") or "")
+    support_confirmed_at = float(item.get("structure_support_5m_time", 0) or 0)
+    last_signature = str(prior_cycle.get("last_swing_signature", "") or "")
+    last_closed_at = float(prior_cycle.get("last_closed_at", 0) or 0)
+
+    # 첫 Cycle이 아닌 재매수는 반드시 '새로 확정된 5분 Swing 저점'이 필요하다.
+    # Cooldown 시간만 지났다고 같은 옛 지지/저항을 재사용하지 않는다.
+    if last_closed_at > 0:
+        if not current_signature:
+            raise ValueError("새 confirmed Swing 식별값이 없어 재매수할 수 없습니다.")
+        if current_signature == last_signature:
+            raise ValueError("이전 Cycle과 같은 confirmed Swing이라 재매수할 수 없습니다.")
+        if support_confirmed_at <= last_closed_at:
+            raise ValueError("이전 청산 후 새로 확정된 5분 Swing 지지가 아직 없습니다.")
+
+    if float(prior_cycle.get("hard_kill_until", 0) or 0) > now_ts:
+        raise ValueError("HARD KILL 시간 중이라 새 Cycle을 시작할 수 없습니다.")
+    if float(prior_cycle.get("cooldown_until", 0) or 0) > now_ts:
+        raise ValueError("Cooldown 시간 중이라 새 Cycle을 시작할 수 없습니다.")
+
+    cycle_no = int(prior_cycle.get("cycle_no", 0) or 0) + 1
+
+    return {
+        "state": "OPEN",
+        "entry_price": float(actual_entry_price),
+        "target1": target1,
+        "target2": target2 if target2 > target1 else 0.0,
+        "soft_stop": soft_stop,
+        "hard_stop": hard_stop,
+        "started_at": float(now_ts),
+        "closed_at": 0.0,
+        "target1_hit": False,
+        "target2_hit": False,
+        "soft_breach_count": 0,
+        "breakdown_state": "NORMAL",
+        "exit_reason": "",
+        "cooldown_until": 0.0,
+        "hard_kill_until": float(prior_cycle.get("hard_kill_until", 0) or 0),
+        "cycle_no": cycle_no,
+        "last_swing_signature": last_signature,
+        "last_closed_at": last_closed_at,
+        "net_swing_percent": net_swing_percent,
+        "actual_risk_reward": actual_risk_reward,
+        "entry_structure": {
+            "repeat_width": float(item.get("repeat_scalp_range_percent", 0) or 0),
+            "target1_timeframe": str(item.get("target1_timeframe", "")),
+            "target2_timeframe": str(item.get("target2_timeframe", "")),
+            "support_5m": float(item.get("structure_support_5m", 0) or 0),
+            "support_15m": float(item.get("structure_support_15m", 0) or 0),
+            "support_60m": float(item.get("structure_support_60m", 0) or 0),
+            "macro_resistance": float(item.get("macro_resistance", 0) or 0),
+            "confirmed_swing_signature": current_signature,
+            "support_confirmed_at": support_confirmed_at,
+            "target1_confirmed_at": float(item.get("target1_confirmed_time", 0) or 0),
+        },
+    }
+
+
+def classify_cycle_breakdown(cycle: dict, live_item: dict) -> tuple[str, dict]:
+    """Soft Stop 이탈을 SHAKEOUT과 REAL_BREAKDOWN으로 분리한다."""
+    if cycle.get("state") not in {"OPEN", "TARGET1_HIT"}:
+        return "NORMAL", {}
+
+    price = float(live_item.get("price", 0) or 0)
+    soft = float(cycle.get("soft_stop", 0) or 0)
+    hard = float(cycle.get("hard_stop", 0) or 0)
+    vwap = float(live_item.get("vwap", 0) or 0)
+    ema9 = float(live_item.get("ema9", 0) or 0)
+    ema20 = float(live_item.get("ema20", 0) or 0)
+    reversal_score = int(live_item.get("repeat_scalp_reversal_score", 0) or 0)
+    mtf_exit = bool(live_item.get("mtf_exit"))
+
+    below_soft = soft > 0 and price < soft
+    below_hard = hard > 0 and price <= hard
+    below_vwap = vwap > 0 and price < vwap
+    ema_bearish = ema20 > 0 and ema9 < ema20
+
+    evidence = {
+        "Soft Stop 이탈": below_soft,
+        "Hard Stop 이탈": below_hard,
+        "VWAP 아래": below_vwap,
+        "EMA 하락정렬": ema_bearish,
+        "하락전환 근거 3개 이상": reversal_score >= 3,
+        "상위 시간대 EXIT": mtf_exit,
+    }
+
+    if below_hard:
+        return "HARD_EXIT", evidence
+
+    if below_soft:
+        # 한두 번의 미세 이탈만으로 바로 붕괴로 확정하지 않는다.
+        # 상위 시간대/EMA/VWAP/하락근거가 함께 깨질 때 REAL_BREAKDOWN.
+        bearish_confirmations = sum(
+            bool(x)
+            for x in (
+                below_vwap,
+                ema_bearish,
+                reversal_score >= 3,
+                mtf_exit,
+            )
+        )
+        if int(cycle.get("soft_breach_count", 0) or 0) >= 2 and bearish_confirmations >= 2:
+            return "REAL_BREAKDOWN", evidence
+        return "SHAKEOUT", evidence
+
+    return "NORMAL", evidence
+
+
+def update_trade_cycle(cycle: dict, live_item: dict, now_ts: float) -> dict:
+    """실시간 시세로 Cycle 상태만 갱신한다. 고정 진입/목표/손절 가격은 변경하지 않는다."""
+    cycle = dict(cycle or _empty_cycle())
+    if cycle.get("state") not in {"OPEN", "TARGET1_HIT"}:
+        return cycle
+
+    price = float(live_item.get("price", 0) or 0)
+    target1 = float(cycle.get("target1", 0) or 0)
+    target2 = float(cycle.get("target2", 0) or 0)
+    soft = float(cycle.get("soft_stop", 0) or 0)
+
+    if target1 > 0 and price >= target1:
+        cycle["target1_hit"] = True
+        cycle["state"] = "TARGET1_HIT"
+
+    if target2 > 0 and price >= target2:
+        cycle["target2_hit"] = True
+        cycle["state"] = "EXITED"
+        cycle["closed_at"] = now_ts
+        cycle["last_closed_at"] = now_ts
+        cycle["last_swing_signature"] = str(
+            (cycle.get("entry_structure", {}) or {}).get("confirmed_swing_signature", "") or ""
+        )
+        cycle["exit_reason"] = "TARGET2_HIT"
+        cycle["cooldown_until"] = now_ts + CYCLE_COOLDOWN_SECONDS
+        return cycle
+
+    if soft > 0 and price < soft:
+        cycle["soft_breach_count"] = int(cycle.get("soft_breach_count", 0) or 0) + 1
+    else:
+        cycle["soft_breach_count"] = 0
+
+    breakdown_state, evidence = classify_cycle_breakdown(cycle, live_item)
+    cycle["breakdown_state"] = breakdown_state
+    cycle["breakdown_evidence"] = evidence
+
+    if breakdown_state == "HARD_EXIT":
+        cycle["state"] = "EXITED"
+        cycle["closed_at"] = now_ts
+        cycle["last_closed_at"] = now_ts
+        cycle["last_swing_signature"] = str(
+            (cycle.get("entry_structure", {}) or {}).get("confirmed_swing_signature", "") or ""
+        )
+        cycle["exit_reason"] = "HARD_EXIT"
+        cycle["cooldown_until"] = now_ts + CYCLE_COOLDOWN_SECONDS
+        cycle["hard_kill_until"] = now_ts + HARD_KILL_SECONDS
+    elif breakdown_state == "REAL_BREAKDOWN":
+        cycle["state"] = "EXITED"
+        cycle["closed_at"] = now_ts
+        cycle["last_closed_at"] = now_ts
+        cycle["last_swing_signature"] = str(
+            (cycle.get("entry_structure", {}) or {}).get("confirmed_swing_signature", "") or ""
+        )
+        cycle["exit_reason"] = "REAL_BREAKDOWN"
+        cycle["cooldown_until"] = now_ts + CYCLE_COOLDOWN_SECONDS
+
+    return cycle
+
+
+def close_trade_cycle(cycle: dict, now_ts: float, reason: str = "MANUAL_EXIT") -> dict:
+    cycle = dict(cycle or _empty_cycle())
+    cycle["state"] = "EXITED"
+    cycle["closed_at"] = now_ts
+    cycle["last_closed_at"] = now_ts
+    cycle["last_swing_signature"] = str(
+        (cycle.get("entry_structure", {}) or {}).get("confirmed_swing_signature", "") or ""
+    )
+    cycle["exit_reason"] = reason
+    cycle["cooldown_until"] = now_ts + CYCLE_COOLDOWN_SECONDS
+    return cycle
+
+
+def reset_trade_cycle(cycle: dict, now_ts: float) -> dict:
+    """종료된 Cycle을 IDLE로 돌리되 Cooldown/Hard Kill과 회차는 유지한다."""
+    old = dict(cycle or _empty_cycle())
+    fresh = _empty_cycle()
+    fresh["cycle_no"] = int(old.get("cycle_no", 0) or 0)
+    fresh["last_swing_signature"] = str(old.get("last_swing_signature", "") or "")
+    fresh["last_closed_at"] = float(old.get("last_closed_at", 0) or 0)
+    fresh["cooldown_until"] = float(old.get("cooldown_until", 0) or 0)
+    fresh["hard_kill_until"] = float(old.get("hard_kill_until", 0) or 0)
+    if fresh["hard_kill_until"] > now_ts:
+        fresh["state"] = "HARD_KILL"
+    elif fresh["cooldown_until"] > now_ts:
+        fresh["state"] = "COOLDOWN"
+    return fresh
+
+
+def cycle_status_text(cycle: dict, now_ts: float) -> str:
+    state = str(cycle.get("state", "IDLE"))
+    if state == "HARD_KILL":
+        remain = max(0, int(float(cycle.get("hard_kill_until", 0) or 0) - now_ts))
+        return f"HARD KILL · 재진입 금지 {remain//60}분 {remain%60}초"
+    if state == "COOLDOWN":
+        remain = max(0, int(float(cycle.get("cooldown_until", 0) or 0) - now_ts))
+        return f"Cooldown · 재매수 대기 {remain//60}분 {remain%60}초"
+    if state == "OPEN":
+        return f"보유 Cycle #{int(cycle.get('cycle_no',0) or 0)}"
+    if state == "TARGET1_HIT":
+        return f"1차 목표 도달 · Cycle #{int(cycle.get('cycle_no',0) or 0)}"
+    if state == "EXITED":
+        return f"Cycle 종료 · {cycle.get('exit_reason','')}"
+    return "진입 전 · 새 Cycle 대기"
+
+
+
 def precise_analysis(row:dict,mode:str):
     raw=scanner().analyze(dict(row),mode); item=apply_mode_policy(finalize_trade_item(raw),mode); market="국내" if mode.startswith("국내") else "미국"
     for _ in range(2):
@@ -599,9 +1209,12 @@ def render_chart(item:dict):
     if n<=0: st.info("1분봉 수집 중"); return
     df=pd.DataFrame({"시간":pd.to_datetime(times[:n],errors="coerce"),"시가":opens[:n],"고가":highs[:n],"저가":lows[:n],"종가":closes[:n],"VWAP":vw[:n],"EMA9":e9[:n],"EMA20":e20[:n],"신호":sig[:n]}).dropna(subset=["시간"]); df["색상"]=df.apply(lambda r:"상승" if r["종가"]>=r["시가"] else "하락",axis=1); color=alt.Scale(domain=["상승","하락"],range=["#ef5350","#2962ff"]); base=alt.Chart(df).encode(x=alt.X("시간:T",title=None)); wick=base.mark_rule().encode(y=alt.Y("저가:Q",scale=alt.Scale(zero=False)),y2="고가:Q",color=alt.Color("색상:N",scale=color,legend=None)); body=base.mark_bar(size=7).encode(y="시가:Q",y2="종가:Q",color=alt.Color("색상:N",scale=color,legend=None)); lines=alt.Chart(df).transform_fold(["VWAP","EMA9","EMA20"],as_=["지표","값"]).mark_line().encode(x="시간:T",y=alt.Y("값:Q",scale=alt.Scale(zero=False)),color="지표:N"); chart=wick+body+lines
     levels=[]; support=float(item.get("structural_support",0) or 0); t1=float(item.get("structural_target1",item.get("structural_target",0)) or 0); t2=float(item.get("structural_target2",0) or 0)
-    if support>0: levels.append({"가격":support,"구간":"지지·손절"})
+    macro_support=float(item.get("macro_support",0) or 0); macro_resistance=float(item.get("macro_resistance",0) or 0)
+    if support>0: levels.append({"가격":support,"구간":"5분 confirmed 지지"})
+    if macro_support>0 and abs(macro_support/support-1)*100>0.10: levels.append({"가격":macro_support,"구간":"15/60분 큰 지지"})
     if t1>0: levels.append({"가격":t1,"구간":"1차 목표"})
     if t2>0: levels.append({"가격":t2,"구간":"2차 목표"})
+    if macro_resistance>0 and all(abs(macro_resistance/x-1)*100>0.10 for x in (t1,t2) if x>0): levels.append({"가격":macro_resistance,"구간":"15/60분 큰 저항"})
     if levels:
         lf=pd.DataFrame(levels); chart=chart+alt.Chart(lf).mark_rule(strokeWidth=2,strokeDash=[6,4]).encode(y=alt.Y("가격:Q",scale=alt.Scale(zero=False)),color=alt.Color("구간:N",title=None))+alt.Chart(lf).mark_text(align="left",dx=5,dy=-5,fontWeight="bold").encode(y="가격:Q",text="구간:N",color=alt.Color("구간:N",legend=None))
     st.altair_chart(chart.properties(height=430),use_container_width=True)
@@ -932,6 +1545,7 @@ if st.session_state.get("scalp_selected") != selected_ticker:
     st.session_state["scalp_last_quote"] = 0.0
     st.session_state.pop("scalp_latest", None)
     st.session_state["scalp_live_history"] = []
+    # 종목별 Cycle은 별도 키로 보존한다. 종목 전환이 기존 보유 계획을 덮어쓰지 않는다.
 
 
 # 정밀계산 주기와 현재가 갱신 주기 분리 복원
@@ -1002,6 +1616,27 @@ change = float(latest.get("change_percent", 0) or 0)
 if price <= 0:
     st.error("⛔ 현재가가 확인되지 않아 분석과 매수 판정을 중단했습니다.")
     st.stop()
+
+cycle_key = _cycle_key(market, selected_ticker)
+cycle = dict(st.session_state.get(cycle_key, _empty_cycle()))
+
+# 시간이 지나 Cooldown/Hard Kill이 끝났으면 자동으로 새 Cycle 대기 상태로 전환한다.
+if cycle.get("state") in {"COOLDOWN", "HARD_KILL"}:
+    if (
+        float(cycle.get("hard_kill_until", 0) or 0) <= now
+        and float(cycle.get("cooldown_until", 0) or 0) <= now
+    ):
+        cycle = reset_trade_cycle(cycle, now)
+        cycle["state"] = "IDLE"
+
+# 보유 중이면 실시간 구조로 상태만 재평가한다.
+# 진입가/1차/2차/Soft/Hard Stop 숫자는 update_trade_cycle에서 절대 수정하지 않는다.
+if cycle.get("state") in {"OPEN", "TARGET1_HIT"}:
+    cycle = update_trade_cycle(cycle, latest, now)
+    st.session_state[cycle_key] = cycle
+elif cycle.get("state") == "EXITED":
+    # EXITED 상태는 사용자가 확인할 수 있도록 유지한다.
+    st.session_state[cycle_key] = cycle
 
 
 # 예측 Calibration
@@ -1113,10 +1748,99 @@ elif buy_votes < 6 or sell_votes > 0:
     level, label = "warning", f"🟡 대기 · 매수 합의 {buy_votes}/10 · 매도 경고 {sell_votes}/10"
 
 latest["entry_checks_passed"] = level == "success"
+live_hard_stop = float(latest.get("structural_hard_stop", 0) or 0)
+live_net_swing = ((target1 / price) - 1) * 100 if target1 > price > 0 else 0.0
+live_signature = str(latest.get("confirmed_swing_signature", "") or "")
+live_support_confirmed_at = float(latest.get("structure_support_5m_time", 0) or 0)
+previous_signature = str(cycle.get("last_swing_signature", "") or "")
+previous_closed_at = float(cycle.get("last_closed_at", 0) or 0)
+fresh_swing_for_reentry = bool(
+    previous_closed_at <= 0
+    or (
+        live_signature
+        and live_signature != previous_signature
+        and live_support_confirmed_at > previous_closed_at
+    )
+)
+latest["net_swing_percent"] = live_net_swing
+latest["fresh_swing_for_reentry"] = fresh_swing_for_reentry
+latest["FINAL_BUY"] = bool(
+    level == "success"
+    and 0.50 <= repeat_width <= 1.50
+    and live_net_swing >= 0.50
+    and live_hard_stop > 0
+    and live_hard_stop < float(latest.get("structural_support", 0) or 0) < price
+    and fresh_swing_for_reentry
+    and repeat_state in {"BUY_PULLBACK", "HOLD_OR_BREAKOUT"}
+)
+
+# 보유 Cycle이 있으면 신규 진입 판정보다 Cycle 관리가 우선한다.
+cycle_state = str(cycle.get("state", "IDLE"))
+cycle_breakdown = str(cycle.get("breakdown_state", "NORMAL"))
+
+if cycle_state in {"OPEN", "TARGET1_HIT"}:
+    # live 구조의 목표가가 바뀌더라도 고정 Cycle 가격은 그대로 사용한다.
+    target1 = float(cycle.get("target1", target1) or target1)
+    target2 = float(cycle.get("target2", target2) or target2)
+    repeat_stop = float(cycle.get("soft_stop", repeat_stop) or repeat_stop)
+
+if cycle_state == "EXITED":
+    level = "error" if cycle.get("exit_reason") in {"HARD_EXIT", "REAL_BREAKDOWN"} else "warning"
+elif cycle_state == "HARD_KILL":
+    level = "error"
+elif cycle_state == "COOLDOWN":
+    level = "warning"
 
 
 # 상단 한 줄 행동지시 복원
-if not quality_passed:
+if cycle_state == "HARD_KILL":
+    action_class, action_title = "stop", "🔴 HARD KILL · 재진입 금지"
+    action_line = cycle_status_text(cycle, now)
+elif cycle_state == "COOLDOWN":
+    action_class, action_title = "wait", "🟡 Cooldown · 재매수 대기"
+    action_line = cycle_status_text(cycle, now)
+elif cycle_state == "EXITED":
+    reason = str(cycle.get("exit_reason", ""))
+    if reason in {"HARD_EXIT", "REAL_BREAKDOWN"}:
+        action_class, action_title = "stop", "🔴 Cycle 종료 · 재진입 대기"
+    else:
+        action_class, action_title = "sell", "🟠 Cycle 종료"
+    action_line = f"{reason or '청산'} · 새 Swing 확인 후 다음 Cycle"
+elif cycle_state in {"OPEN", "TARGET1_HIT"}:
+    if cycle_breakdown == "SHAKEOUT":
+        action_class, action_title = "wait", "🟡 SHAKEOUT 의심 · 즉시 손절 아님"
+        action_line = (
+            f"Soft Stop {fmt(cycle.get('soft_stop'))} 일시 이탈 · "
+            "VWAP/EMA/상위시간대 붕괴 동반 여부 재확인"
+        )
+    elif cycle_breakdown == "REAL_BREAKDOWN":
+        action_class, action_title = "stop", "🔴 REAL_BREAKDOWN · 매도"
+        action_line = "Soft Stop 이탈이 반복되고 하락 구조가 함께 확인됐습니다."
+    elif cycle_breakdown == "HARD_EXIT":
+        action_class, action_title = "stop", "🔴 HARD_EXIT · 즉시 청산"
+        action_line = f"Hard Stop {fmt(cycle.get('hard_stop'))} 이탈"
+    elif cycle_state == "TARGET1_HIT":
+        action_class, action_title = "sell", "🟠 1차 목표 도달 · 일부 익절"
+        action_line = (
+            f"고정 1차 {fmt(cycle.get('target1'))} 도달 · "
+            + (
+                f"잔여분 2차 {fmt(cycle.get('target2'))} / 트레일링 관리"
+                if float(cycle.get("target2",0) or 0) > 0
+                else "2차 confirmed 저항 없음 · 잔여분은 트레일링 관리"
+            )
+        )
+    else:
+        action_class, action_title = "buy", "🟢 보유 Cycle 관리 중"
+        action_line = (
+            f"고정 진입 {fmt(cycle.get('entry_price'))} → "
+            f"1차 {fmt(cycle.get('target1'))}"
+            + (
+                f" → 2차 {fmt(cycle.get('target2'))}"
+                if float(cycle.get("target2",0) or 0) > 0
+                else ""
+            )
+        )
+elif not quality_passed:
     action_class, action_title = "wait", "⚪ 시세 확인 중·주문 대기"
     action_line = "현재가·분봉·호가 중 미수신 항목을 확인 중입니다."
 elif repeat_state == "BUY_PULLBACK" and level == "success":
@@ -1147,21 +1871,191 @@ else:
     action_class, action_title = "wait", "🟡 지금은 대기"
     action_line = f"{fmt(repeat_buy)} 지지 반등 또는 매수 합의를 기다리세요."
 
+display_soft_stop = (
+    float(cycle.get("soft_stop",0) or 0)
+    if cycle_state in {"OPEN","TARGET1_HIT"}
+    else repeat_stop
+)
+display_hard_stop = (
+    float(cycle.get("hard_stop",0) or 0)
+    if cycle_state in {"OPEN","TARGET1_HIT"}
+    else float(latest.get("structural_hard_stop",0) or 0)
+)
+
 st.markdown(
     f'<div class="trade-action {action_class}">'
     f'<h2>{action_title}</h2>'
     f'<p><b>{action_line}</b></p>'
-    f'<p>손절·무효 기준: {fmt(repeat_stop)} · 확인된 반복폭: {repeat_width:.2f}%</p>'
+    f'<p>Soft Stop: {fmt(display_soft_stop)} · '
+    f'Hard Stop: {fmt(display_hard_stop) if display_hard_stop>0 else "미확인"} · '
+    f'확인된 반복폭: {repeat_width:.2f}%</p>'
     f'</div>',
     unsafe_allow_html=True,
 )
 
 if action_class in {"buy", "sell", "stop"}:
-    alert_key = f"signal_alert::{market}::{selected_ticker}::{action_class}"
+    alert_key = f"signal_alert::{market}::{selected_ticker}::{action_class}::{cycle_state}"
     last_alert = float(st.session_state.get(alert_key, 0) or 0)
     if now - last_alert >= 180:
         st.toast(f"{selected_ticker} · {action_title}")
         st.session_state[alert_key] = now
+
+
+# Cycle Manager
+st.subheader("Cycle Manager · 진입 후 가격 고정")
+
+cycle = dict(st.session_state.get(cycle_key, cycle))
+cycle_state = str(cycle.get("state", "IDLE"))
+
+if cycle_state in {"OPEN", "TARGET1_HIT"}:
+    cycle_cols = st.columns(8)
+    cycle_cols[0].metric("고정 진입가", fmt(cycle.get("entry_price")))
+    cycle_cols[1].metric("고정 1차 목표", fmt(cycle.get("target1")))
+    cycle_cols[2].metric(
+        "고정 2차 목표",
+        fmt(cycle.get("target2")) if float(cycle.get("target2",0) or 0)>0 else "-"
+    )
+    cycle_cols[3].metric("Soft Stop", fmt(cycle.get("soft_stop")))
+    cycle_cols[4].metric(
+        "Hard Stop",
+        fmt(cycle.get("hard_stop")) if float(cycle.get("hard_stop",0) or 0)>0 else "미확인"
+    )
+    cycle_cols[5].metric("Net Swing", f"{float(cycle.get('net_swing_percent',0) or 0):.2f}%")
+    cycle_cols[6].metric("실제 손익비", f"{float(cycle.get('actual_risk_reward',0) or 0):.2f}배")
+    cycle_cols[7].metric("Cycle 상태", cycle_status_text(cycle, now))
+
+    st.caption(
+        "위 5개 가격은 진입 순간 고정됩니다. 아래 실시간 구조가 변해도 "
+        "진입가·1차·2차·Soft/Hard Stop을 자동으로 다시 쓰지 않습니다."
+    )
+
+    if cycle.get("breakdown_state") == "SHAKEOUT":
+        st.warning(
+            "SHAKEOUT 감지: Soft Stop 아래로 잠깐 밀렸지만 "
+            "REAL_BREAKDOWN 확정 조건은 아직 부족합니다."
+        )
+
+    breakdown_rows = [
+        {"붕괴 검문": key, "감지": "예" if value else "아니오"}
+        for key, value in (cycle.get("breakdown_evidence", {}) or {}).items()
+    ]
+    if breakdown_rows:
+        with st.expander("보유 중 SHAKEOUT / REAL_BREAKDOWN 근거", expanded=False):
+            st.dataframe(pd.DataFrame(breakdown_rows), hide_index=True, use_container_width=True)
+
+    if st.button("내가 매도함 · Cycle 종료", use_container_width=True, key=f"cycle_close::{selected_ticker}"):
+        cycle = close_trade_cycle(cycle, now, "MANUAL_EXIT")
+        st.session_state[cycle_key] = cycle
+        st.rerun()
+
+elif cycle_state == "EXITED":
+    st.warning(
+        f"{cycle_status_text(cycle, now)} · "
+        f"Cooldown 종료 후 새 confirmed Swing이 형성될 때만 재매수합니다."
+    )
+    if st.button("종료 확인 · Cooldown 상태로", use_container_width=True, key=f"cycle_reset::{selected_ticker}"):
+        cycle = reset_trade_cycle(cycle, now)
+        st.session_state[cycle_key] = cycle
+        st.rerun()
+
+elif cycle_state in {"COOLDOWN", "HARD_KILL"}:
+    if cycle_state == "HARD_KILL":
+        st.error(cycle_status_text(cycle, now))
+    else:
+        st.warning(cycle_status_text(cycle, now))
+
+    if (
+        float(cycle.get("hard_kill_until", 0) or 0) <= now
+        and float(cycle.get("cooldown_until", 0) or 0) <= now
+    ):
+        if st.button("새 Cycle 대기 상태로 전환", use_container_width=True, key=f"cycle_idle::{selected_ticker}"):
+            cycle = reset_trade_cycle(cycle, now)
+            cycle["state"] = "IDLE"
+            st.session_state[cycle_key] = cycle
+            st.rerun()
+
+else:
+    entry_default = float(price)
+    actual_entry = st.number_input(
+        "실제 체결 진입가",
+        min_value=0.0,
+        value=entry_default,
+        step=max(entry_default * 0.0001, 0.01),
+        format="%.4f" if entry_default < 1000 else "%.0f",
+        key=f"actual_entry::{market}::{selected_ticker}",
+        help="실제로 체결된 가격을 입력한 뒤 아래 버튼을 누르면 그 순간의 계획이 고정됩니다.",
+    )
+
+    preview_hard = _structural_hard_stop(latest)
+    preview_cols = st.columns(5)
+    preview_cols[0].metric("고정 예정 진입", fmt(actual_entry))
+    preview_cols[1].metric("고정 예정 1차", fmt(target1))
+    preview_cols[2].metric("고정 예정 2차", fmt(target2) if target2 > 0 else "-")
+    preview_cols[3].metric("고정 예정 Soft", fmt(latest.get("structural_support")))
+    preview_cols[4].metric("고정 예정 Hard", fmt(preview_hard) if preview_hard > 0 else "미확인")
+
+    actual_soft = float(latest.get("structural_support",0) or 0)
+    actual_net_swing = ((target1 / actual_entry) - 1) * 100 if target1 > actual_entry > 0 else 0.0
+    actual_rr = (
+        (target1 - actual_entry) / (actual_entry - actual_soft)
+        if actual_entry > actual_soft > 0
+        else 0.0
+    )
+
+    st.caption(
+        f"실제 체결가 기준 Net Swing {actual_net_swing:.2f}% · "
+        f"손익비 {actual_rr:.2f}배"
+    )
+
+    can_start_cycle = bool(
+        level == "success"
+        and 0.50 <= repeat_width <= 1.50
+        and actual_net_swing >= 0.50
+        and actual_rr >= 1.50
+        and preview_hard > 0
+        and preview_hard < actual_soft < actual_entry
+        and fresh_swing_for_reentry
+        and target1 > actual_entry > 0
+    )
+
+    if not can_start_cycle:
+        reasons = []
+        if not (0.50 <= repeat_width <= 1.50):
+            reasons.append(f"confirmed Swing {repeat_width:.2f}%")
+        if actual_net_swing < 0.50:
+            reasons.append(f"Net Swing {actual_net_swing:.2f}%")
+        if actual_rr < 1.50:
+            reasons.append(f"실제 손익비 {actual_rr:.2f}")
+        if preview_hard <= 0:
+            reasons.append("Hard Stop 미확인")
+        if not fresh_swing_for_reentry:
+            reasons.append("이전 청산 후 새 5분 confirmed Swing 미형성")
+        if level != "success":
+            reasons.append("진입 검문 미통과")
+        st.info(
+            "현재는 FINAL_BUY 조건이 아닙니다. "
+            + (" · ".join(reasons) if reasons else "구조 재확인 필요")
+        )
+
+    if st.button(
+        "매수함 · 현재 계획 고정",
+        use_container_width=True,
+        disabled=not can_start_cycle,
+        key=f"cycle_start::{market}::{selected_ticker}",
+    ):
+        try:
+            cycle = start_trade_cycle(
+                latest,
+                market,
+                selected_ticker,
+                float(actual_entry),
+                now,
+                prior_cycle=cycle,
+            )
+            st.session_state[cycle_key] = cycle
+            st.rerun()
+        except Exception as error:
+            st.error(f"Cycle 시작 실패: {error}")
 
 
 # 트레일링 스탑 표시 복원
@@ -1199,6 +2093,8 @@ st.caption(f"현재 적용 기법: {regime_method}")
 
 
 # 1차/2차 목표 전체 표시
+if cycle_state in {"OPEN", "TARGET1_HIT"}:
+    st.caption("아래는 LIVE 구조입니다. 위 Cycle Manager의 고정 가격과 구분해서 보세요.")
 level_cols = st.columns(5)
 level_cols[0].metric("진입 기준가", fmt(latest.get("structural_entry")))
 level_cols[1].metric(
@@ -1219,6 +2115,39 @@ st.caption(
     f"2차 근거: {latest.get('target2_basis', '미확인')} · "
     f"손절 근거: {latest.get('stop_basis', latest.get('level_plan_reason', '미확인'))}"
 )
+
+with st.expander("큰 구조 지지·저항 · 60분→15분→5분", expanded=False):
+    structure_rows = [
+        {
+            "시간대": "60분",
+            "지지": fmt(latest.get("structure_support_60m")),
+            "저항": fmt(latest.get("structure_resistance_60m")),
+            "confirmed Swing": int(latest.get("confirmed_swing_60m_count",0) or 0),
+            "역할": "장 전체 큰 구조",
+        },
+        {
+            "시간대": "15분",
+            "지지": fmt(latest.get("structure_support_15m")),
+            "저항": fmt(latest.get("structure_resistance_15m")),
+            "confirmed Swing": int(latest.get("confirmed_swing_15m_count",0) or 0),
+            "역할": "몇 시간 구조·2차 목표",
+        },
+        {
+            "시간대": "5분",
+            "지지": fmt(latest.get("structure_support_5m")),
+            "저항": fmt(latest.get("structure_resistance_5m")),
+            "confirmed Swing": int(latest.get("confirmed_swing_5m_count",0) or 0),
+            "역할": "0.5~1.5% 반복 Swing",
+        },
+        {
+            "시간대": "1분",
+            "지지": "목표 계산에 사용 안 함",
+            "저항": "목표 계산에 사용 안 함",
+            "confirmed Swing": "-",
+            "역할": "진입·재돌파 타이밍만",
+        },
+    ]
+    st.dataframe(pd.DataFrame(structure_rows), hide_index=True, use_container_width=True)
 
 st.caption(
     f"장중 지속상승 판정 {continuous_rise_score}/10 · "
@@ -1352,11 +2281,16 @@ st.caption(f"한 줄 결론: {action_title} · {action_line}")
 
 
 # 기법 합의/검문 복원
-consensus_cols = st.columns(4)
-consensus_cols[0].metric("매수 기법", f"{buy_votes}/10")
-consensus_cols[1].metric("매도 기법", f"{sell_votes}/10")
-consensus_cols[2].metric("대기 기법", f"{wait_votes}/10")
-consensus_cols[3].metric(
+consensus_cols = st.columns(5)
+consensus_cols[0].metric(
+    "FINAL_BUY",
+    "YES" if latest.get("FINAL_BUY") else "NO",
+    "새 Swing" if latest.get("fresh_swing_for_reentry") else "재매수 Swing 대기",
+)
+consensus_cols[1].metric("매수 기법", f"{buy_votes}/10")
+consensus_cols[2].metric("매도 기법", f"{sell_votes}/10")
+consensus_cols[3].metric("대기 기법", f"{wait_votes}/10")
+consensus_cols[4].metric(
     "종합 매수 강도",
     f"{weighted_score:+.1f}점",
     f"매수 근거 비중 {weighted_buy:.1f}%",
