@@ -22,7 +22,6 @@ import signal
 import sqlite3
 import sys
 import time
-import threading
 import zlib
 
 import pandas as pd
@@ -44,10 +43,10 @@ STOP = False
 
 FAST_DB_PATH = ROOT / "validation_data" / "fast_scanner.sqlite3"
 FAST_DAEMON_HEARTBEAT_SEC = 15
-FAST_POOL_REFRESH_SEC = 45
+FAST_POOL_REFRESH_SEC = 60
 FAST_PRECISE_PER_LOOP = 1
-FAST_FOCUS_QUOTE_SEC = 3
-FAST_FOCUS_FULL_SEC = 60
+FAST_FOCUS_QUOTE_SEC = 1
+FAST_FOCUS_FULL_SEC = 58
 LIQUIDITY_TOP_N = 100
 PRECISE_PRIORITY_N = 30
 FULL_UNION_REVISIT_SEC = 300
@@ -188,6 +187,8 @@ def connect() -> sqlite3.Connection:
             hard_exit_count INTEGER NOT NULL DEFAULT 0,
             hard_kill INTEGER NOT NULL DEFAULT 0,
             last_risk_event TEXT,
+            position_state TEXT NOT NULL DEFAULT 'PRE_ENTRY',
+            active_plan_json TEXT,
             PRIMARY KEY(market,ticker,trade_date)
         )
     """)
@@ -210,6 +211,11 @@ def connect() -> sqlite3.Connection:
     for column, definition in migrations.items():
         if column not in existing:
             db.execute(f"ALTER TABLE signals ADD COLUMN {column} {definition}")
+    cycle_cols = {row[1] for row in db.execute("PRAGMA table_info(cycle_state_v51)")}
+    if "position_state" not in cycle_cols:
+        db.execute("ALTER TABLE cycle_state_v51 ADD COLUMN position_state TEXT NOT NULL DEFAULT 'PRE_ENTRY'")
+    if "active_plan_json" not in cycle_cols:
+        db.execute("ALTER TABLE cycle_state_v51 ADD COLUMN active_plan_json TEXT")
     return db
 
 
@@ -250,20 +256,9 @@ def row_for(ticker: str, name: str, exchange: str) -> dict:
 
 
 def load_shared_strategy_core() -> dict:
-    """scalp_app.py의 순수 전략코드만 읽어 검증기와 UI 계산을 완전히 통일한다."""
-    source_path = ROOT / "scalp_app.py"
-    if not source_path.exists():
-        raise FileNotFoundError("run_live_validation.py와 같은 폴더에 scalp_app.py가 필요합니다.")
-    source = source_path.read_text(encoding="utf-8")
-    start_marker = "# === SHARED_STRATEGY_CORE_START ==="
-    end_marker = "# === SHARED_STRATEGY_CORE_END ==="
-    if start_marker not in source or end_marker not in source:
-        raise RuntimeError("scalp_app.py에서 SHARED_STRATEGY_CORE를 찾지 못했습니다.")
-    core = source.split(start_marker, 1)[1].split(end_marker, 1)[0]
-    namespace = {"math": math, "pd": pd, "KST": KST, "ET": ZoneInfo("America/New_York")}
-    exec(compile(core, str(source_path) + "::<shared_core>", "exec"), namespace)
-    return namespace
-
+    """v6 호환 전략 어댑터. UI 소스코드를 읽지 않는다."""
+    from strategy_compat_v60 import shared_namespace
+    return shared_namespace()
 
 _SHARED = load_shared_strategy_core()
 apply_repeat_scalp_overlay = _SHARED["apply_repeat_scalp_overlay"]
@@ -284,7 +279,7 @@ STRATEGY_VERSION = _SHARED["STRATEGY_VERSION"]
 def load_cycle_state_v51(db: sqlite3.Connection, market: str, ticker: str, now_ts: int) -> dict:
     trade_date = datetime.fromtimestamp(now_ts, tz=KST).strftime("%Y%m%d")
     row = db.execute(
-        """SELECT cooldown_until,breakdown_count,hard_exit_count,hard_kill,last_risk_event
+        """SELECT cooldown_until,breakdown_count,hard_exit_count,hard_kill,last_risk_event,position_state,active_plan_json
            FROM cycle_state_v51 WHERE market=? AND ticker=? AND trade_date=?""",
         (market, ticker, trade_date),
     ).fetchone()
@@ -297,6 +292,8 @@ def load_cycle_state_v51(db: sqlite3.Connection, market: str, ticker: str, now_t
         "hard_exit_count": int(row[2] or 0),
         "hard_kill": bool(row[3]),
         "last_risk_event": str(row[4] or ""),
+        "position_state": str(row[5] or "PRE_ENTRY"),
+        "active_plan": (json.loads(row[6]) if row[6] else None),
     }
 
 
@@ -304,8 +301,8 @@ def save_cycle_state_v51(db: sqlite3.Connection, market: str, ticker: str, state
     trade_date = str(state.get("trade_date") or datetime.now(KST).strftime("%Y%m%d"))
     db.execute(
         """INSERT OR REPLACE INTO cycle_state_v51(
-           market,ticker,trade_date,cooldown_until,breakdown_count,hard_exit_count,hard_kill,last_risk_event
-           ) VALUES(?,?,?,?,?,?,?,?)""",
+           market,ticker,trade_date,cooldown_until,breakdown_count,hard_exit_count,hard_kill,last_risk_event,position_state,active_plan_json
+           ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
         (
             market, ticker, trade_date,
             f(state.get("cooldown_until")),
@@ -313,6 +310,8 @@ def save_cycle_state_v51(db: sqlite3.Connection, market: str, ticker: str, state
             int(state.get("hard_exit_count",0) or 0),
             int(bool(state.get("hard_kill"))),
             str(state.get("last_risk_event") or ""),
+            str(state.get("position_state") or "PRE_ENTRY"),
+            json.dumps(state.get("active_plan"), ensure_ascii=False) if state.get("active_plan") else None,
         ),
     )
 
@@ -324,6 +323,8 @@ def analyze_one(engine, policy, finalize, market: str, member: tuple[str, str, s
     market_name = "국내" if market == "KR" else "미국"
     try:
         result = engine.analyze(row_for(ticker, name, exchange), mode)
+        # analyze 응답 직후의 현재가는 REST 기반 최신 시세로 계측한다.
+        result["quote_age_seconds"] = 0.0
         result = policy(finalize(result), mode)
         result = hourly_structure_plan(result, market_name)
         result = apply_repeat_scalp_overlay(result, market)
@@ -1012,6 +1013,7 @@ def fast_connect() -> sqlite3.Connection:
     db = sqlite3.connect(FAST_DB_PATH, timeout=10)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("PRAGMA busy_timeout=10000")
     db.execute("""
         CREATE TABLE IF NOT EXISTS fast_snapshot(
             market TEXT NOT NULL,
@@ -1036,7 +1038,10 @@ def fast_connect() -> sqlite3.Connection:
             kr_pool_count INTEGER NOT NULL DEFAULT 0,
             us_pool_count INTEGER NOT NULL DEFAULT 0,
             kr_cursor INTEGER NOT NULL DEFAULT 0,
-            us_cursor INTEGER NOT NULL DEFAULT 0
+            us_cursor INTEGER NOT NULL DEFAULT 0,
+            last_loop_ms REAL NOT NULL DEFAULT 0,
+            last_api_ms REAL NOT NULL DEFAULT 0,
+            cache_skips INTEGER NOT NULL DEFAULT 0
         )
     """)
     db.execute("""
@@ -1049,7 +1054,18 @@ def fast_connect() -> sqlite3.Connection:
             updated REAL
         )
     """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS ui_control(
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            active_market TEXT NOT NULL DEFAULT 'KR',
+            updated REAL NOT NULL DEFAULT 0
+        )
+    """)
+    db.execute("INSERT OR IGNORE INTO ui_control(singleton,active_market,updated) VALUES(1,'KR',0)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_fast_snapshot_rank ON fast_snapshot(market,final_buy,score,updated)")
+    fast_cols={row[1] for row in db.execute("PRAGMA table_info(fast_daemon_state)")}
+    for col,definition in {"last_loop_ms":"REAL NOT NULL DEFAULT 0","last_api_ms":"REAL NOT NULL DEFAULT 0","cache_skips":"INTEGER NOT NULL DEFAULT 0"}.items():
+        if col not in fast_cols: db.execute(f"ALTER TABLE fast_daemon_state ADD COLUMN {col} {definition}")
     db.commit()
     return db
 
@@ -1144,6 +1160,17 @@ def _focus_member(db: sqlite3.Connection):
     return str(market), (str(ticker), str(name or ticker), str(exchange or ("KR" if market=="KR" else "NASDAQ")))
 
 
+
+def _active_ui_market(db: sqlite3.Connection) -> str:
+    try:
+        row = db.execute("SELECT active_market,updated FROM ui_control WHERE singleton=1").fetchone()
+        if row and str(row[0]) in {"KR","US"}:
+            return str(row[0])
+    except Exception:
+        pass
+    return "KR"
+
+
 def claim_fast_daemon(db: sqlite3.Connection) -> bool:
     now_ts = time.time()
     db.execute("BEGIN IMMEDIATE")
@@ -1167,7 +1194,7 @@ def fast_heartbeat(db: sqlite3.Connection, **fields) -> None:
     sets = ["pid=?","heartbeat=?"]
     vals = [os.getpid(), now_ts]
     for k, val in fields.items():
-        if k in {"last_error","kr_pool_count","us_pool_count","kr_cursor","us_cursor"}:
+        if k in {"last_error","kr_pool_count","us_pool_count","kr_cursor","us_cursor","last_loop_ms","last_api_ms","cache_skips"}:
             sets.append(f"{k}=?")
             vals.append(val)
     vals.append(1)
@@ -1195,6 +1222,8 @@ def fast_daemon(markets: str = "BOTH") -> int:
     focus_full_at = {}
     focus_quote_at = {}
     precise_last_at = {}
+    cache_skips = 0
+    last_api_ms = 0.0
 
     with fast_connect() as db:
         if not claim_fast_daemon(db):
@@ -1204,7 +1233,9 @@ def fast_daemon(markets: str = "BOTH") -> int:
             try:
                 focus = _focus_member(db)
 
-                for market in selected:
+                active_ui_market = _active_ui_market(db)
+                loop_markets = [active_ui_market] if active_ui_market in selected else list(selected)
+                for market in loop_markets:
                     now = datetime.now(KST)
                     # 후보 pool은 UI와 무관하게 저빈도로만 갱신
                     if not pools[market] or time.time() - pool_at[market] >= FAST_POOL_REFRESH_SEC:
@@ -1222,7 +1253,9 @@ def fast_daemon(markets: str = "BOTH") -> int:
                             db.commit()
                         if time.time() - focus_full_at.get(fk, 0) >= FAST_FOCUS_FULL_SEC:
                             cs = load_cycle_state_v51(db, market, fm[0], int(time.time()))
+                            api_started=time.perf_counter()
                             item = analyze_one(engine, policy, finalize, market, fm, cs)
+                            last_api_ms=(time.perf_counter()-api_started)*1000
                             if item:
                                 new_cs = item.pop("_cycle_state_v51", cs)
                                 save_cycle_state_v51(db, market, fm[0], new_cs)
@@ -1244,9 +1277,13 @@ def fast_daemon(markets: str = "BOTH") -> int:
                         min_gap = 55.0 if is_priority else FULL_UNION_REVISIT_SEC
                         due = time.time() - precise_last_at.get(key, 0.0) >= min_gap
 
+                        if not due:
+                            cache_skips += 1
                         if due and not (focus and focus[0] == market and focus[1][0] == member[0]):
                             cs = load_cycle_state_v51(db, market, member[0], int(time.time()))
+                            api_started=time.perf_counter()
                             item = analyze_one(engine, policy, finalize, market, member, cs)
+                            last_api_ms=(time.perf_counter()-api_started)*1000
                             precise_last_at[key] = time.time()
                             if item:
                                 item["liquidity_union_priority"] = is_priority
@@ -1262,6 +1299,9 @@ def fast_daemon(markets: str = "BOTH") -> int:
                         us_pool_count=len(pools["US"]),
                         kr_cursor=cursor["KR"],
                         us_cursor=cursor["US"],
+                        last_loop_ms=(time.time()-loop_started)*1000,
+                        last_api_ms=last_api_ms,
+                        cache_skips=cache_skips,
                     )
                     db.commit()
 
@@ -1280,28 +1320,6 @@ def fast_daemon(markets: str = "BOTH") -> int:
 
 
 
-_FAST_THREAD_LOCK = threading.Lock()
-_FAST_THREAD = None
-
-def start_fast_worker(markets: str = "BOTH") -> dict:
-    """Streamlit 프로세스 안에서 fast_daemon을 단 한 번만 백그라운드 thread로 시작한다.
-
-    Streamlit UI 요소는 thread에서 절대 만지지 않고 KIS 분석 + SQLite 저장만 수행한다.
-    전략 계산은 persistence_engine.evaluate_strategy()를 그대로 사용한다.
-    """
-    global _FAST_THREAD
-    with _FAST_THREAD_LOCK:
-        if _FAST_THREAD is not None and _FAST_THREAD.is_alive():
-            return {"running": True, "started": False, "name": _FAST_THREAD.name}
-        _FAST_THREAD = threading.Thread(
-            target=fast_daemon,
-            args=(markets,),
-            name="repeat-scalp-fast-worker",
-            daemon=True,
-        )
-        _FAST_THREAD.start()
-        return {"running": True, "started": True, "name": _FAST_THREAD.name}
-
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -1312,7 +1330,7 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=6, help="한 루프에서 정밀분석할 동적 후보 수")
     parser.add_argument("--run-until", default="AUTO")
     parser.add_argument("--once", action="store_true")
-    parser.add_argument("--fast-daemon", action="store_true", help="Streamlit용 초고속 snapshot 백그라운드 스캐너")
+    parser.add_argument("--fast-daemon", action="store_true", help="독립 snapshot worker (Streamlit과 별도 실행)")
     args = parser.parse_args()
 
     if args.fast_daemon:
