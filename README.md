@@ -47,9 +47,13 @@ KIS_ACCESS_TOKEN = "당일_접근_토큰"
 # KIS_ACCESS_TOKEN_EXPIRES_AT = "2026-08-18T07:00:00+09:00"
 
 KIS_ALLOW_TOKEN_ISSUE = "false"
-KIS_MIN_REQUEST_INTERVAL_SECONDS = "0.4"
+KIS_MIN_REQUEST_INTERVAL_SECONDS = "1.0"
+KIS_MAX_REQUESTS_PER_MINUTE = "30"
+KIS_MAX_REQUESTS_PER_FIVE_HOURS = "1100"
 KIS_MAX_RETRIES = "1"
 ```
+
+화면을 열기만 해서는 KIS 요청을 보내지 않습니다. 선택 종목 분석은 최대 3건, 빠른검색은 국내 14건·미국 21건, 60초 자동 새로고침은 5시간 최대 약 900건의 요청을 사용합니다. 앱은 1분 30건·5시간 1,100건의 보수적 rolling 예산을 적용하고 429 응답 뒤에는 추가 요청을 대기 처리합니다. 자세한 계산식과 조정 원칙은 [`docs/kis_api_budget.md`](docs/kis_api_budget.md)를 확인하세요.
 
 ### 2. v5.1 외부 영속 저장소
 
@@ -106,7 +110,7 @@ streamlit run app.py
 pytest -q
 ```
 
-테스트는 토큰 자동 발급 차단, KIS 응답 파싱, 반복박스, Swing 통계, 위험 상태, FINAL_BUY, Cycle 중복 방지, Hard Kill, Calibration 표본 30건 규칙을 다룹니다. 실제 KIS API 호출은 테스트에 포함하지 않습니다.
+테스트는 토큰 자동 발급 차단, KIS 응답 파싱, 분당·5시간 호출 예산, 반복박스, Swing 통계, 위험 상태, FINAL_BUY, Cycle 중복 방지, Hard Kill, Calibration 표본 30건 규칙을 다룹니다. 실제 KIS API 호출은 테스트에 포함하지 않습니다.
 
 ## 한계
 

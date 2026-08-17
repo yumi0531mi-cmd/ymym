@@ -13,6 +13,7 @@ import requests
 from filelock import FileLock
 
 from .models import Market, Quote
+from .rate_limit import BudgetSnapshot, RequestBudget
 from .sessions import ET, KST, market_session
 
 
@@ -77,9 +78,13 @@ class KISClient:
         self.allow_token_issue = _as_bool(_secret(("KIS_ALLOW_TOKEN_ISSUE",), secrets, "false"))
         self.base = _secret(("KIS_BASE_URL", "BASE_URL"), secrets, "https://openapi.koreainvestment.com:9443").rstrip("/")
         self.min_request_interval = _as_float(
-            _secret(("KIS_MIN_REQUEST_INTERVAL_SECONDS",), secrets, "0.4"), default=0.4, minimum=0.1
+            _secret(("KIS_MIN_REQUEST_INTERVAL_SECONDS",), secrets, "1.0"), default=1.0, minimum=0.2
         )
         self.max_retries = _as_int(_secret(("KIS_MAX_RETRIES",), secrets, "1"), default=1, minimum=0)
+        self.request_budget = RequestBudget(
+            minute_limit=_as_int(_secret(("KIS_MAX_REQUESTS_PER_MINUTE",), secrets, "30"), default=30, minimum=1),
+            five_hour_limit=_as_int(_secret(("KIS_MAX_REQUESTS_PER_FIVE_HOURS",), secrets, "1100"), default=1100, minimum=1),
+        )
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.session = requests.Session()
@@ -105,7 +110,14 @@ class KISClient:
         expires = _parse_time(self.access_token_expires_at)
         return bool(expires and expires <= datetime.now().astimezone() + timedelta(minutes=10))
 
+    @property
+    def budget_status(self) -> BudgetSnapshot:
+        return self.request_budget.snapshot()
+
     def _wait_for_slot(self) -> None:
+        budget_wait = self.request_budget.acquire()
+        if budget_wait > 0:
+            raise KISError(f"KIS 호출 예산 보호 중입니다. 최소 {budget_wait:.0f}초 뒤 다시 시도하세요.")
         with self._mutex:
             now = time.monotonic()
             delay = max(self._last_call + self.min_request_interval - now, self._blocked_until - now, 0.0)
@@ -137,6 +149,7 @@ class KISClient:
                 return response
 
             retry_after = _as_float(response.headers.get("Retry-After", ""), default=2.0, minimum=0.5)
+            self.request_budget.block_for(retry_after)
             with self._mutex:
                 self._blocked_until = max(self._blocked_until, time.monotonic() + retry_after)
             if attempt >= self.max_retries:

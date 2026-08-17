@@ -173,8 +173,8 @@ with st.sidebar:
     exchange = st.selectbox("미국 거래소", ["NAS", "NYS", "AMS"], disabled=market == Market.KR)
     scan_now = st.button("유동성 시작목록 빠른검색", use_container_width=True)
     analyze_now = st.button("선택 종목 분석", type="primary", use_container_width=True)
-    live = st.toggle("자동 새로고침", False, help="기본은 꺼져 있습니다. 필요할 때만 저빈도 갱신을 사용하세요.")
-    refresh_seconds = st.select_slider("자동 새로고침 간격(초)", options=[10, 15, 30, 60], value=15, disabled=not live)
+    live = st.toggle("자동 새로고침", False, help="기본은 꺼져 있습니다. 5시간 호출 예산 안에서 저빈도 갱신만 사용하세요.")
+    refresh_seconds = st.select_slider("자동 새로고침 간격(초)", options=[60, 120, 300], value=60, disabled=not live)
     save_validation = st.toggle("매수 신호 검증 저장", False, help="진입 고려 신호만 저장합니다. 주문은 실행하지 않습니다.")
     cost_default = 0.05 if market == Market.KR else 0.10
     cost_pct = st.number_input("왕복비용 가정(%)", min_value=0.0, max_value=5.0, value=cost_default, step=0.01)
@@ -182,6 +182,12 @@ with st.sidebar:
     st.caption(f"현재 세션: {market_session(market)}")
     token_mode = getattr(client, "token_mode", "재시작 후 인증 상태 확인")
     st.caption(f"KIS 인증: {token_mode}")
+    budget = client.budget_status
+    st.caption(
+        f"KIS 호출 보호(현재 서버): 1분 {budget.minute_used}/{budget.minute_limit} · "
+        f"5시간 {budget.five_hour_used}/{budget.five_hour_limit}"
+    )
+    st.caption("선택 종목 분석은 현재가·1호가·1분봉으로 최대 3건을 사용합니다. 자동 새로고침 60초는 5시간 최대 약 900건입니다.")
     st.caption(f"검증 저장: {event_store.status}")
     admin = admin_unlocked()
 
@@ -192,6 +198,7 @@ st.title("실시간 반복단타 후보")
 st.caption(
     "수동매매 판단 보조 도구입니다. 진입·손절은 완료 1분봉 구조를, 1차·2차 목표는 완료 5분봉 구조를 우선 반영합니다. 화면 가격은 호가, 거래량·거래대금, 비용과 유동성 조건을 함께 계산한 참고 구간이며 수익을 보장하지 않습니다."
 )
+st.caption("API 보호: 화면을 열기만 해서는 KIS 시세를 요청하지 않습니다. 종목 분석은 최대 3건, 빠른검색은 국내 14건·미국 21건의 현재가 요청을 사용하며, 초과 요청은 앱에서 보수적으로 대기 처리합니다.")
 
 if scan_now:
     with st.spinner("시작목록의 현재가 1차 필터 확인 중…"):
