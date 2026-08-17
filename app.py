@@ -665,8 +665,29 @@ def mixed_card_priority(item: dict[str, Any]) -> tuple[int, int, int]:
     return (trend_rank, repeat_rank, plan.score)
 
 
-def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
-    """Render the short, price-first dashboard card requested by the user."""
+def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int) -> dict[str, Any]:
+    """Recalculate only from cached bars and KIS live trades; no REST request occurs here."""
+    base_quote: Quote = item["quote"]
+    quote = quote_with_live_tick(base_quote)
+    bars = merge_live_completed_bars(item["bars"], quote.symbol, quote.market)
+    chart_aligned, chart_alignment_reason = completed_bar_alignment(quote, bars)
+    cycle = cycle_store.get(quote.symbol, quote.market, quote.timestamp)
+    previous_plan = item["plan"]
+    plan = analyze(
+        quote, bars, orderbook_required=True, round_trip_cost_pct=cost_pct,
+        minimum_score=min_score, cooldown_active=cycle.cooldown_active, hard_kill=cycle.hard_kill,
+        calibration_probability=previous_plan.calibration_probability,
+        calibration_samples=previous_plan.calibration_samples,
+        calibration_expectancy_pct=previous_plan.diagnostics.get("calibration_expectancy_pct"),
+    )
+    return {
+        **item, "quote": quote, "bars": bars, "plan": plan,
+        "chart_aligned": chart_aligned, "chart_alignment_reason": chart_alignment_reason,
+    }
+
+
+def render_plan_fields(item: dict[str, Any]) -> None:
+    """Draw the non-tick fields after each completed live minute bar."""
     quote: Quote = item["quote"]
     plan = item["plan"]
     structure = dashboard_structure(item)
@@ -677,11 +698,35 @@ def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
     stop = plan.hard_stop or plan.invalidation or plan.stop
     if not chart_aligned:
         target_1 = target_2 = support = stop = None
-    title = f"{quote.symbol} · {item.get('name') or quote.market.value}"
+    st.markdown(structure_strip_html(structure), unsafe_allow_html=True)
+    forecast_columns = st.columns(4)
+    for column, minutes in zip(forecast_columns, (5, 10, 15, 30)):
+        point = forecast_point_for(plan, minutes) if chart_aligned else None
+        column.metric(
+            f"{minutes}분 예상",
+            price_text(point.base if point else None),
+            forecast_direction_text(point),
+        )
+    prices = st.columns(2)
+    prices[0].metric("추천 매수가", buy_range_text(plan, quote) if chart_aligned else "완료 분봉 확인 중")
+    prices[1].metric("추천 매도가 1차", price_text(target_1))
+    exits = st.columns(3)
+    exits[0].metric("추천 매도가 2차", price_text(target_2))
+    exits[1].metric("현재 차트 지지", price_text(support))
+    exits[2].metric("손절가", price_text(stop))
 
+
+@st.fragment(run_every=60.0)
+def render_live_plan_fields(item: dict[str, Any], cost_pct: float, min_score: int) -> None:
+    render_plan_fields(live_card_snapshot(item, cost_pct, min_score))
+
+
+def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int) -> None:
+    """Render a price-first card with 1-second tick and 1-minute structure refreshes."""
+    quote: Quote = item["quote"]
+    title = f"{quote.symbol} · {item.get('name') or quote.market.value}"
     with st.container(border=True):
         st.subheader(title)
-        st.markdown(structure_strip_html(structure), unsafe_allow_html=True)
         render_realtime_price(
             quote.symbol,
             quote.market.value,
@@ -689,21 +734,7 @@ def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
             quote.previous_close,
             quote.timestamp.isoformat(),
         )
-        forecast_columns = st.columns(4)
-        for column, minutes in zip(forecast_columns, (5, 10, 15, 30)):
-            point = forecast_point_for(plan, minutes) if chart_aligned else None
-            column.metric(
-                f"{minutes}분 예상",
-                price_text(point.base if point else None),
-                forecast_direction_text(point),
-            )
-        prices = st.columns(2)
-        prices[0].metric("추천 매수가", buy_range_text(plan, quote) if chart_aligned else "완료 분봉 확인 중")
-        prices[1].metric("추천 매도가 1차", price_text(target_1))
-        exits = st.columns(3)
-        exits[0].metric("추천 매도가 2차", price_text(target_2))
-        exits[1].metric("현재 차트 지지", price_text(support))
-        exits[2].metric("손절가", price_text(stop))
+        render_live_plan_fields(item, cost_pct, min_score)
 
 
 def render_card_detail(item: dict[str, Any]) -> None:
@@ -882,7 +913,7 @@ if cards:
     source_text = " · ".join(sorted(source_labels))
     st.caption(f"상세 카드 {len(cards)}개 · {updated_at.strftime('%H:%M:%S')} · {realtime_hub.status_label()} · {source_text}")
     for card_item in cards:
-        render_live_card(card_item, float(cost_pct))
+        render_live_card(card_item, float(cost_pct), int(min_score))
 elif kis_connected and not errors and not candidates:
     limit_text = "30만 원 미만" if market == Market.KR else "170달러 미만"
     st.info(f"현재 {limit_text} 가격 조건과 상승 후보 기준을 함께 통과한 종목이 없습니다.")
