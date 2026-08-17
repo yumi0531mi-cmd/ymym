@@ -54,7 +54,7 @@ def secrets_fingerprint(secrets: Any | None = None) -> str:
     fields = (
         _secret(("KIS_APP_KEY", "APP_KEY", "app_key"), secrets),
         _secret(("KIS_APP_SECRET", "APP_SECRET", "app_secret"), secrets),
-        _secret(("KIS_ACCESS_TOKEN", "ACCESS_TOKEN"), secrets),
+        _secret(("KIS_ACCESS_TOKEN", "KIS_TOKEN", "ACCESS_TOKEN", "TOKEN", "access_token"), secrets),
         _secret(("KIS_BASE_URL", "BASE_URL"), secrets),
         _secret(("KIS_ALLOW_TOKEN_ISSUE",), secrets, "false"),
     )
@@ -99,7 +99,7 @@ class KISClient:
     def __init__(self, secrets: Any | None = None, cache_dir: str | Path = ".scanner_cache"):
         self.app_key = _secret(("KIS_APP_KEY", "APP_KEY", "app_key"), secrets)
         self.app_secret = _secret(("KIS_APP_SECRET", "APP_SECRET", "app_secret"), secrets)
-        self.access_token = _secret(("KIS_ACCESS_TOKEN", "ACCESS_TOKEN"), secrets)
+        self.access_token = _secret(("KIS_ACCESS_TOKEN", "KIS_TOKEN", "ACCESS_TOKEN", "TOKEN", "access_token"), secrets)
         self.access_token_expires_at = _secret(("KIS_ACCESS_TOKEN_EXPIRES_AT",), secrets)
         self.allow_token_issue = _as_bool(_secret(("KIS_ALLOW_TOKEN_ISSUE",), secrets, "false"))
         self.base = _secret(("KIS_BASE_URL", "BASE_URL"), secrets, "https://openapi.koreainvestment.com:9443").rstrip("/")

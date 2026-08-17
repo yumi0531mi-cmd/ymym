@@ -182,9 +182,14 @@ with st.sidebar:
     market = Market.KR if market_label.startswith("국내") else Market.US
     symbol = st.text_input("종목코드/티커 직접 검색", placeholder="005930 또는 SOXL").strip().upper()
     exchange = st.selectbox("미국 거래소", ["NAS", "NYS", "AMS"], disabled=market == Market.KR)
-    scan_now = st.button("고정 유동성 시작목록 검색", use_container_width=True)
-    full_market_scan_now = st.button("전종목 후보 검색", help="KIS 시장 순위 API로 1차 후보를 찾습니다. 개별 전종목 분봉 조회는 하지 않습니다.", use_container_width=True)
-    analyze_now = st.button("선택 종목 분석", type="primary", use_container_width=True)
+    kis_connected = bool(client.access_token)
+    if kis_connected:
+        st.success("한국투자증권 연결: 준비됨")
+    else:
+        st.warning("한국투자증권 연결: 아직 준비 중입니다. 연결이 끝날 때까지 검색·분석 버튼은 눌러도 작동하지 않습니다.")
+    scan_now = st.button("고정 유동성 시작목록 검색", use_container_width=True, disabled=not kis_connected)
+    full_market_scan_now = st.button("전종목 후보 검색", help="연결이 준비되면 시장 전체의 1차 후보를 찾습니다.", use_container_width=True, disabled=not kis_connected)
+    analyze_now = st.button("선택 종목 분석", type="primary", use_container_width=True, disabled=not kis_connected)
     live = st.toggle("자동 새로고침", False, help="기본은 꺼져 있습니다. 5시간 호출 예산 안에서 저빈도 갱신만 사용하세요.")
     refresh_seconds = st.select_slider("자동 새로고침 간격(초)", options=[60, 120, 300], value=60, disabled=not live)
     save_validation = st.toggle("매수 신호 검증 저장", False, help="진입 고려 신호만 저장합니다. 주문은 실행하지 않습니다.")
@@ -192,8 +197,7 @@ with st.sidebar:
     cost_pct = st.number_input("왕복비용 가정(%)", min_value=0.0, max_value=5.0, value=cost_default, step=0.01)
     min_score = st.slider("최소 신호 점수", min_value=60, max_value=100, value=80, step=5, help="점수는 승률이 아니라 현재 데이터·유동성·구조의 조건 충족도입니다.")
     st.caption(f"현재 세션: {market_session(market)}")
-    token_mode = getattr(client, "token_mode", "재시작 후 인증 상태 확인")
-    st.caption(f"KIS 인증: {token_mode}")
+    st.caption("연결 상태는 위의 초록색 또는 노란색 안내를 확인하세요.")
     budget = client.budget_status
     st.caption(
         f"KIS 호출 보호(현재 서버): 1분 {budget.minute_used}/{budget.minute_limit} · "
@@ -239,7 +243,10 @@ if full_market_scan_now:
         st.session_state["full_candidates"] = [candidate.to_dict() for candidate in full_candidates]
         st.session_state["full_scan_sources"] = {source: len(rows) for source, rows in full_rankings.items()}
     except KISError as exc:
-        st.error(f"전종목 후보 검색을 지금 실행할 수 없습니다: {exc}")
+        if "KIS_ACCESS_TOKEN" in str(exc):
+            st.error("한국투자증권 연결이 아직 준비되지 않았습니다. 연결이 확인된 뒤 다시 시도해 주세요.")
+        else:
+            st.error(f"전종목 후보 검색을 지금 실행할 수 없습니다: {exc}")
 
 analyze_candidate = False
 if st.session_state.get("full_market") == market.value and st.session_state.get("full_candidates"):
@@ -289,7 +296,10 @@ try:
         marker = str(plan.diagnostics.get("completed_bar_at") or quote.timestamp.isoformat())
         cycle = cycle_store.apply_risk_state(cycle, plan.risk_state, marker)
 except (KISError, ValueError, KeyError, OSError) as exc:
-    st.error(f"KIS 데이터 수신 실패: {exc}")
+    if isinstance(exc, KISError) and "KIS_ACCESS_TOKEN" in str(exc):
+        st.error("한국투자증권 연결이 아직 준비되지 않았습니다. 연결이 확인된 뒤 분석을 시작해 주세요.")
+    else:
+        st.error(f"시세를 받지 못했습니다: {exc}")
     st.caption("실시간 현재가와 호가를 확인하지 못했으므로 진입·목표·손절가는 표시하지 않습니다.")
     st.stop()
 except Exception as exc:
