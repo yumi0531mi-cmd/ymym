@@ -133,16 +133,23 @@ def admin_unlocked() -> bool:
 
 def render_chart(bars: pd.DataFrame, plan) -> None:
     fig = go.Figure(
-        go.Candlestick(x=bars.index, open=bars.open, high=bars.high, low=bars.low, close=bars.close, name="1분봉")
+        go.Candlestick(x=bars.index, open=bars.open, high=bars.high, low=bars.low, close=bars.close, name="완료·진행 1분봉")
     )
-    for value, name, color in (
-        (plan.entry, "실제 진입 참고", "#1976d2"),
-        (plan.target, "확인된 저항", "#2e7d32"),
-        (plan.stop, "지지 이탈 손절", "#c62828"),
+    for value, name, color, dash in (
+        (plan.entry, "진입 기준", "#1565c0", "solid"),
+        (plan.target, "1차 목표", "#2e7d32", "solid"),
+        (plan.target2, "2차 목표", "#00897b", "dash"),
+        (plan.invalidation or plan.stop, "구조 무효화", "#c62828", "solid"),
     ):
         if value is not None:
-            fig.add_hline(y=value, line_color=color, annotation_text=f"{name} {value:g}")
-    fig.update_layout(height=420, margin=dict(l=4, r=4, t=15, b=4), xaxis_rangeslider_visible=False)
+            fig.add_hline(y=value, line_color=color, line_dash=dash, annotation_text=f"{name} {value:g}")
+    if plan.repeat_box:
+        low, high = plan.repeat_box
+        fig.add_hrect(y0=low, y1=high, fillcolor="#90caf9", opacity=0.10, line_width=0, annotation_text="반복박스")
+    fig.update_layout(
+        height=460, margin=dict(l=4, r=4, t=24, b=4), xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h"),
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -162,7 +169,7 @@ with st.sidebar:
     save_validation = st.toggle("매수 신호 검증 저장", False, help="진입 고려 신호만 저장합니다. 주문은 실행하지 않습니다.")
     cost_default = 0.05 if market == Market.KR else 0.10
     cost_pct = st.number_input("왕복비용 가정(%)", min_value=0.0, max_value=5.0, value=cost_default, step=0.01)
-    min_score = st.slider("최소 신호 점수", min_value=70, max_value=100, value=85, step=5)
+    min_score = st.slider("최소 신호 점수", min_value=60, max_value=100, value=80, step=5, help="점수는 승률이 아니라 현재 데이터·유동성·구조의 조건 충족도입니다.")
     st.caption(f"현재 세션: {market_session(market)}")
     token_mode = getattr(client, "token_mode", "재시작 후 인증 상태 확인")
     st.caption(f"KIS 인증: {token_mode}")
@@ -172,9 +179,9 @@ with st.sidebar:
 if live and symbol:
     st_autorefresh(interval=int(refresh_seconds * 1000), key=f"live_refresh_{refresh_seconds}")
 
-st.title("시간별 강한 종목 + 반복박스 혼합형 스캐너")
+st.title("실시간 반복단타 후보")
 st.caption(
-    "수동매매 판단 보조 도구입니다. 수익은 보장되지 않으며, 매수 신호는 완료된 분봉·실제 진입 참고가·비용·유동성·세션 게이트를 모두 통과할 때만 표시합니다."
+    "수동매매 판단 보조 도구입니다. 화면의 진입·1차·2차 목표·구조 무효화 가격은 완료된 분봉, 호가, 거래량·거래대금, 비용과 유동성 조건으로 계산한 참고 구간이며 수익을 보장하지 않습니다."
 )
 
 if scan_now:
@@ -222,59 +229,87 @@ except Exception as exc:
 
 css = "buy" if plan.signal == Signal.BUY else "block" if plan.signal in (Signal.BLOCK, Signal.SELL) else "unknown" if plan.signal == Signal.UNVERIFIED else "wait"
 st.markdown(
-    f'<div class="signal {css}">{html.escape(plan.signal.value)} · {html.escape(plan.strategy)} · {html.escape(plan.regime.value)}</div>',
+    f'<div class="signal {css}">{html.escape(plan.signal.value)} · {html.escape(plan.strategy)}</div>',
     unsafe_allow_html=True,
 )
 
-metrics = [
+if plan.signal == Signal.BUY:
+    st.success("현재 조건에서는 진입 기준가와 구조 무효화 가격이 계산되었습니다. 1차 목표에서 일부 청산 여부를 직접 판단하세요.")
+elif plan.signal == Signal.WAIT:
+    st.info("가격 기준은 보여 드리지만, 현재는 진입 조건이 완성되지 않았습니다. 아래 ‘대기 이유’를 먼저 확인하세요.")
+else:
+    st.warning("현재 장세·유동성·데이터 조건에서 신규 진입을 피합니다. 가격 카드가 비어 있으면 필요한 구조가 아직 확인되지 않은 것입니다.")
+
+summary = [
     ("현재가", f"{quote.price:g}"),
-    ("매도 1호가", f"{quote.ask:g}" if quote.ask else "미수신"),
-    ("매수 1호가", f"{quote.bid:g}" if quote.bid else "미수신"),
     ("당일 등락", f"{quote.change_pct:+.2f}%"),
-    ("조건점수", f"{plan.score}점"),
+    ("조건 점수", f"{plan.score}/100"),
+    ("현재 세션", quote.session),
+    ("5시간 데이터", "준비" if plan.diagnostics.get("five_hour_data_ready") else f"{plan.diagnostics.get('completed_bars', 0)}/300분"),
 ]
-for column, (label, value) in zip(st.columns(5), metrics):
+for column, (label, value) in zip(st.columns(5), summary):
     column.metric(label, value)
 
-st.subheader("기계적 매매 계획")
-if plan.entry is None:
-    st.info("현재는 진입하지 않음. 모든 데이터·세션·유동성·손익비·점수 조건이 충족되기 전에는 가격을 제시하지 않습니다.")
-else:
-    values = [("실제 진입 참고가", plan.entry), ("확인된 저항 청산", plan.target), ("지지 이탈 손절", plan.stop)]
-    for column, (label, value) in zip(st.columns(3), values):
-        column.metric(label, f"{value:g}" if value is not None else "미확인")
-    st.caption(f"목표 근거: {plan.target_basis} · 손절 근거: {plan.stop_basis} · 왕복비용 가정: {cost_pct:.2f}%")
+st.subheader("반복단타 가격 계획")
+price_cards = [
+    ("진입 기준가", plan.entry, "실제 매수 참고가"),
+    ("1차 목표가", plan.target, plan.target_basis),
+    ("2차 목표가", plan.target2, plan.target2_basis),
+    ("구조 무효화", plan.invalidation or plan.stop, plan.stop_basis),
+]
+for column, (label, value, basis) in zip(st.columns(4), price_cards):
+    column.metric(label, f"{value:g}" if value is not None else "조건 미확인")
+    column.caption(basis)
+
+rr_value = plan.diagnostics.get("reward_risk_net")
+spread_value = plan.diagnostics.get("spread_pct")
+st.caption(
+    f"비용 반영 1차 목표 손익비: {rr_value:.2f}" if isinstance(rr_value, (int, float)) else "비용 반영 손익비: 구조 미확인"
+)
+st.caption(
+    f"호가 스프레드: {spread_value:.3f}% · 왕복비용 가정: {cost_pct:.2f}%" if isinstance(spread_value, (int, float)) else f"호가 스프레드: 미확인 · 왕복비용 가정: {cost_pct:.2f}%"
+)
 
 if plan.repeat_box:
     low, high = plan.repeat_box
-    ready = bool(plan.diagnostics.get("repeat_entry_ready"))
-    message = "하단 진입 구간에 근접" if ready else "현재 위치는 하단 진입 구간이 아님"
-    st.success(f"완료 5분봉 반복박스 확인: {low:g}~{high:g} (폭 {(high / low - 1) * 100:.2f}%) · {message}")
-    st.caption("상단 돌파 또는 하단 이탈 시 박스 반복 전략을 중단하고 신호를 다시 확인하세요.")
+    zone = plan.diagnostics.get("box_zone", "박스 위치 미확인")
+    st.success(f"반복박스 확인: {low:g}~{high:g} · 폭 {(high / low - 1) * 100:.2f}% · 현재 위치: {zone}")
+    st.caption("박스 전략은 하단 구간에서만 진입을 검토하고, 중단·상단에서는 추격하지 않습니다. 하단 아래 2개 완료 1분봉 종가가 확인되면 구조 무효화로 봅니다.")
 else:
-    st.caption("반복박스 미확인 또는 현재가 이탈: 현재는 1회 매매 관점만 사용합니다.")
+    st.caption("0.5~5.0%의 반복박스가 확인되지 않았습니다. 현재는 상승 추세 눌림 또는 장세 전환 관점으로만 평가합니다.")
 
-if plan.forecasts:
-    st.subheader("5·10·15·30분 경로 시나리오")
-    st.caption("확정가격이 아닌 사전 고정 범위입니다. 네 구간이 모두 맞아야 내부 경로 검증에서 통과로 처리합니다.")
+if plan.reasons:
+    st.subheader("지금 대기하거나 조심해야 하는 이유")
+    for reason in plan.reasons:
+        st.write(f"- {reason}")
+
+st.subheader("실시간 차트 · 진입 / 1차 / 2차 목표 / 구조 무효화")
+if not bars.empty:
+    render_chart(bars.tail(180), plan)
+
+with st.expander("계산 근거와 상세 지표"):
+    diagnostics = plan.diagnostics
+    plain = {
+        "전략": plan.strategy,
+        "장세": plan.regime.value,
+        "완료 1분봉 수": diagnostics.get("completed_bars"),
+        "VWAP": diagnostics.get("vwap"),
+        "EMA9": diagnostics.get("ema9"),
+        "ATR": diagnostics.get("atr"),
+        "상대거래량": diagnostics.get("rvol"),
+        "거래대금 상대강도": diagnostics.get("notional_rvol"),
+        "가짜신호 경고": diagnostics.get("false_signal_flags"),
+        "조건 통과표": diagnostics.get("gates"),
+        "대기 이유": plan.reasons,
+        "미수신 데이터": plan.missing,
+    }
+    st.json(plain, expanded=True)
+
+with st.expander("상승 여력 시나리오 (보조 참고)"):
+    st.caption("아래 범위는 확정 목표가가 아니라 최근 완료 1분봉 변동성을 이용한 5~30분 참고 범위입니다.")
     for column, point in zip(st.columns(4), plan.forecasts):
         column.metric(f"{point.minutes}분 · {point.direction.value}", f"{point.base:g}")
-        column.caption(f"{point.low:g}~{point.high:g}")
-
-if not bars.empty:
-    render_chart(bars.tail(120), plan)
-
-with st.expander("판정 근거와 데이터 상태"):
-    st.json(
-        {
-            "세션": quote.session,
-            "데이터검문": plan.data_verified,
-            "미수신": plan.missing,
-            "가감점·차단 근거": plan.reasons,
-            "진단": plan.diagnostics,
-        },
-        expanded=True,
-    )
+        column.caption(f"범위 {point.low:g}~{point.high:g}")
 
 store = ValidationStore(VALIDATION_ROOT, event_store=event_store)
 if save_validation and plan.signal == Signal.BUY and plan.forecasts:

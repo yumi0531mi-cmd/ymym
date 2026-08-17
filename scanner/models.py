@@ -82,6 +82,9 @@ class TradePlan:
     repeat_box: tuple[float, float] | None = None
     data_verified: bool = False
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    target2: float | None = None
+    target2_basis: str = "2차 목표 미확인"
+    invalidation: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

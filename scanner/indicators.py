@@ -35,6 +35,16 @@ def enrich(frame: pd.DataFrame) -> pd.DataFrame:
     df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
     avg_volume = df.volume.rolling(20, min_periods=5).mean()
     df["rvol"] = (df.volume / avg_volume.replace(0, np.nan)).fillna(0)
+    df["notional"] = df.close * df.volume
+    notional_5m = df["notional"].rolling(5, min_periods=5).sum()
+    baseline_notional = notional_5m.rolling(20, min_periods=10).median()
+    df["notional_rvol"] = (notional_5m / baseline_notional.replace(0, np.nan)).fillna(0)
+    df["atr_pct"] = (df["atr"] / df.close.replace(0, np.nan) * 100).fillna(0)
+    body_high = df[["open", "close"]].max(axis=1)
+    body_low = df[["open", "close"]].min(axis=1)
+    df["body"] = (df.close - df.open).abs()
+    df["upper_wick"] = (df.high - body_high).clip(lower=0)
+    df["lower_wick"] = (body_low - df.low).clip(lower=0)
     return df
 
 

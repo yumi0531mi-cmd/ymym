@@ -85,6 +85,75 @@ def repeat_box(frame: pd.DataFrame, current: float) -> tuple[float, float] | Non
     width = (high / low - 1) * 100
     touches_low = int((recent.low <= low * 1.002).sum())
     touches_high = int((recent.high >= high * 0.998).sum())
-    if 0.5 <= width <= 3.0 and touches_low >= 2 and touches_high >= 2:
+    if 0.5 <= width <= 5.0 and touches_low >= 2 and touches_high >= 2:
         return low, high
     return None
+
+
+def trade_levels(
+    frame: pd.DataFrame, entry: float, box: tuple[float, float] | None = None
+) -> tuple[float | None, float | None, float | None, str, str, str]:
+    """Return first target, second target and observed support without future prices."""
+    df = enrich(frame)
+    if len(df) < 20 or entry <= 0:
+        return None, None, None, "1차 목표 미확인", "2차 목표 미확인", "지지 미확인"
+
+    completed = df.iloc[:-1].tail(180)
+    highs = completed.high[(completed.high.shift(1) < completed.high) & (completed.high.shift(-1) < completed.high)]
+    lows = completed.low[(completed.low.shift(1) > completed.low) & (completed.low.shift(-1) > completed.low)]
+    resistances = sorted(float(value) for value in highs if value > entry)
+    supports = sorted((float(value) for value in lows if value < entry), reverse=True)
+    support = supports[0] if supports else None
+    target1 = resistances[0] if resistances else None
+    target2 = resistances[1] if len(resistances) > 1 else None
+    target1_basis = "완료 1분봉 스윙 저항" if target1 else "1차 목표 미확인"
+    target2_basis = "다음 완료 1분봉 스윙 저항" if target2 else "2차 목표 미확인"
+    support_basis = "완료 1분봉 스윙 저점" if support else "지지 미확인"
+
+    if box:
+        low, high = box
+        middle = (low + high) / 2
+        if low < entry < high:
+            support = low
+            support_basis = "완료 5분봉 반복박스 하단"
+            if middle > entry:
+                target1, target1_basis = middle, "반복박스 중단값"
+            if high > entry:
+                target2, target2_basis = high, "반복박스 상단값"
+    return target1, target2, support, target1_basis, target2_basis, support_basis
+
+
+def price_zone_in_box(box: tuple[float, float] | None, current: float) -> str:
+    if not box or current <= 0:
+        return "박스 미확인"
+    low, high = box
+    position = (current - low) / max(high - low, 1e-9)
+    if position <= 0.40:
+        return "하단 진입 구간"
+    if position >= 0.80:
+        return "상단 추격 금지 구간"
+    return "박스 중간 대기 구간"
+
+
+def fake_signal_flags(
+    frame: pd.DataFrame, support: float | None, resistance: float | None
+) -> dict[str, bool]:
+    """Identify completed-candle rejection patterns; these are warnings, not predictions."""
+    df = enrich(frame)
+    if len(df) < 3:
+        return {"fake_breakout": False, "fake_breakdown": False, "upper_rejection": False, "two_close_breakdown": False}
+    last = df.iloc[-1]
+    previous = df.iloc[-2]
+    body_floor = max(float(last.body), float(last.atr) * 0.05, 1e-9)
+    fake_breakout = bool(resistance and last.high > resistance and last.close < resistance)
+    fake_breakdown = bool(support and last.low < support and last.close >= support)
+    upper_rejection = bool(last.upper_wick >= body_floor * 1.5 and last.close <= (last.high + last.low) / 2)
+    two_close_breakdown = bool(
+        support and last.close < support and previous.close < support
+    )
+    return {
+        "fake_breakout": fake_breakout,
+        "fake_breakdown": fake_breakdown,
+        "upper_rejection": upper_rejection,
+        "two_close_breakdown": two_close_breakdown,
+    }

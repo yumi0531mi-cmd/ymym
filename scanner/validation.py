@@ -57,6 +57,10 @@ class ValidationCase:
     mae_pct: float | None = None
     net_return_pct: float | None = None
     missing: list[str] = field(default_factory=list)
+    strategy: str = ""
+    target2: float | None = None
+    target2_basis: str = ""
+    invalidation: float | None = None
 
     @classmethod
     def from_plan(cls, plan: TradePlan, latest_trade_price: float | None, session: str, version: str = "1.0.0"):
@@ -85,6 +89,10 @@ class ValidationCase:
             stop=plan.stop,
             horizons=horizons,
             missing=list(plan.missing),
+            strategy=plan.strategy,
+            target2=plan.target2,
+            target2_basis=plan.target2_basis,
+            invalidation=plan.invalidation,
         )
 
     def score_path(self, actual_prices: dict[int, float], actual_regime: Regime | None = None) -> None:
@@ -277,14 +285,33 @@ class ValidationStore:
         complete = [row for row in rows if row.get("complete_four_area_pass") is not None]
         passed = [row for row in complete if row.get("complete_four_area_pass") is True]
         net = [float(row["net_return_pct"]) for row in complete if row.get("net_return_pct") is not None]
+        groups: dict[str, list[float]] = {}
+        for row in rows:
+            if row.get("net_return_pct") is None:
+                continue
+            key = f"{row.get('market', '')}:{row.get('session', '')}:{row.get('strategy', '')}"
+            groups.setdefault(key, []).append(float(row["net_return_pct"]))
+        by_strategy_session = {}
+        for key, values in groups.items():
+            wins = sum(value > 0 for value in values)
+            rate = wins / len(values) * 100
+            by_strategy_session[key] = {
+                "samples": len(values),
+                "net_win_rate": rate,
+                "average_net_return_pct": sum(values) / len(values),
+                "eligible_for_80pct_review": len(values) >= 50,
+                "meets_80pct_goal": len(values) >= 50 and rate >= 80.0,
+            }
         return {
             "storage": self.storage_status,
             "signals": len(rows),
             "fully_scored": len(complete),
             "four_area_pass": len(passed),
             "four_area_rate": len(passed) / len(complete) * 100 if complete else None,
+            "net_win_rate": sum(value > 0 for value in net) / len(net) * 100 if net else None,
             "average_net_return_pct": sum(net) / len(net) if net else None,
             "worst_net_return_pct": min(net) if net else None,
+            "by_strategy_session": by_strategy_session,
         }
 
     def export_csv(self, output: str | Path) -> Path:

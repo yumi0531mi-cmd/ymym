@@ -6,7 +6,7 @@ import pandas as pd
 from scanner.engine import analyze
 from scanner.models import Market, Quote, Regime, Signal
 from scanner.persistence import EventStore, ManualTrade
-from scanner.strategy import confirmed_levels, repeat_box
+from scanner.strategy import confirmed_levels, fake_signal_flags, repeat_box, trade_levels
 from scanner.validation import ValidationCase
 from scanner.universe import rank_quotes
 
@@ -104,6 +104,39 @@ def test_closed_market_cannot_produce_buy_signal():
     plan = analyze(closed, df)
     assert plan.signal != Signal.BUY
     assert "거래 가능 세션" in plan.missing
+
+
+def test_repeat_box_allows_four_percent_repetition_range():
+    idx = pd.date_range("2026-01-02 09:00", periods=80, freq="min")
+    cycle = np.where((np.arange(80) // 5) % 2 == 0, 100.0, 104.0)
+    df = pd.DataFrame({
+        "open": cycle, "high": cycle + 0.2, "low": cycle - 0.2,
+        "close": cycle, "volume": np.full(80, 1000),
+    }, index=idx)
+    box = repeat_box(df, 101.0)
+    assert box is not None
+    assert 3.0 < (box[1] / box[0] - 1) * 100 <= 5.0
+
+
+def test_trade_levels_return_two_targets_when_swings_exist():
+    df = bars(180, slope=0)
+    entry = 100.0
+    target1, target2, support, *_ = trade_levels(df, entry)
+    assert target1 is None or target1 > entry
+    assert target2 is None or target2 > entry
+    assert support is None or support < entry
+
+
+def test_fake_breakdown_and_two_close_breakdown_are_distinguished():
+    idx = pd.date_range("2026-01-02 09:00", periods=40, freq="min")
+    price = np.full(40, 100.0)
+    df = pd.DataFrame({"open": price, "high": price + 0.2, "low": price - 0.2,
+                       "close": price, "volume": np.full(40, 1000)}, index=idx)
+    df.iloc[-2, df.columns.get_loc("close")] = 98.5
+    df.iloc[-1, df.columns.get_loc("close")] = 98.0
+    flags = fake_signal_flags(df, support=99.0, resistance=101.0)
+    assert flags["two_close_breakdown"] is True
+    assert flags["fake_breakdown"] is False
 
 
 def test_event_store_is_inert_without_supabase_secrets():
