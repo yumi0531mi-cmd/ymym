@@ -714,6 +714,7 @@ cards: list[dict[str, Any]] = []
 errors: list[str] = []
 candidates: list[dict[str, Any]] = []
 visible_requests: list[dict[str, Any]] = []
+fixed_symbols: tuple[str, ...] = ()
 direct_request: dict[str, str] | None = None
 if search_query:
     if market == Market.KR:
@@ -795,7 +796,6 @@ if candidates:
             + [str(card["quote"].symbol) for card in cards]
         )
     )
-    render_new_candidate_watchlist(market.value, fixed_symbols)
 elif kis_connected:
     limit_text = "30만 원 미만" if market == Market.KR else "170달러 미만"
     st.info(f"현재 {limit_text} 가격 조건과 상승 후보 기준을 함께 통과한 종목이 없습니다. 다음 30분 후보 목록 갱신 때 자동으로 다시 확인합니다.")
@@ -805,14 +805,14 @@ if cards:
     updated_at = max(card["quote"].timestamp for card in cards)
     source_labels = {str(card.get("candidate_source") or "시장 실시간 순위") for card in cards}
     source_text = " · ".join(sorted(source_labels))
-    st.markdown(f"<div class='connection ok'>실시간 현재가 기준 {updated_at.strftime('%H:%M:%S')} · {html.escape(realtime_hub.status_label())} · {source_text} · 상승 추세를 우선으로 {len(cards)}개를 분석했습니다. `반복단타 가능`은 추가 구조 표시이며, 초록색 목표가와 빨간색 손절가는 사용자 전략의 목표·손절 레벨입니다.</div>", unsafe_allow_html=True)
+    st.caption(f"상세 카드 {len(cards)}개 · {updated_at.strftime('%H:%M:%S')} · {realtime_hub.status_label()} · {source_text}")
     for card_item in cards:
         render_live_card(card_item, float(cost_pct))
 elif kis_connected and not errors and not candidates:
     st.info("현재 분석할 상승 추세 후보가 없습니다. 관심 종목은 왼쪽 검색칸에 바로 입력할 수 있습니다.")
 
+if candidates:
+    render_new_candidate_watchlist(market.value, fixed_symbols)
+
 for error in errors:
     st.warning(f"일부 후보는 분석 데이터를 만들지 못했습니다: {error}")
-
-with st.expander("숫자와 전략 신호 읽는 법"):
-    st.markdown("**현재가** 영역만 KIS 공식 실시간 체결가로 1초마다 갱신되며, 나머지 후보 목록·카드·차트는 다시 로딩하지 않습니다. 재연결 중에는 REST 현재가를 임시 표시합니다. **진입 기준가·1차/2차 목표가·손절가**는 완료된 1분봉과 5분봉 구조, 거래량·거래대금·호가 상태에 따라 계산합니다. `강한 매수 검토 · 실측 80% 이상`은 동일 전략·세션·점수 구간의 사후 표본이 30건 이상이고, 최근 30건에서도 1차 목표가가 Hard Stop보다 먼저 도달한 비율이 80% 이상이며, 왕복비용을 뺀 평균 결과가 양수일 때만 표시합니다. 표본 부족 구간은 80%라고 표시하지 않고 누적 상태로 남깁니다.")

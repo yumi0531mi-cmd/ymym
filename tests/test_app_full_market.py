@@ -104,7 +104,7 @@ def test_connected_app_automatically_renders_live_candidate_card_without_user_se
     assert any("005930" in str(item.value) for item in app.subheader)
     assert {metric.label for metric in app.metric} >= {"현재가", "추천 매수가", "추천 매도가 1차", "추천 매도가 2차", "손절가"}
     assert any("방향  5분 + · 10분 ? · 15분 + · 30분 +" in str(item.value) for item in app.caption)
-    assert any("실시간 현재가 기준" in str(item.value) for item in app.markdown)
+    assert any("상세 카드 1개" in str(item.value) for item in app.caption)
 
 
 def test_ranking_error_falls_back_to_liquid_candidates_and_still_renders_cards():
