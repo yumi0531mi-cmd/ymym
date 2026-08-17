@@ -85,6 +85,14 @@ class TradePlan:
     target2: float | None = None
     target2_basis: str = "2차 목표 미확인"
     invalidation: float | None = None
+    soft_stop: float | None = None
+    hard_stop: float | None = None
+    risk_state: str = "미확인"
+    persistence_score: int | None = None
+    persistence_band: str = "미산출"
+    persistence_confidence: float | None = None
+    calibration_probability: float | None = None
+    calibration_samples: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

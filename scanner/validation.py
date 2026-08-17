@@ -61,6 +61,9 @@ class ValidationCase:
     target2: float | None = None
     target2_basis: str = ""
     invalidation: float | None = None
+    score: int = 0
+    risk_state: str = ""
+    persistence_score: int | None = None
 
     @classmethod
     def from_plan(cls, plan: TradePlan, latest_trade_price: float | None, session: str, version: str = "1.0.0"):
@@ -93,6 +96,9 @@ class ValidationCase:
             target2=plan.target2,
             target2_basis=plan.target2_basis,
             invalidation=plan.invalidation,
+            score=plan.score,
+            risk_state=plan.risk_state,
+            persistence_score=plan.persistence_score,
         )
 
     def score_path(self, actual_prices: dict[int, float], actual_regime: Regime | None = None) -> None:
@@ -319,7 +325,7 @@ class ValidationStore:
         path = Path(output)
         path.parent.mkdir(parents=True, exist_ok=True)
         fields = [
-            "case_id", "version", "symbol", "market", "session", "signal_time", "signal", "quote_pass",
+            "case_id", "version", "symbol", "market", "session", "signal_time", "signal", "score", "risk_state", "quote_pass",
             "predicted_regime", "actual_regime", "regime_pass", "target_pass", "full_path_pass",
             "complete_four_area_pass", "mfe_pct", "mae_pct", "net_return_pct",
         ]

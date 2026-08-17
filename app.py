@@ -9,6 +9,8 @@ import plotly.graph_objects as go
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
+from scanner.calibration import calibration_for
+from scanner.cycle import CycleStore
 from scanner.engine import analyze
 from scanner.kis_client import KISClient, KISError
 from scanner.models import Market, Quote, Signal
@@ -17,7 +19,7 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "5.1-persistence-cycle"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 
 st.set_page_config(page_title="한투 혼합형 주식 스캐너", page_icon="📡", layout="wide")
@@ -42,6 +44,11 @@ def get_client() -> KISClient:
 @st.cache_resource
 def get_event_store() -> EventStore:
     return EventStore(st.secrets)
+
+
+@st.cache_resource
+def get_cycle_store() -> CycleStore:
+    return CycleStore(get_event_store())
 
 
 def _quote_to_cache_record(quote: Quote) -> dict[str, object]:
@@ -139,7 +146,8 @@ def render_chart(bars: pd.DataFrame, plan) -> None:
         (plan.entry, "진입 기준", "#1565c0", "solid"),
         (plan.target, "1차 목표", "#2e7d32", "solid"),
         (plan.target2, "2차 목표", "#00897b", "dash"),
-        (plan.invalidation or plan.stop, "구조 무효화", "#c62828", "solid"),
+        (plan.soft_stop, "Soft Stop", "#ef6c00", "dash"),
+        (plan.hard_stop or plan.invalidation or plan.stop, "Hard Stop", "#c62828", "solid"),
     ):
         if value is not None:
             fig.add_hline(y=value, line_color=color, line_dash=dash, annotation_text=f"{name} {value:g}")
@@ -155,6 +163,7 @@ def render_chart(bars: pd.DataFrame, plan) -> None:
 
 client = get_client()
 event_store = get_event_store()
+cycle_store = get_cycle_store()
 
 with st.sidebar:
     st.title("📡 스캐너 설정")
@@ -209,16 +218,26 @@ if not (analyze_now or live):
     st.info("준비되었습니다. **선택 종목 분석**을 눌러 KIS 시세를 요청하세요.")
     st.stop()
 
+store = ValidationStore(VALIDATION_ROOT, event_store=event_store)
 try:
     quote = load_quote(symbol, market.value, exchange)
     bars = load_bars(symbol, market.value, exchange)
-    plan = analyze(
-        quote,
-        bars,
-        orderbook_required=True,
-        round_trip_cost_pct=float(cost_pct),
-        minimum_score=int(min_score),
+    cycle = cycle_store.get(symbol, market, quote.timestamp)
+    preliminary = analyze(
+        quote, bars, orderbook_required=True, round_trip_cost_pct=float(cost_pct),
+        minimum_score=int(min_score), cooldown_active=cycle.cooldown_active, hard_kill=cycle.hard_kill,
     )
+    calibration = calibration_for(
+        store, market=market.value, session=quote.session, strategy=preliminary.strategy, score=preliminary.score,
+    )
+    plan = analyze(
+        quote, bars, orderbook_required=True, round_trip_cost_pct=float(cost_pct), minimum_score=int(min_score),
+        cooldown_active=cycle.cooldown_active, hard_kill=cycle.hard_kill,
+        calibration_probability=calibration.probability_pct, calibration_samples=calibration.samples,
+    )
+    if event_store.configured:
+        marker = str(plan.diagnostics.get("completed_bar_at") or quote.timestamp.isoformat())
+        cycle = cycle_store.apply_risk_state(cycle, plan.risk_state, marker)
 except (KISError, ValueError, KeyError, OSError) as exc:
     st.error(f"KIS 데이터 수신 실패: {exc}")
     st.caption("실시간 현재가와 호가를 확인하지 못했으므로 진입·목표·손절가는 표시하지 않습니다.")
@@ -242,12 +261,13 @@ else:
 
 summary = [
     ("현재가", f"{quote.price:g}"),
-    ("당일 등락", f"{quote.change_pct:+.2f}%"),
-    ("조건 점수", f"{plan.score}/100"),
-    ("현재 세션", quote.session),
-    ("5시간 데이터", "준비" if plan.diagnostics.get("five_hour_data_ready") else f"{plan.diagnostics.get('completed_bars', 0)}/300분"),
+    ("모델 점수", f"{plan.score}/100"),
+    ("지속성", f"{plan.persistence_score if plan.persistence_score is not None else '-'}점 · {plan.persistence_band}"),
+    ("위험 상태", plan.risk_state),
+    ("Horizon", str(plan.diagnostics.get("persistence", {}).get("horizon_state", "미확인"))),
+    ("보정 확률", f"{plan.calibration_probability:.1f}%" if plan.calibration_probability is not None else f"보정 전 ({plan.calibration_samples}/30)"),
 ]
-for column, (label, value) in zip(st.columns(5), summary):
+for column, (label, value) in zip(st.columns(6), summary):
     column.metric(label, value)
 
 st.subheader("반복단타 가격 계획")
@@ -255,9 +275,10 @@ price_cards = [
     ("진입 기준가", plan.entry, "실제 매수 참고가"),
     ("1차 목표가", plan.target, plan.target_basis),
     ("2차 목표가", plan.target2, plan.target2_basis),
-    ("구조 무효화", plan.invalidation or plan.stop, plan.stop_basis),
+    ("Soft Stop", plan.soft_stop, "지지 훼손 확인 시작선"),
+    ("Hard Stop", plan.hard_stop or plan.invalidation or plan.stop, plan.stop_basis),
 ]
-for column, (label, value, basis) in zip(st.columns(4), price_cards):
+for column, (label, value, basis) in zip(st.columns(5), price_cards):
     column.metric(label, f"{value:g}" if value is not None else "조건 미확인")
     column.caption(basis)
 
@@ -299,7 +320,9 @@ with st.expander("계산 근거와 상세 지표"):
         "상대거래량": diagnostics.get("rvol"),
         "거래대금 상대강도": diagnostics.get("notional_rvol"),
         "가짜신호 경고": diagnostics.get("false_signal_flags"),
-        "조건 통과표": diagnostics.get("gates"),
+        "지속성 진단": diagnostics.get("persistence"),
+        "위험 상태": diagnostics.get("risk"),
+        "FINAL_BUY 조건": diagnostics.get("final_buy_gates"),
         "대기 이유": plan.reasons,
         "미수신 데이터": plan.missing,
     }
@@ -311,7 +334,6 @@ with st.expander("상승 여력 시나리오 (보조 참고)"):
         column.metric(f"{point.minutes}분 · {point.direction.value}", f"{point.base:g}")
         column.caption(f"범위 {point.low:g}~{point.high:g}")
 
-store = ValidationStore(VALIDATION_ROOT, event_store=event_store)
 if save_validation and plan.signal == Signal.BUY and plan.forecasts:
     scored = store.score_ready(symbol, market.value, bars, float(cost_pct))
     latest = float(bars.close.iloc[-2]) if len(bars) >= 2 else None
