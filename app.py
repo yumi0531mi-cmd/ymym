@@ -61,7 +61,9 @@ st.markdown(
 	.badges{display:flex;flex-wrap:wrap;gap:.35rem;margin:.7rem 0}.badge{border-radius:999px;padding:.24rem .55rem;font-size:.73rem;font-weight:750;background:#edf2f8;color:#34445d}.badge.buy{background:#dff7e7;color:#176238}.badge.wait{background:#fff3cc;color:#885b00}.badge.block{background:#ffe4e5;color:#a32f37}.badge.risk{background:#f8e7ec;color:#a32f57}
 	.warn-box{border:1px solid #f0b7b7;background:#fff4f4;color:#9f3131;border-radius:11px;padding:.55rem .65rem;margin:.55rem 0;font-size:.82rem}.note-box{background:#edf4ff;color:#274f85;border-radius:11px;padding:.55rem .65rem;margin:.55rem 0;font-size:.82rem}
 	.data-grid{display:grid;grid-template-columns:1fr 1fr;gap:.35rem .75rem;margin:.75rem 0}.data-item{border-bottom:1px solid #e3e9f1;padding:.35rem 0}.data-label{color:var(--muted);font-size:.72rem}.data-value{font-size:.9rem;font-weight:700;margin-top:.1rem}
-	.plan-title{font-weight:800;font-size:.95rem;margin:.85rem 0 .35rem}.plan-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.4rem}.plan-item{background:#f5f8fc;border-radius:10px;padding:.48rem}.plan-item .data-label{font-size:.7rem}.entry{color:#a66c00}.target{color:var(--green)}.stop{color:var(--red)}
+			.plan-title{font-weight:800;font-size:.95rem;margin:.85rem 0 .35rem}.plan-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.4rem}.plan-item{background:#f5f8fc;border-radius:10px;padding:.48rem}.plan-item .data-label{font-size:.7rem}.entry{color:#a66c00}.target{color:var(--green)}.stop{color:var(--red)}
+		.structure-strip{display:grid;grid-template-columns:repeat(6,minmax(100px,1fr));overflow-x:auto;border:1px solid var(--line);border-radius:12px;margin:.35rem 0 .65rem;background:#fbfcfe}.structure-cell{padding:.48rem .55rem;border-right:1px solid var(--line);min-width:100px}.structure-cell:last-child{border-right:0}.structure-label{color:var(--muted);font-size:.7rem}.structure-value{font-size:.86rem;font-weight:750;margin-top:.15rem;white-space:nowrap}@media(max-width:700px){.structure-strip{grid-template-columns:repeat(6,minmax(112px,1fr))}}
+
 	.card-foot{color:var(--muted);font-size:.72rem;margin-top:.65rem}.card-detail{margin:.15rem 0 1rem}
 	@media(max-width:700px){.block-container{padding:.65rem .55rem 2rem}.cards-grid{grid-template-columns:1fr;gap:.75rem}.trade-card{padding:.8rem;border-radius:15px}.ticker{font-size:1.1rem}.price{font-size:1.18rem}.data-grid{gap:.25rem .55rem}.plan-grid{gap:.3rem}.plan-item{padding:.42rem}.stButton>button{min-height:2.5rem;font-size:.92rem}}
 
@@ -462,6 +464,15 @@ def dashboard_structure(item: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def structure_strip_html(structure: dict[str, str]) -> str:
+    cells = "".join(
+        f'<div class="structure-cell"><div class="structure-label">{html.escape(label)}</div>'
+        f'<div class="structure-value">{html.escape(value)}</div></div>'
+        for label, value in structure.items()
+    )
+    return f'<div class="structure-strip">{cells}</div>'
+
+
 def compact_directions(plan: Any) -> str:
     signs = {Regime.UP: "+", Regime.DOWN: "-", Regime.RANGE: "0"}
     values = []
@@ -642,7 +653,7 @@ def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
 
     with st.container(border=True):
         st.subheader(title)
-        st.dataframe(pd.DataFrame([structure]), hide_index=True, width="stretch")
+        st.markdown(structure_strip_html(structure), unsafe_allow_html=True)
         render_realtime_price(
             quote.symbol,
             quote.market.value,
