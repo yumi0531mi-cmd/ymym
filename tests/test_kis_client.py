@@ -67,3 +67,42 @@ def test_token_issuance_is_disabled_without_explicit_local_opt_in(tmp_path):
         assert "KIS_ACCESS_TOKEN" in str(exc)
         return
     raise AssertionError("automatic issuance must be disabled by default")
+
+
+def test_kr_market_rankings_use_two_first_page_requests(tmp_path):
+    client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
+    responses = [{"output": [{"mksc_shrn_iscd": "005930"}]}, {"output": [{"mksc_shrn_iscd": "000660"}]}]
+    calls = []
+
+    def fake_get(path, tr_id, params):
+        calls.append((path, tr_id, params))
+        return responses.pop(0)
+
+    client._get = fake_get  # type: ignore[method-assign]
+    rankings = client.market_rankings(Market.KR)
+
+    assert len(calls) == 2
+    assert {call[0] for call in calls} == {
+        "/uapi/domestic-stock/v1/quotations/volume-rank",
+        "/uapi/domestic-stock/v1/ranking/fluctuation",
+    }
+    assert len(rankings["거래대금·거래량 순위"]) == 1
+    assert len(rankings["상승률 순위"]) == 1
+
+
+def test_us_market_rankings_use_two_requests_per_exchange(tmp_path):
+    client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
+    responses = [{"output2": [{"symb": "TEST"}]} for _ in range(6)]
+    calls = []
+
+    def fake_get(path, tr_id, params):
+        calls.append((path, tr_id, params))
+        return responses.pop(0)
+
+    client._get = fake_get  # type: ignore[method-assign]
+    rankings = client.market_rankings(Market.US)
+
+    assert len(calls) == 6
+    assert {call[2]["EXCD"] for call in calls} == {"NAS", "NYS", "AMS"}
+    assert len(rankings["거래대금·거래량 순위"]) == 3
+    assert len(rankings["상승률 순위"]) == 3

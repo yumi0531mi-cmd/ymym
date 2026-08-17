@@ -363,3 +363,73 @@ class KISClient:
         df.index = timestamps
         df = df.loc[df.index.notna(), ["open", "high", "low", "close", "volume"]].sort_index()
         return df[~df.index.duplicated(keep="last")]
+
+
+    def market_rankings(self, market: Market) -> dict[str, list[dict[str, Any]]]:
+        """Fetch only first-page market rankings for a low-call candidate screen.
+
+        Returned rows are candidates, not tradable signals. Per-symbol quote,
+        orderbook and intraday calls remain deferred until the user selects one.
+        """
+        if market == Market.KR:
+            volume = self._get(
+                "/uapi/domestic-stock/v1/quotations/volume-rank",
+                "FHPST01710000",
+                {
+                    "FID_COND_MRKT_DIV_CODE": "J",
+                    "FID_COND_SCR_DIV_CODE": "20171",
+                    "FID_INPUT_ISCD": "0000",
+                    "FID_DIV_CLS_CODE": "0",
+                    "FID_BLNG_CLS_CODE": "3",
+                    "FID_TRGT_CLS_CODE": "111111111",
+                    "FID_TRGT_EXLS_CLS_CODE": "0000000000",
+                    "FID_INPUT_PRICE_1": "0",
+                    "FID_INPUT_PRICE_2": "10000000",
+                    "FID_VOL_CNT": "0",
+                    "FID_INPUT_DATE_1": "",
+                },
+            )
+            fluctuation = self._get(
+                "/uapi/domestic-stock/v1/ranking/fluctuation",
+                "FHPST01700000",
+                {
+                    "fid_rsfl_rate2": "30",
+                    "fid_cond_mrkt_div_code": "J",
+                    "fid_cond_scr_div_code": "20170",
+                    "fid_input_iscd": "0000",
+                    "fid_rank_sort_cls_code": "0000",
+                    "fid_input_cnt_1": "0",
+                    "fid_prc_cls_code": "0",
+                    "fid_input_price_1": "0",
+                    "fid_input_price_2": "10000000",
+                    "fid_vol_cnt": "0",
+                    "fid_trgt_cls_code": "0",
+                    "fid_trgt_exls_cls_code": "0",
+                    "fid_div_cls_code": "0",
+                    "fid_rsfl_rate1": "0",
+                },
+            )
+            return {
+                "거래대금·거래량 순위": list(volume.get("output") or []),
+                "상승률 순위": list(fluctuation.get("output") or []),
+            }
+
+        rankings: dict[str, list[dict[str, Any]]] = {"거래대금·거래량 순위": [], "상승률 순위": []}
+        for exchange in ("NAS", "NYS", "AMS"):
+            turnover = self._get(
+                "/uapi/overseas-stock/v1/ranking/trade-pbmn",
+                "HHDFS76320010",
+                {"EXCD": exchange, "NDAY": "0", "VOL_RANG": "0", "AUTH": "", "KEYB": "", "PRC1": "", "PRC2": ""},
+            )
+            updown = self._get(
+                "/uapi/overseas-stock/v1/ranking/updown-rate",
+                "HHDFS76290000",
+                {"EXCD": exchange, "NDAY": "0", "GUBN": "1", "VOL_RANG": "0", "AUTH": "", "KEYB": ""},
+            )
+            rankings["거래대금·거래량 순위"].extend(
+                [{**row, "_exchange": exchange} for row in list(turnover.get("output2") or []) if isinstance(row, dict)]
+            )
+            rankings["상승률 순위"].extend(
+                [{**row, "_exchange": exchange} for row in list(updown.get("output2") or []) if isinstance(row, dict)]
+            )
+        return rankings

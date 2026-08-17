@@ -13,6 +13,7 @@ from scanner.calibration import calibration_for
 from scanner.cycle import CycleStore
 from scanner.engine import analyze
 from scanner.kis_client import KISClient, KISError
+from scanner.market_screener import merge_rankings
 from scanner.models import Market, Quote, Signal
 from scanner.persistence import EventStore, ManualTrade, PersistenceError, save_manual_trade
 from scanner.sessions import market_session
@@ -171,7 +172,8 @@ with st.sidebar:
     market = Market.KR if market_label.startswith("국내") else Market.US
     symbol = st.text_input("종목코드/티커 직접 검색", placeholder="005930 또는 SOXL").strip().upper()
     exchange = st.selectbox("미국 거래소", ["NAS", "NYS", "AMS"], disabled=market == Market.KR)
-    scan_now = st.button("유동성 시작목록 빠른검색", use_container_width=True)
+    scan_now = st.button("고정 유동성 시작목록 검색", use_container_width=True)
+    full_market_scan_now = st.button("전종목 후보 검색", help="KIS 시장 순위 API로 1차 후보를 찾습니다. 개별 전종목 분봉 조회는 하지 않습니다.", use_container_width=True)
     analyze_now = st.button("선택 종목 분석", type="primary", use_container_width=True)
     live = st.toggle("자동 새로고침", False, help="기본은 꺼져 있습니다. 5시간 호출 예산 안에서 저빈도 갱신만 사용하세요.")
     refresh_seconds = st.select_slider("자동 새로고침 간격(초)", options=[60, 120, 300], value=60, disabled=not live)
@@ -198,7 +200,7 @@ st.title("실시간 반복단타 후보")
 st.caption(
     "수동매매 판단 보조 도구입니다. 진입·손절은 완료 1분봉 구조를, 1차·2차 목표는 완료 5분봉 구조를 우선 반영합니다. 화면 가격은 호가, 거래량·거래대금, 비용과 유동성 조건을 함께 계산한 참고 구간이며 수익을 보장하지 않습니다."
 )
-st.caption("API 보호: 화면을 열기만 해서는 KIS 시세를 요청하지 않습니다. 종목 분석은 최대 3건, 빠른검색은 국내 14건·미국 21건의 현재가 요청을 사용하며, 초과 요청은 앱에서 보수적으로 대기 처리합니다.")
+st.caption("API 보호: 화면을 열기만 해서는 KIS 시세를 요청하지 않습니다. 종목 분석은 최대 3건, 고정 시작목록 검색은 국내 14건·미국 21건의 현재가 요청을 사용합니다. 전종목 후보 검색은 국내 2건·미국 6건의 시장 순위 요청만 사용하며, 개별 분봉·호가 조회는 선택한 종목에만 실행합니다.")
 
 if scan_now:
     with st.spinner("시작목록의 현재가 1차 필터 확인 중…"):
@@ -208,7 +210,7 @@ if scan_now:
     st.session_state["scan_errors"] = scan_errors
 
 if st.session_state.get("ranked_market") == market.value and st.session_state.get("ranked_candidates"):
-    st.subheader("유동성 시작목록 1차 결과")
+    st.subheader("고정 유동성 시작목록 1차 결과")
     st.caption("전체 시장 스캔이 아닙니다. 공개된 시작목록의 가격·상승률 결과이며, 정밀 조건을 통과하기 전에는 매수 후보가 아닙니다.")
     st.dataframe(
         pd.DataFrame(st.session_state["ranked_candidates"], columns=["종목", "등락률(%)"]),
@@ -218,10 +220,40 @@ if st.session_state.get("ranked_market") == market.value and st.session_state.ge
 if st.session_state.get("ranked_market") == market.value and st.session_state.get("scan_errors"):
     st.caption(f"현재가 미수신: {len(st.session_state['scan_errors'])}건")
 
+if full_market_scan_now:
+    try:
+        with st.spinner("시장 전체 순위에서 반복단타 후보를 1차 선별 중…"):
+            full_rankings = client.market_rankings(market)
+            full_candidates = merge_rankings(market, full_rankings, limit=20)
+        st.session_state["full_market"] = market.value
+        st.session_state["full_candidates"] = [candidate.to_dict() for candidate in full_candidates]
+        st.session_state["full_scan_sources"] = {source: len(rows) for source, rows in full_rankings.items()}
+    except KISError as exc:
+        st.error(f"전종목 후보 검색을 지금 실행할 수 없습니다: {exc}")
+
+analyze_candidate = False
+if st.session_state.get("full_market") == market.value and st.session_state.get("full_candidates"):
+    st.subheader("전종목 1차 후보 결과")
+    st.caption("시장 전체 순위 응답에서 거래대금·거래량과 상승률이 겹치는 종목을 우선 정렬했습니다. 이 점수는 매수 신호나 승률이 아닙니다.")
+    candidates = pd.DataFrame(st.session_state["full_candidates"])
+    display_columns = [column for column in ["symbol", "name", "exchange", "screen_score", "sources", "price", "change_pct", "volume", "turnover"] if column in candidates]
+    st.dataframe(candidates[display_columns], hide_index=True, use_container_width=True)
+    selected = st.selectbox(
+        "전종목 후보를 골라 정밀 분석",
+        options=[""] + list(range(len(st.session_state["full_candidates"]))),
+        format_func=lambda index: "후보 선택" if index == "" else f"{st.session_state['full_candidates'][index]['symbol']} · {st.session_state['full_candidates'][index]['name']}",
+    )
+    if selected != "":
+        selected_candidate = st.session_state["full_candidates"][selected]
+        symbol = str(selected_candidate["symbol"])
+        if market == Market.US and selected_candidate.get("exchange"):
+            exchange = str(selected_candidate["exchange"])
+        analyze_candidate = st.button(f"{symbol} 정밀 분석", type="primary")
+
 if not symbol:
     st.info("왼쪽에 종목코드 또는 티커를 입력하고 **선택 종목 분석**을 누르세요. 자동 새로고침은 기본 해제되어 API 호출을 줄입니다.")
     st.stop()
-if not (analyze_now or live):
+if not (analyze_now or analyze_candidate or live):
     st.info("준비되었습니다. **선택 종목 분석**을 눌러 KIS 시세를 요청하세요.")
     st.stop()
 
