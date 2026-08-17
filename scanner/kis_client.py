@@ -67,7 +67,7 @@ def secrets_fingerprint(secrets: Any | None = None) -> str:
         _secret(("KIS_APP_SECRET", "APP_SECRET", "app_secret"), secrets),
         _secret(("KIS_ACCESS_TOKEN", "KIS_TOKEN", "ACCESS_TOKEN", "TOKEN", "access_token"), secrets),
         _secret(("KIS_BASE_URL", "BASE_URL"), secrets),
-        _secret(("KIS_ALLOW_TOKEN_ISSUE",), secrets, "false"),
+        _secret(("KIS_ALLOW_TOKEN_ISSUE", "KIS_AUTO_TOKEN_ISSUE"), secrets, "true"),
     )
     return hashlib.sha256("\x1f".join(fields).encode("utf-8")).hexdigest()
 
@@ -103,22 +103,29 @@ def _parse_time(value: str) -> datetime | None:
 class KISClient:
     """Read-only KIS REST client with conservative token and request controls.
 
-    Community Cloud deployments should provide a daily-issued KIS_ACCESS_TOKEN through
-    Streamlit Secrets. Automatic token issuance is deliberately disabled by default.
+    Community Cloud deployments can use a daily KIS_ACCESS_TOKEN when supplied, or
+    issue one only on the first protected KIS request when no valid token is cached.
+    Token issuance never occurs while the app's initial screen is rendered.
     """
 
     def __init__(self, secrets: Any | None = None, cache_dir: str | Path = ".scanner_cache"):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.app_key, app_key_source = _secret_with_source(("KIS_APP_KEY", "APP_KEY", "app_key"), secrets)
         self.app_secret, app_secret_source = _secret_with_source(("KIS_APP_SECRET", "APP_SECRET", "app_secret"), secrets)
         self.access_token, token_source = _secret_with_source(("KIS_ACCESS_TOKEN", "KIS_TOKEN", "ACCESS_TOKEN", "TOKEN", "access_token"), secrets)
+        self.access_token_expires_at = _secret(("KIS_ACCESS_TOKEN_EXPIRES_AT",), secrets)
+        # The user selected the simple automatic mode: issue only when a KIS
+        # request needs a token, then reuse the private local cache until expiry.
+        self.allow_token_issue = _as_bool(_secret(("KIS_ALLOW_TOKEN_ISSUE", "KIS_AUTO_TOKEN_ISSUE"), secrets, "true"))
+        cached_token = self._cached_token()
+        has_auto_path = bool(self.app_key and self.app_secret and self.allow_token_issue)
         self.connection_diagnostics = {
             "앱 키": "확인됨" if self.app_key else "미확인",
             "앱 시크릿": "확인됨" if self.app_secret else "미확인",
-            "당일 토큰": "확인됨" if self.access_token else "미확인",
-            "저장 위치": token_source if self.access_token else (app_key_source if self.app_key else app_secret_source),
+            "당일 토큰": "확인됨" if (self.access_token or cached_token) else ("자동 발급 대기" if has_auto_path else "미확인"),
+            "저장 위치": token_source if self.access_token else ("앱 임시 보관" if cached_token else (app_key_source if self.app_key else app_secret_source)),
         }
-        self.access_token_expires_at = _secret(("KIS_ACCESS_TOKEN_EXPIRES_AT",), secrets)
-        self.allow_token_issue = _as_bool(_secret(("KIS_ALLOW_TOKEN_ISSUE",), secrets, "false"))
         self.base = _secret(("KIS_BASE_URL", "BASE_URL"), secrets, "https://openapi.koreainvestment.com:9443").rstrip("/")
         self.min_request_interval = _as_float(
             _secret(("KIS_MIN_REQUEST_INTERVAL_SECONDS",), secrets, "1.0"), default=1.0, minimum=0.2
@@ -128,8 +135,6 @@ class KISClient:
             minute_limit=_as_int(_secret(("KIS_MAX_REQUESTS_PER_MINUTE",), secrets, "30"), default=30, minimum=1),
             five_hour_limit=_as_int(_secret(("KIS_MAX_REQUESTS_PER_FIVE_HOURS",), secrets, "1100"), default=1100, minimum=1),
         )
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.session = requests.Session()
         self.session.headers.update({"content-type": "application/json; charset=utf-8", "custtype": "P"})
         self._mutex = threading.Lock()
@@ -142,15 +147,17 @@ class KISClient:
 
     @property
     def ready(self) -> bool:
-        """True only when a manual token and both app credentials are available."""
-        return bool(self.configured and self.access_token)
+        """True when a manual/cached token exists or safe on-demand issuance is available."""
+        return bool(self.configured and (self.access_token or self._cached_token() or self.allow_token_issue))
 
     @property
     def token_mode(self) -> str:
         if self.access_token:
             return "수동 토큰"
-        if self.allow_token_issue:
-            return "로컬 개발용 자동 발급"
+        if self._cached_token():
+            return "자동 발급 토큰 재사용"
+        if self.allow_token_issue and self.configured:
+            return "필요 시 1회 자동 발급"
         return "토큰 미설정"
 
     @property
@@ -226,8 +233,8 @@ class KISClient:
 
         if not self.allow_token_issue:
             raise KISError(
-                "KIS_ACCESS_TOKEN이 없습니다. Community Cloud에서는 일일 토큰을 Secrets에 입력하세요. "
-                "자동 발급은 KIS_ALLOW_TOKEN_ISSUE=true인 로컬 개발 환경에서만 허용됩니다."
+                "KIS_ACCESS_TOKEN이 없고 자동 발급도 꺼져 있습니다. "
+                "KIS_ALLOW_TOKEN_ISSUE=true로 설정하거나 수동 토큰을 입력하세요."
             )
         if not self.configured:
             raise KISError("KIS_APP_KEY/KIS_APP_SECRET이 없습니다.")
@@ -255,6 +262,10 @@ class KISClient:
             path.write_text(
                 json.dumps({"access_token": token, "expires_at": expires.isoformat()}), encoding="utf-8"
             )
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
             return token
 
     def _get(self, path: str, tr_id: str, params: dict[str, Any]) -> dict[str, Any]:

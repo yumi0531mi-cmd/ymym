@@ -72,14 +72,45 @@ def test_secrets_fingerprint_changes_without_exposing_secret_value():
     assert "token-a" not in before and "token-b" not in after
 
 
-def test_token_issuance_is_disabled_without_explicit_local_opt_in(tmp_path):
-    client = KISClient({"KIS_APP_KEY": "test", "KIS_APP_SECRET": "test"}, cache_dir=tmp_path)
+def test_token_issuance_can_be_explicitly_disabled(tmp_path):
+    client = KISClient(
+        {"KIS_APP_KEY": "test", "KIS_APP_SECRET": "test", "KIS_ALLOW_TOKEN_ISSUE": "false"},
+        cache_dir=tmp_path,
+    )
     try:
         client._token()
     except KISError as exc:
-        assert "KIS_ACCESS_TOKEN" in str(exc)
+        assert "자동 발급" in str(exc)
         return
-    raise AssertionError("automatic issuance must be disabled by default")
+    raise AssertionError("explicitly disabled automatic issuance must not run")
+
+
+def test_automatic_token_issuance_happens_once_then_reuses_private_cache(tmp_path):
+    client = KISClient({"KIS_APP_KEY": "test", "KIS_APP_SECRET": "test"}, cache_dir=tmp_path)
+    calls = []
+
+    class TokenResponse:
+        ok = True
+
+        @staticmethod
+        def json():
+            return {"access_token": "issued-token", "expires_in": 23 * 60 * 60}
+
+    def fake_request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return TokenResponse()
+
+    client._request = fake_request  # type: ignore[method-assign]
+    assert client.ready
+    assert client.token_mode == "필요 시 1회 자동 발급"
+    assert client._token() == "issued-token"
+    assert client._token() == "issued-token"
+    assert len(calls) == 1
+    assert calls[0][0] == "POST" and calls[0][1] == "/oauth2/tokenP"
+
+    restarted_client = KISClient({"KIS_APP_KEY": "test", "KIS_APP_SECRET": "test"}, cache_dir=tmp_path)
+    assert restarted_client.token_mode == "자동 발급 토큰 재사용"
+    assert restarted_client._token() == "issued-token"
 
 
 def test_kr_market_rankings_use_two_first_page_requests(tmp_path):
@@ -144,9 +175,9 @@ def test_connection_diagnostics_hides_values_and_accepts_any_nested_section(tmp_
     assert "private-token" not in repr(client.connection_diagnostics)
 
 
-def test_connection_diagnostics_identifies_missing_manual_token(tmp_path):
+def test_connection_diagnostics_shows_automatic_token_waiting_state(tmp_path):
     client = KISClient({"KIS_APP_KEY": "key", "KIS_APP_SECRET": "secret"}, cache_dir=tmp_path)
-    assert not client.ready
+    assert client.ready
     assert client.connection_diagnostics["앱 키"] == "확인됨"
     assert client.connection_diagnostics["앱 시크릿"] == "확인됨"
-    assert client.connection_diagnostics["당일 토큰"] == "미확인"
+    assert client.connection_diagnostics["당일 토큰"] == "자동 발급 대기"

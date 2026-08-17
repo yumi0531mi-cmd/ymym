@@ -24,7 +24,7 @@ from scanner.validation import ValidationStore
 APP_VERSION = "5.2.1-mobile-cards"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
-CLIENT_CACHE_VERSION = "client-contract-v2"
+CLIENT_CACHE_VERSION = "client-contract-v3-auto-token"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 MAX_CARD_CANDIDATES = 3
 
@@ -324,7 +324,10 @@ with st.sidebar:
     symbol = st.text_input("직접 볼 종목", placeholder="005930 또는 SOXL").strip().upper()
     exchange = st.selectbox("미국 거래소", ["NAS", "NYS", "AMS"], disabled=market == Market.KR)
     kis_connected = client.ready
-    if kis_connected:
+    auto_token_pending = client.token_mode == "필요 시 1회 자동 발급"
+    if kis_connected and auto_token_pending:
+        st.info("한국투자증권 연결 준비됨\n\n첫 검색을 누를 때 오늘 토큰을 1회 자동 발급합니다.")
+    elif kis_connected:
         st.success("한국투자증권 연결됨")
     else:
         st.warning("한국투자증권 연결 대기 중\n\n연결되면 아래 검색 버튼이 켜집니다.")
@@ -344,7 +347,9 @@ if live and symbol and kis_connected:
     st_autorefresh(interval=60_000, key="mobile_card_refresh")
 
 st.markdown("<div class='mobile-head'><h1>반복단타 후보 카드</h1><p>여러 후보의 진입 기준가 · 5분 목표가 · 구조 손절가를 휴대전화에서 비교합니다.</p></div>", unsafe_allow_html=True)
-if kis_connected:
+if kis_connected and auto_token_pending:
+    st.markdown("<div class='connection ok'>한국투자증권 연결 준비가 끝났습니다. <b>전종목 후보 찾기</b> 또는 <b>입력 종목 카드 만들기</b>를 처음 누를 때에만 오늘 토큰을 1회 자동 발급합니다. 이후에는 임시 보관 토큰을 재사용합니다.</div>", unsafe_allow_html=True)
+elif kis_connected:
     st.markdown("<div class='connection ok'>한국투자증권 연결이 준비되었습니다. 전종목 후보를 찾거나 종목코드를 입력해 카드로 확인하세요.</div>", unsafe_allow_html=True)
 else:
     status = client.connection_diagnostics
