@@ -21,8 +21,10 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationStore
 
-APP_VERSION = "5.2-mobile-cards"
-CLIENT_CACHE_VERSION = "mobile-card-flow-v1"
+APP_VERSION = "5.2.1-mobile-cards"
+# Bump this whenever the cached KISClient interface changes. Streamlit can retain a
+# resource through a hot code update, so a new contract must never reuse an old client.
+CLIENT_CACHE_VERSION = "client-contract-v2"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 MAX_CARD_CANDIDATES = 3
 
@@ -71,6 +73,22 @@ def get_client(cache_version: str, secret_fingerprint: str) -> KISClient:
 
 def current_secret_fingerprint() -> str:
     return secrets_fingerprint(st.secrets)
+
+
+def current_client() -> KISClient:
+    """Return a client compatible with the active code after a hot deployment.
+
+    This only constructs a local read-only client. It does not issue a KIS token,
+    request prices, or submit an order.
+    """
+    fingerprint = current_secret_fingerprint()
+    client = get_client(CLIENT_CACHE_VERSION, fingerprint)
+    # Streamlit may retain an object created before a class interface update.
+    # A type check avoids touching properties that old instances do not have.
+    if not isinstance(client, KISClient):
+        get_client.clear()
+        client = get_client(CLIENT_CACHE_VERSION, fingerprint)
+    return client
 
 
 @st.cache_resource
@@ -294,7 +312,7 @@ def render_chart(bars: pd.DataFrame, plan: Any) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
-client = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint())
+client = current_client()
 event_store = get_event_store()
 cycle_store = get_cycle_store()
 store = ValidationStore(VALIDATION_ROOT, event_store=event_store)
