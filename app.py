@@ -610,69 +610,6 @@ def render_realtime_price(symbol: str, market_value: str, base_price: float, pre
     st.caption(f"{source} · 마지막 체결 시각 {timestamp.strftime('%H:%M:%S')}")
 
 
-def trade_card_html(item: dict[str, Any], cost_pct: float) -> str:
-    quote: Quote = item["quote"]
-    plan = item["plan"]
-    change = quote.change_pct
-    change_class = "up" if change > 0 else "down" if change < 0 else "flat"
-    diagnostics = plan.diagnostics
-    reasons = list(plan.reasons or [])[:2]
-    flags = diagnostics.get("false_signal_flags") or []
-    warnings = reasons + [str(flag) for flag in flags[:1]]
-    warning_html = "".join(f"<div>⚠ {html.escape(str(reason))}</div>" for reason in warnings)
-    if not warning_html:
-        warning_html = "<div>현재 특별 경고는 확인되지 않았습니다.</div>"
-    spread = diagnostics.get("spread_pct")
-    rvol = diagnostics.get("rvol")
-    rr_value = diagnostics.get("reward_risk_net")
-    volume = quote.volume
-    turnover = quote.turnover
-    hard_stop = plan.hard_stop or plan.invalidation or plan.stop
-    persistence = plan.persistence_score
-    repeat_width = repeat_band_pct(plan)
-    regime_badge = "상승 추세" if plan.regime == Regime.UP else ("박스권" if plan.regime == Regime.RANGE else "전환·관망")
-    repeat_badge = (
-        f"<span class='badge repeat'>반복단타 가능 {repeat_width:.2f}%</span>"
-        if repeat_width is not None
-        else "<span class='badge'>추세 진입 관찰</span>"
-    )
-    card = f"""
-<section class="trade-card">
-      <div class="card-top">
-    <div><div class="ticker">{html.escape(quote.symbol)}</div><div class="name">{html.escape(str(item.get('name') or quote.market.value))} · {html.escape(quote.session)} · {html.escape(plan.strategy)}</div></div>
-
-    <div><div class="price">{price_text(quote.price)}</div><div class="change {change_class}">{change:+.2f}%</div></div>
-  </div>
-  <div class="badges">
-    <span class="badge {signal_class(plan.signal)}">{html.escape(plan.signal.value)}</span>
-    <span class="badge trend">{regime_badge}</span>
-    {repeat_badge}
-    <span class="badge risk">위험: {html.escape(plan.risk_state)}</span>
-    <span class="badge">점수 {plan.score}/100</span>
-    <span class="badge">지속성 {persistence if persistence is not None else '미확인'}</span>
-  </div>
-  <div class="warn-box">{warning_html}</div>
-  <div class="data-grid">
-    <div class="data-item"><div class="data-label">거래량</div><div class="data-value">{money(volume)}</div></div>
-    <div class="data-item"><div class="data-label">거래대금</div><div class="data-value">{money(turnover)}</div></div>
-    <div class="data-item"><div class="data-label">상대거래량</div><div class="data-value">{number_text(rvol, 'x')}</div></div>
-    <div class="data-item"><div class="data-label">호가 스프레드</div><div class="data-value">{number_text(spread, '%')}</div></div>
-  </div>
-  <div class="plan-title">매매 레벨 <span style="font-size:.72rem;color:#64748b">수동매매 참고값</span></div>
-  <div class="plan-grid">
-    <div class="plan-item"><div class="data-label">진입 기준가</div><div class="data-value entry">{price_text(plan.entry)}</div></div>
-    <div class="plan-item"><div class="data-label">1차 목표 · 5분</div><div class="data-value target">{price_text(plan.target)}</div></div>
-    <div class="plan-item"><div class="data-label">2차 목표 · 5분</div><div class="data-value target">{price_text(plan.target2)}</div></div>
-    <div class="plan-item"><div class="data-label">Soft Stop</div><div class="data-value stop">{price_text(plan.soft_stop)}</div></div>
-    <div class="plan-item"><div class="data-label">Hard Stop</div><div class="data-value stop">{price_text(hard_stop)}</div></div>
-    <div class="plan-item"><div class="data-label">비용 반영 손익비</div><div class="data-value">{number_text(rr_value)}</div></div>
-  </div>
-  <div class="card-foot">1차·2차 목표는 완료된 5분봉 구조를 우선 사용합니다. 왕복비용 가정 {cost_pct:.2f}%</div>
-</section>
-"""
-    return card
-
-
 def mixed_card_priority(item: dict[str, Any]) -> tuple[int, int, int]:
     plan = item["plan"]
     trend_rank = 2 if plan.regime == Regime.UP else (1 if plan.regime == Regime.RANGE else 0)
