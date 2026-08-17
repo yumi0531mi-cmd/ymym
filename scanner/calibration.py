@@ -39,6 +39,7 @@ def calibration_for(
     session: str,
     strategy: str,
     score: int,
+    version: str | None = None,
 ) -> CalibrationResult:
     current_bucket = bucket(score)
     rows = validation.load_all()
@@ -49,6 +50,7 @@ def calibration_for(
         and row.get("strategy") == strategy
         and bucket(int(row.get("score", 0))) == current_bucket
         and row.get("target_pass") is not None
+        and (version is None or row.get("version") == version)
     ]
     samples = len(matches)
     wins = sum(row.get("target_pass") is True for row in matches)

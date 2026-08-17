@@ -9,7 +9,7 @@ from .indicators import enrich
 from .models import Market, Quote, Regime, Signal, TradePlan
 from .persistence_engine import final_buy_decision, persistence_score, risk_state
 from .sessions import remaining_session_minutes
-from .strategy import fake_signal_flags, multi_timeframe, price_zone_in_box, repeat_box, trade_levels
+from .strategy import confirmed_levels, fake_signal_flags, multi_timeframe, price_zone_in_box, repeat_box, trade_levels
 
 
 ACTIVE_SESSIONS = {"KR_REGULAR", "US_PRE", "US_REGULAR", "US_AFTER"}
@@ -163,7 +163,8 @@ def analyze(
     latest = completed.iloc[-1]
     entry = quote.ask or quote.price
     target1, target2, support, target1_basis, target2_basis, support_basis = trade_levels(df, entry, box)
-    flags = fake_signal_flags(completed, support, target1)
+    entry_resistance_1m, _, _, _ = confirmed_levels(df, entry)
+    flags = fake_signal_flags(completed, support, entry_resistance_1m)
     risk = risk_state(df, current_price=quote.price, support=support, fake_breakdown=flags["fake_breakdown"])
     stop_basis = f"{support_basis} 기반 Hard Stop" if risk.hard_stop else "구조 무효화 기준 미확인"
     spread = quote.spread_pct
@@ -270,6 +271,8 @@ def analyze(
         "notional_rvol_threshold": notional_threshold,
         "reward_risk_net": reward_risk,
         "round_trip_cost_pct": cost_pct,
+        "target1_window_minutes": 5,
+        "entry_resistance_1m": entry_resistance_1m,
         "box_zone": zone,
         "false_signal_flags": flags,
         "completed_bars": len(completed),

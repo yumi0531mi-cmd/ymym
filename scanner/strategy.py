@@ -93,22 +93,36 @@ def repeat_box(frame: pd.DataFrame, current: float) -> tuple[float, float] | Non
 def trade_levels(
     frame: pd.DataFrame, entry: float, box: tuple[float, float] | None = None
 ) -> tuple[float | None, float | None, float | None, str, str, str]:
-    """Return first target, second target and observed support without future prices."""
+    """Return 5-minute structure targets and one-minute structural support.
+
+    The newest one-minute bar and newest five-minute aggregation are excluded.
+    This keeps entry and stop responsive on completed one-minute data while
+    preventing a still-forming candle from setting either target.
+    """
     df = enrich(frame)
     if len(df) < 20 or entry <= 0:
         return None, None, None, "1차 목표 미확인", "2차 목표 미확인", "지지 미확인"
 
-    completed = df.iloc[:-1].tail(180)
-    highs = completed.high[(completed.high.shift(1) < completed.high) & (completed.high.shift(-1) < completed.high)]
-    lows = completed.low[(completed.low.shift(1) > completed.low) & (completed.low.shift(-1) > completed.low)]
-    resistances = sorted(float(value) for value in highs if value > entry)
-    supports = sorted((float(value) for value in lows if value < entry), reverse=True)
+    completed_1m = df.iloc[:-1].tail(180)
+    lows_1m = completed_1m.low[
+        (completed_1m.low.shift(1) > completed_1m.low)
+        & (completed_1m.low.shift(-1) > completed_1m.low)
+    ]
+    supports = sorted((float(value) for value in lows_1m if value < entry), reverse=True)
     support = supports[0] if supports else None
+    support_basis = "완료 1분봉 스윙 저점" if support else "지지 미확인"
+
+    grouped = resample(frame, 5)
+    completed_5m = enrich(grouped.iloc[:-1]).tail(60) if len(grouped) > 1 else grouped.iloc[0:0]
+    highs_5m = completed_5m.high[
+        (completed_5m.high.shift(1) < completed_5m.high)
+        & (completed_5m.high.shift(-1) < completed_5m.high)
+    ]
+    resistances = sorted(float(value) for value in highs_5m if value > entry)
     target1 = resistances[0] if resistances else None
     target2 = resistances[1] if len(resistances) > 1 else None
-    target1_basis = "완료 1분봉 스윙 저항" if target1 else "1차 목표 미확인"
-    target2_basis = "다음 완료 1분봉 스윙 저항" if target2 else "2차 목표 미확인"
-    support_basis = "완료 1분봉 스윙 저점" if support else "지지 미확인"
+    target1_basis = "완료 5분봉 스윙 저항" if target1 else "1차 목표 미확인"
+    target2_basis = "다음 완료 5분봉 스윙 저항" if target2 else "2차 목표 미확인"
 
     if box:
         low, high = box
@@ -117,9 +131,9 @@ def trade_levels(
             support = low
             support_basis = "완료 5분봉 반복박스 하단"
             if middle > entry:
-                target1, target1_basis = middle, "반복박스 중단값"
+                target1, target1_basis = middle, "완료 5분봉 반복박스 중단값"
             if high > entry:
-                target2, target2_basis = high, "반복박스 상단값"
+                target2, target2_basis = high, "완료 5분봉 반복박스 상단값"
     return target1, target2, support, target1_basis, target2_basis, support_basis
 
 

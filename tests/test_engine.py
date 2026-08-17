@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from scanner.engine import analyze
+from scanner.indicators import resample
 from scanner.models import Market, Quote, Regime, Signal
 from scanner.persistence import EventStore, ManualTrade
 from scanner.strategy import confirmed_levels, fake_signal_flags, repeat_box, trade_levels
@@ -118,13 +119,41 @@ def test_repeat_box_allows_four_percent_repetition_range():
     assert 3.0 < (box[1] / box[0] - 1) * 100 <= 5.0
 
 
-def test_trade_levels_return_two_targets_when_swings_exist():
+def test_trade_levels_use_completed_five_minute_swing_highs():
     df = bars(180, slope=0)
     entry = 100.0
-    target1, target2, support, *_ = trade_levels(df, entry)
-    assert target1 is None or target1 > entry
-    assert target2 is None or target2 > entry
+    target1, target2, support, target1_basis, target2_basis, _ = trade_levels(df, entry)
+    completed_5m = resample(df, 5).iloc[:-1]
+    highs = completed_5m.high[
+        (completed_5m.high.shift(1) < completed_5m.high)
+        & (completed_5m.high.shift(-1) < completed_5m.high)
+    ]
+    expected = sorted(float(value) for value in highs if value > entry)
+
+    assert target1 == (expected[0] if expected else None)
+    assert target2 == (expected[1] if len(expected) > 1 else None)
+    assert target1_basis == ("완료 5분봉 스윙 저항" if expected else "1차 목표 미확인")
+    assert target2_basis == ("다음 완료 5분봉 스윙 저항" if len(expected) > 1 else "2차 목표 미확인")
     assert support is None or support < entry
+
+
+def test_target_pass_requires_touch_within_five_minutes():
+    df = bars(180)
+    current = float(df.close.iloc[-1])
+    plan = analyze(quote(current), df)
+    case = ValidationCase.from_plan(plan, current, "US_REGULAR")
+    case.target = current * 1.01
+    case.stop = current * 0.98
+    start = datetime.fromisoformat(case.signal_time)
+    idx = pd.date_range(start, periods=31, freq="min")
+    future = pd.DataFrame({"open": current, "high": current * 1.002, "low": current * 0.999,
+                           "close": current * 1.001, "volume": 1000}, index=idx)
+    future.iloc[6, future.columns.get_loc("high")] = current * 1.02
+
+    case.score_future_bars(future)
+
+    assert case.target_pass is False
+    assert case.target_first is False
 
 
 def test_fake_breakdown_and_two_close_breakdown_are_distinguished():

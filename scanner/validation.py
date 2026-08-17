@@ -150,24 +150,26 @@ class ValidationCase:
         low = float(end.low.min())
         self.mfe_pct = (high / origin - 1) * 100
         self.mae_pct = (low / origin - 1) * 100
+        target_window = frame.loc[frame.index <= signal_at + pd.Timedelta(5, unit="min")]
         target_time = None
         stop_time = None
-        if self.target is not None:
-            touched = end.index[end.high >= self.target]
-            target_time = touched[0] if len(touched) else None
-        if self.stop is not None:
-            touched = end.index[end.low <= self.stop]
-            stop_time = touched[0] if len(touched) else None
+        if not target_window.empty:
+            if self.target is not None:
+                touched = target_window.index[target_window.high >= self.target]
+                target_time = touched[0] if len(touched) else None
+            if self.stop is not None:
+                touched = target_window.index[target_window.low <= self.stop]
+                stop_time = touched[0] if len(touched) else None
         if target_time is not None and stop_time is not None and target_time == stop_time:
             self.target_first = False
             self.stopped_first = True
             self.target_pass = False
-            self.missing.append("같은 1분봉에서 목표·손절 동시 접촉: 보수적으로 실패 처리")
+            self.missing.append("1차 목표 5분 창에서 목표·손절 동시 접촉: 보수적으로 실패 처리")
         else:
             self.target_first = target_time is not None and (stop_time is None or target_time < stop_time)
             self.stopped_first = stop_time is not None and (target_time is None or stop_time < target_time)
             self.target_pass = self.target_first
-        exit_price = self.target if self.target_first else self.stop if self.stopped_first else float(end.close.iloc[-1])
+        exit_price = self.target if self.target_first else self.stop if self.stopped_first else float(target_window.close.iloc[-1]) if not target_window.empty else float(end.close.iloc[-1])
         self.net_return_pct = (float(exit_price) / origin - 1) * 100 - cost_pct
 
         first = float(end.close.iloc[0])

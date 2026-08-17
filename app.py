@@ -19,7 +19,7 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
-APP_VERSION = "5.1-persistence-cycle"
+APP_VERSION = "5.1.1-five-minute-target"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 
 st.set_page_config(page_title="한투 혼합형 주식 스캐너", page_icon="📡", layout="wide")
@@ -144,8 +144,8 @@ def render_chart(bars: pd.DataFrame, plan) -> None:
     )
     for value, name, color, dash in (
         (plan.entry, "진입 기준", "#1565c0", "solid"),
-        (plan.target, "1차 목표", "#2e7d32", "solid"),
-        (plan.target2, "2차 목표", "#00897b", "dash"),
+        (plan.target, "1차 목표 · 완료 5분봉", "#2e7d32", "solid"),
+        (plan.target2, "2차 목표 · 완료 5분봉", "#00897b", "dash"),
         (plan.soft_stop, "Soft Stop", "#ef6c00", "dash"),
         (plan.hard_stop or plan.invalidation or plan.stop, "Hard Stop", "#c62828", "solid"),
     ):
@@ -190,7 +190,7 @@ if live and symbol:
 
 st.title("실시간 반복단타 후보")
 st.caption(
-    "수동매매 판단 보조 도구입니다. 화면의 진입·1차·2차 목표·구조 무효화 가격은 완료된 분봉, 호가, 거래량·거래대금, 비용과 유동성 조건으로 계산한 참고 구간이며 수익을 보장하지 않습니다."
+    "수동매매 판단 보조 도구입니다. 진입·손절은 완료 1분봉 구조를, 1차·2차 목표는 완료 5분봉 구조를 우선 반영합니다. 화면 가격은 호가, 거래량·거래대금, 비용과 유동성 조건을 함께 계산한 참고 구간이며 수익을 보장하지 않습니다."
 )
 
 if scan_now:
@@ -229,6 +229,7 @@ try:
     )
     calibration = calibration_for(
         store, market=market.value, session=quote.session, strategy=preliminary.strategy, score=preliminary.score,
+        version=APP_VERSION,
     )
     plan = analyze(
         quote, bars, orderbook_required=True, round_trip_cost_pct=float(cost_pct), minimum_score=int(min_score),
@@ -253,7 +254,7 @@ st.markdown(
 )
 
 if plan.signal == Signal.BUY:
-    st.success("현재 조건에서는 진입 기준가와 구조 무효화 가격이 계산되었습니다. 1차 목표에서 일부 청산 여부를 직접 판단하세요.")
+    st.success("현재 조건에서는 진입 기준가와 구조 무효화 가격이 계산되었습니다. 완료 5분봉 구조의 1차 목표 도달 시 일부 청산 여부를 직접 판단하세요.")
 elif plan.signal == Signal.WAIT:
     st.info("가격 기준은 보여 드리지만, 현재는 진입 조건이 완성되지 않았습니다. 아래 ‘대기 이유’를 먼저 확인하세요.")
 else:
@@ -273,8 +274,8 @@ for column, (label, value) in zip(st.columns(6), summary):
 st.subheader("반복단타 가격 계획")
 price_cards = [
     ("진입 기준가", plan.entry, "실제 매수 참고가"),
-    ("1차 목표가", plan.target, plan.target_basis),
-    ("2차 목표가", plan.target2, plan.target2_basis),
+    ("1차 목표가 (5분)", plan.target, plan.target_basis),
+    ("2차 목표가 (5분)", plan.target2, plan.target2_basis),
     ("Soft Stop", plan.soft_stop, "지지 훼손 확인 시작선"),
     ("Hard Stop", plan.hard_stop or plan.invalidation or plan.stop, plan.stop_basis),
 ]
@@ -314,6 +315,8 @@ with st.expander("계산 근거와 상세 지표"):
         "전략": plan.strategy,
         "장세": plan.regime.value,
         "완료 1분봉 수": diagnostics.get("completed_bars"),
+        "1차 목표 평가 창(분)": diagnostics.get("target1_window_minutes"),
+        "진입용 1분봉 저항": diagnostics.get("entry_resistance_1m"),
         "VWAP": diagnostics.get("vwap"),
         "EMA9": diagnostics.get("ema9"),
         "ATR": diagnostics.get("atr"),
@@ -329,7 +332,7 @@ with st.expander("계산 근거와 상세 지표"):
     st.json(plain, expanded=True)
 
 with st.expander("상승 여력 시나리오 (보조 참고)"):
-    st.caption("아래 범위는 확정 목표가가 아니라 최근 완료 1분봉 변동성을 이용한 5~30분 참고 범위입니다.")
+    st.caption("아래 범위는 확정 목표가가 아닙니다. 1차 목표는 위의 완료 5분봉 구조를 사용하고, 아래는 최근 완료 1분봉 변동성으로 계산한 5~30분 보조 참고 범위입니다.")
     for column, point in zip(st.columns(4), plan.forecasts):
         column.metric(f"{point.minutes}분 · {point.direction.value}", f"{point.base:g}")
         column.caption(f"범위 {point.low:g}~{point.high:g}")

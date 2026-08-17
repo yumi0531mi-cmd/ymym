@@ -55,3 +55,29 @@ def test_calibration_uses_t1_before_stop_rate_after_thirty_samples():
     )
     assert result.samples == 30
     assert result.probability_pct == 80.0
+
+
+def test_calibration_can_scope_samples_to_target_rule_version():
+    rows = [
+        {
+            "market": "US", "session": "US_REGULAR", "strategy": "TREND_SWING · 상승 추세 눌림",
+            "score": 84, "target_pass": True, "net_return_pct": 0.3,
+            "version": "5.1.1-five-minute-target",
+        }
+        for _ in range(30)
+    ]
+    rows.append(
+        {
+            "market": "US", "session": "US_REGULAR", "strategy": "TREND_SWING · 상승 추세 눌림",
+            "score": 84, "target_pass": False, "net_return_pct": -0.2,
+            "version": "5.1-persistence-cycle",
+        }
+    )
+
+    result = calibration_for(
+        RowsOnlyStore(rows), market="US", session="US_REGULAR", strategy="TREND_SWING · 상승 추세 눌림", score=84,
+        version="5.1.1-five-minute-target",
+    )
+
+    assert result.samples == 30
+    assert result.probability_pct == 100.0
