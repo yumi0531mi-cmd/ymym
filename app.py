@@ -522,6 +522,30 @@ def completed_bar_alignment(quote: Quote, bars: pd.DataFrame) -> tuple[bool, str
     return True, "일치"
 
 
+def record_and_score_live_validation(
+    store: ValidationStore,
+    plan: Any,
+    quote: Quote,
+    bars: pd.DataFrame,
+    chart_aligned: bool,
+    cost_pct: float,
+) -> tuple[int, bool]:
+    """Persist only real KIS-trade-backed plans and score mature cases from completed bars."""
+    scored_cases = store.score_ready(quote.symbol, quote.market.value, bars, float(cost_pct))
+    live_tick = current_realtime_hub().tick(quote.market, quote.symbol)
+    if not (live_tick and chart_aligned and plan.entry and plan.target and plan.hard_stop):
+        return scored_cases, False
+    case = ValidationCase.from_plan(
+        plan,
+        live_tick.price,
+        quote.session,
+        version=APP_VERSION,
+        latest_trade_time=live_tick.timestamp,
+    )
+    _, recorded_case = store.save_once(case, cooldown_seconds=300)
+    return scored_cases, recorded_case
+
+
 def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
     """Fetch and analyze one automatic dashboard card from REST history plus live completed bars."""
     rest_quote = load_rest_dashboard_quote(symbol, market.value, exchange)
@@ -545,20 +569,11 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
         calibration_samples=getattr(calibration, "recent_samples", calibration.samples),
         calibration_expectancy_pct=getattr(calibration, "recent_average_net_return_pct", calibration.average_net_return_pct if hasattr(calibration, "average_net_return_pct") else None),
     )
-    # Complete earlier same-symbol signals first, then record a new fully specified
-    # entry/target/stop signal. This supplies the real target-before-stop outcomes
-    # used by the strategy-specific 80% calibration; no synthetic history is created.
-    scored_cases = store.score_ready(symbol, market.value, bars, float(cost_pct))
-    recorded_case = False
-    if chart_aligned and plan.entry and plan.target and plan.hard_stop:
-        case = ValidationCase.from_plan(
-            plan,
-            live_tick.price if live_tick is not None else None,
-            quote.session,
-            version=APP_VERSION,
-            latest_trade_time=live_tick.timestamp if live_tick is not None else None,
-        )
-        _, recorded_case = store.save_once(case, cooldown_seconds=300)
+    # Complete earlier same-symbol signals first, then persist a real KIS-trade-backed
+    # plan. The same path also runs from the one-minute card structure refresh.
+    scored_cases, recorded_case = record_and_score_live_validation(
+        store, plan, quote, bars, chart_aligned, float(cost_pct)
+    )
     if event_store.configured:
         marker = str(plan.diagnostics.get("completed_bar_at") or quote.timestamp.isoformat())
         cycle_store.apply_risk_state(cycle, plan.risk_state, marker)
@@ -665,7 +680,7 @@ def mixed_card_priority(item: dict[str, Any]) -> tuple[int, int, int]:
     return (trend_rank, repeat_rank, plan.score)
 
 
-def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int) -> dict[str, Any]:
+def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
     """Recalculate only from cached bars and KIS live trades; no REST request occurs here."""
     base_quote: Quote = item["quote"]
     quote = quote_with_live_tick(base_quote)
@@ -680,8 +695,12 @@ def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int) ->
         calibration_samples=previous_plan.calibration_samples,
         calibration_expectancy_pct=previous_plan.diagnostics.get("calibration_expectancy_pct"),
     )
+    scored_cases, recorded_case = record_and_score_live_validation(
+        store, plan, quote, bars, chart_aligned, float(cost_pct)
+    )
     return {
         **item, "quote": quote, "bars": bars, "plan": plan,
+        "validation_scored": scored_cases, "validation_recorded": recorded_case,
         "chart_aligned": chart_aligned, "chart_alignment_reason": chart_alignment_reason,
     }
 
@@ -717,11 +736,11 @@ def render_plan_fields(item: dict[str, Any]) -> None:
 
 
 @st.fragment(run_every=60.0)
-def render_live_plan_fields(item: dict[str, Any], cost_pct: float, min_score: int) -> None:
-    render_plan_fields(live_card_snapshot(item, cost_pct, min_score))
+def render_live_plan_fields(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore) -> None:
+    render_plan_fields(live_card_snapshot(item, cost_pct, min_score, store))
 
 
-def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int) -> None:
+def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore) -> None:
     """Render a price-first card with 1-second tick and 1-minute structure refreshes."""
     quote: Quote = item["quote"]
     title = f"{quote.symbol} · {item.get('name') or quote.market.value}"
@@ -734,7 +753,7 @@ def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int) -> N
             quote.previous_close,
             quote.timestamp.isoformat(),
         )
-        render_live_plan_fields(item, cost_pct, min_score)
+        render_live_plan_fields(item, cost_pct, min_score, store)
 
 
 def render_card_detail(item: dict[str, Any]) -> None:
@@ -913,7 +932,7 @@ if cards:
     source_text = " · ".join(sorted(source_labels))
     st.caption(f"상세 카드 {len(cards)}개 · {updated_at.strftime('%H:%M:%S')} · {realtime_hub.status_label()} · {source_text}")
     for card_item in cards:
-        render_live_card(card_item, float(cost_pct), int(min_score))
+        render_live_card(card_item, float(cost_pct), int(min_score), store)
 elif kis_connected and not errors and not candidates:
     limit_text = "30만 원 미만" if market == Market.KR else "170달러 미만"
     st.info(f"현재 {limit_text} 가격 조건과 상승 후보 기준을 함께 통과한 종목이 없습니다.")
