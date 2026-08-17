@@ -124,7 +124,8 @@ with st.sidebar:
     cost_pct = st.number_input("왕복비용 가정(%)", min_value=0.0, max_value=5.0, value=cost_default, step=0.01)
     min_score = st.slider("최소 신호 점수", min_value=70, max_value=100, value=85, step=5)
     st.caption(f"현재 세션: {market_session(market)}")
-    st.caption(f"KIS 인증: {client.token_mode}")
+    token_mode = getattr(client, "token_mode", "재시작 후 인증 상태 확인")
+    st.caption(f"KIS 인증: {token_mode}")
     st.caption(f"검증 저장: {event_store.status}")
     admin = admin_unlocked()
 
