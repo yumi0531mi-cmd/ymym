@@ -173,10 +173,45 @@ def load_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=7200, show_spinner=False)
 def load_dashboard_candidates(market_value: str) -> list[dict[str, Any]]:
-    """Return the best automatic card candidates without asking the user to choose."""
+    """Return automatic candidates, falling back safely when ranking is unavailable."""
     market = Market(market_value)
-    rankings = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).market_rankings(market)
-    return [candidate.to_dict() for candidate in merge_rankings(market, rankings, limit=MAX_CARD_CANDIDATES)]
+    client = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint())
+    try:
+        rankings = client.market_rankings(market)
+        candidates = [candidate.to_dict() for candidate in merge_rankings(market, rankings, limit=MAX_CARD_CANDIDATES)]
+        for candidate in candidates:
+            candidate["candidate_source"] = "시장 실시간 순위"
+        if candidates:
+            return candidates
+    except KISError:
+        # Some ranking endpoints can be unavailable by account or session. A known
+        # liquid list keeps the first screen useful without pretending it is a full-market rank.
+        pass
+
+    items = KR_LIQUID if market == Market.KR else US_LIQUID
+    quotes: list[tuple[Quote, Any]] = []
+    for item in items:
+        try:
+            quote = client.quote(item.symbol, market, item.exchange, include_orderbook=False)
+            if quote.price > 0:
+                quotes.append((quote, item))
+        except KISError:
+            continue
+    quotes.sort(key=lambda pair: (pair[0].change_pct, pair[0].turnover or 0.0), reverse=True)
+    return [
+        {
+            "symbol": quote.symbol,
+            "name": item.name,
+            "market": market.value,
+            "exchange": item.exchange,
+            "price": quote.price,
+            "change_pct": quote.change_pct,
+            "volume": quote.volume,
+            "turnover": quote.turnover,
+            "candidate_source": "유동성 시작목록 자동 대체",
+        }
+        for quote, item in quotes[:MAX_CARD_CANDIDATES]
+    ]
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -320,10 +355,10 @@ def render_card_detail(item: dict[str, Any]) -> None:
         st.caption(f"1차 목표 근거: {plan.target_basis or '구조 미확인'} · 2차 목표 근거: {plan.target2_basis or '구조 미확인'}")
         st.caption(f"보정 확률: {plan.calibration_probability:.1f}%" if plan.calibration_probability is not None else f"보정 표본 수: {plan.calibration_samples}/30")
         if not item["bars"].empty:
-            render_chart(item["bars"].tail(120), plan)
+            render_chart(item["bars"].tail(120), plan, key=f"chart_{quote.market.value}_{quote.symbol}")
 
 
-def render_chart(bars: pd.DataFrame, plan: Any) -> None:
+def render_chart(bars: pd.DataFrame, plan: Any, key: str) -> None:
     fig = go.Figure(go.Candlestick(x=bars.index, open=bars.open, high=bars.high, low=bars.low, close=bars.close, name="1분봉"))
     for value, name, color, dash in (
         (plan.entry, "진입", "#6ba7ff", "solid"),
@@ -337,7 +372,7 @@ def render_chart(bars: pd.DataFrame, plan: Any) -> None:
     fig.update_layout(height=320, margin=dict(l=4, r=4, t=24, b=4), xaxis_rangeslider_visible=False, paper_bgcolor="#ffffff", plot_bgcolor="#ffffff", font_color="#172033")
     fig.update_xaxes(gridcolor="#edf1f6")
     fig.update_yaxes(gridcolor="#edf1f6")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=key)
 
 
 client = current_client()
@@ -384,6 +419,7 @@ else:
                 try:
                     card = analyze_card(symbol, market, exchange, float(cost_pct), int(min_score), store)
                     card["name"] = str(candidate.get("name") or symbol)
+                    card["candidate_source"] = str(candidate.get("candidate_source") or "시장 실시간 순위")
                     cards.append(card)
                 except (KISError, ValueError, KeyError, OSError) as exc:
                     errors.append(f"{symbol}: {type(exc).__name__}")
@@ -394,7 +430,9 @@ else:
 
 if cards:
     updated_at = max(card["quote"].timestamp for card in cards)
-    st.markdown(f"<div class='connection ok'>실시간 현재가 기준 {updated_at.strftime('%H:%M:%S')} · 상위 {len(cards)}개 후보를 자동 분석했습니다. 초록색 목표가와 빨간색 손절가는 수동매매 참고선입니다.</div>", unsafe_allow_html=True)
+    source_labels = {str(card.get("candidate_source") or "시장 실시간 순위") for card in cards}
+    source_text = " · ".join(sorted(source_labels))
+    st.markdown(f"<div class='connection ok'>실시간 현재가 기준 {updated_at.strftime('%H:%M:%S')} · {source_text} · 상위 {len(cards)}개 후보를 자동 분석했습니다. 초록색 목표가와 빨간색 손절가는 수동매매 참고선입니다.</div>", unsafe_allow_html=True)
     st.markdown("<div class='cards-grid'>" + "".join(trade_card_html(card_item, float(cost_pct)) for card_item in cards) + "</div>", unsafe_allow_html=True)
     for card_item in cards:
         render_card_detail(card_item)

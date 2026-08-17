@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
-from scanner.kis_client import KISClient
+from scanner.kis_client import KISClient, KISError
 from scanner.models import Market, Quote, Regime, Signal, TradePlan
 
 
@@ -61,6 +61,14 @@ def test_missing_kis_credentials_shows_safe_waiting_screen_without_buttons():
     assert any("한국투자증권 연결을 기다리고 있습니다" in str(item.value) for item in app.markdown)
 
 
+def _quote_for_symbol(symbol, market, *_args, **_kwargs) -> Quote:
+    return Quote(
+        symbol=str(symbol), market=market, price=70000, previous_close=69000,
+        timestamp=datetime(2026, 8, 17, 10, 0), volume=1_200_000,
+        turnover=84_000_000_000, session="KR_REGULAR",
+    )
+
+
 def test_connected_app_automatically_renders_live_candidate_card_without_user_selection():
     original_init = KISClient.__init__
 
@@ -90,3 +98,32 @@ def test_connected_app_automatically_renders_live_candidate_card_without_user_se
     assert any("실시간 반복단타 후보" in str(item.value) for item in app.markdown)
     assert any("trade-card" in str(item.value) and "1차 목표" in str(item.value) for item in app.markdown)
     assert any("실시간 현재가 기준" in str(item.value) for item in app.markdown)
+
+
+def test_ranking_error_falls_back_to_liquid_candidates_and_still_renders_cards():
+    original_init = KISClient.__init__
+
+    def init_with_mock_token(self, secrets=None, cache_dir=".scanner_cache"):
+        original_init(
+            self,
+            {"KIS_APP_KEY": "test-key", "KIS_APP_SECRET": "test-secret", "KIS_ACCESS_TOKEN": "test-token"},
+            cache_dir=cache_dir,
+        )
+
+    st.cache_resource.clear()
+    st.cache_data.clear()
+    with (
+        patch.object(KISClient, "__init__", init_with_mock_token),
+        patch.object(KISClient, "market_rankings", side_effect=KISError("rank unavailable")),
+        patch.object(KISClient, "quote", side_effect=_quote_for_symbol),
+        patch.object(KISClient, "orderbook", return_value=(69900, 70000)),
+        patch.object(KISClient, "intraday", side_effect=_bars),
+        patch("scanner.engine.analyze", side_effect=_plan),
+        patch("scanner.calibration.calibration_for", return_value=SimpleNamespace(probability_pct=None, samples=0)),
+    ):
+        app = AppTest.from_file(APP_PATH)
+        app.run(timeout=30)
+
+    assert not app.exception
+    assert any("유동성 시작목록 자동 대체" in str(item.value) for item in app.markdown)
+    assert any("trade-card" in str(item.value) for item in app.markdown)
