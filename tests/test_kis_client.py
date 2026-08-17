@@ -181,3 +181,21 @@ def test_connection_diagnostics_shows_automatic_token_waiting_state(tmp_path):
     assert client.connection_diagnostics["앱 키"] == "확인됨"
     assert client.connection_diagnostics["앱 시크릿"] == "확인됨"
     assert client.connection_diagnostics["당일 토큰"] == "자동 발급 대기"
+
+
+def test_domestic_rankings_keeps_successful_source_when_paired_rank_fails(tmp_path):
+    client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
+    calls = []
+
+    def fake_get(path, _tr_id, _params):
+        calls.append(path)
+        if path.endswith("volume-rank"):
+            return {"output": [{"mksc_shrn_iscd": "005930", "stck_prpr": "70000"}]}
+        raise KISError("temporary fluctuation rank failure")
+
+    client._get = fake_get  # type: ignore[method-assign]
+    rankings = client.market_rankings(Market.KR)
+
+    assert len(calls) == 2
+    assert rankings["거래대금·거래량 순위"]
+    assert rankings["상승률 순위"] == []

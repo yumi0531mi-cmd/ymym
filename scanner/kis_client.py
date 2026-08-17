@@ -440,47 +440,62 @@ class KISClient:
         orderbook and intraday calls remain deferred until the user selects one.
         """
         if market == Market.KR:
-            volume = self._get(
-                "/uapi/domestic-stock/v1/quotations/volume-rank",
-                "FHPST01710000",
-                {
-                    "FID_COND_MRKT_DIV_CODE": "J",
-                    "FID_COND_SCR_DIV_CODE": "20171",
-                    "FID_INPUT_ISCD": "0000",
-                    "FID_DIV_CLS_CODE": "0",
-                    "FID_BLNG_CLS_CODE": "3",
-                    "FID_TRGT_CLS_CODE": "111111111",
-                    "FID_TRGT_EXLS_CLS_CODE": "0000000000",
-                    "FID_INPUT_PRICE_1": "0",
-                    "FID_INPUT_PRICE_2": "10000000",
-                    "FID_VOL_CNT": "0",
-                    "FID_INPUT_DATE_1": "",
-                },
-            )
-            fluctuation = self._get(
-                "/uapi/domestic-stock/v1/ranking/fluctuation",
-                "FHPST01700000",
-                {
-                    "fid_rsfl_rate2": "30",
-                    "fid_cond_mrkt_div_code": "J",
-                    "fid_cond_scr_div_code": "20170",
-                    "fid_input_iscd": "0000",
-                    "fid_rank_sort_cls_code": "0000",
-                    "fid_input_cnt_1": "0",
-                    "fid_prc_cls_code": "0",
-                    "fid_input_price_1": "0",
-                    "fid_input_price_2": "10000000",
-                    "fid_vol_cnt": "0",
-                    "fid_trgt_cls_code": "0",
-                    "fid_trgt_exls_cls_code": "0",
-                    "fid_div_cls_code": "0",
-                    "fid_rsfl_rate1": "0",
-                },
-            )
-            return {
+            # Domestic rank endpoints can have different availability by session or
+            # account entitlement. Keep a successful rank source rather than
+            # discarding it because the paired source is temporarily unavailable.
+            volume: dict[str, Any] = {}
+            fluctuation: dict[str, Any] = {}
+            failures: list[KISError] = []
+            try:
+                volume = self._get(
+                    "/uapi/domestic-stock/v1/quotations/volume-rank",
+                    "FHPST01710000",
+                    {
+                        "FID_COND_MRKT_DIV_CODE": "J",
+                        "FID_COND_SCR_DIV_CODE": "20171",
+                        "FID_INPUT_ISCD": "0000",
+                        "FID_DIV_CLS_CODE": "0",
+                        "FID_BLNG_CLS_CODE": "3",
+                        "FID_TRGT_CLS_CODE": "111111111",
+                        "FID_TRGT_EXLS_CLS_CODE": "0000000000",
+                        "FID_INPUT_PRICE_1": "0",
+                        "FID_INPUT_PRICE_2": "10000000",
+                        "FID_VOL_CNT": "0",
+                        "FID_INPUT_DATE_1": "",
+                    },
+                )
+            except KISError as exc:
+                failures.append(exc)
+            try:
+                fluctuation = self._get(
+                    "/uapi/domestic-stock/v1/ranking/fluctuation",
+                    "FHPST01700000",
+                    {
+                        "fid_rsfl_rate2": "30",
+                        "fid_cond_mrkt_div_code": "J",
+                        "fid_cond_scr_div_code": "20170",
+                        "fid_input_iscd": "0000",
+                        "fid_rank_sort_cls_code": "0000",
+                        "fid_input_cnt_1": "0",
+                        "fid_prc_cls_code": "0",
+                        "fid_input_price_1": "0",
+                        "fid_input_price_2": "10000000",
+                        "fid_vol_cnt": "0",
+                        "fid_trgt_cls_code": "0",
+                        "fid_trgt_exls_cls_code": "0",
+                        "fid_div_cls_code": "0",
+                        "fid_rsfl_rate1": "0",
+                    },
+                )
+            except KISError as exc:
+                failures.append(exc)
+            rows = {
                 "거래대금·거래량 순위": list(volume.get("output") or []),
                 "상승률 순위": list(fluctuation.get("output") or []),
             }
+            if not any(rows.values()) and failures:
+                raise failures[0]
+            return rows
 
         rankings: dict[str, list[dict[str, Any]]] = {"거래대금·거래량 순위": [], "상승률 순위": []}
         for exchange in ("NAS", "NYS", "AMS"):
