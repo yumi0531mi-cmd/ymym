@@ -213,6 +213,34 @@ class KISClient:
 
         raise KISError("KIS 요청을 완료하지 못했습니다.")
 
+    def websocket_approval_key(self) -> str:
+        """Issue a KIS WebSocket approval key for read-only market-data subscriptions.
+
+        This is distinct from an OAuth access token and is never exposed in the UI,
+        logs, or cached price records.  It uses the same app key/secret already
+        configured for this scanner and does not call any order endpoint.
+        """
+        if not self.configured:
+            raise KISError("KIS_APP_KEY/KIS_APP_SECRET이 없습니다.")
+        response = self._request(
+            "POST",
+            "/oauth2/Approval",
+            payload={
+                "grant_type": "client_credentials",
+                "appkey": self.app_key,
+                "secretkey": self.app_secret,
+            },
+        )
+        if not response.ok:
+            raise KISError(f"KIS 실시간 접속키 발급 실패(HTTP {response.status_code})")
+        try:
+            key = str(response.json()["approval_key"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise KISError("KIS 실시간 접속키 응답에 approval_key가 없습니다.") from exc
+        if not key:
+            raise KISError("KIS 실시간 접속키가 비어 있습니다.")
+        return key
+
     def _cached_token(self) -> str | None:
         path = self.cache_dir / "kis_token.json"
         if not path.exists():

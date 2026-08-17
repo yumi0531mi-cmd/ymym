@@ -18,14 +18,15 @@ from scanner.kis_client import KISClient, KISError, secrets_fingerprint
 from scanner.market_screener import merge_rankings
 from scanner.models import Market, Quote, Regime, Signal
 from scanner.persistence import EventStore
+from scanner.realtime import KISRealtimeHub
 from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
-APP_VERSION = "5.5-market-wide-price-filter"
+APP_VERSION = "5.6-kis-realtime"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
-CLIENT_CACHE_VERSION = "client-contract-v6-market-wide"
+CLIENT_CACHE_VERSION = "client-contract-v7-kis-realtime"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 MAX_LIVE_CARDS = 5
 MAX_CANDIDATE_LIST = 20
@@ -97,6 +98,11 @@ def current_client() -> KISClient:
 
 
 @st.cache_resource
+def get_realtime_hub(cache_version: str, secret_fingerprint: str) -> KISRealtimeHub:
+    return KISRealtimeHub(get_client(cache_version, secret_fingerprint))
+
+
+@st.cache_resource
 def get_event_store() -> EventStore:
     return EventStore(st.secrets)
 
@@ -159,11 +165,23 @@ def _load_orderbook(symbol: str, market_value: str, exchange: str) -> tuple[floa
 def load_dashboard_quote(symbol: str, market_value: str, exchange: str) -> Quote:
     quote = _quote_from_cache_record(_load_quote_record(symbol, market_value, exchange))
     bid, ask = _load_orderbook(symbol, market_value, exchange)
+    tick = get_realtime_hub(CLIENT_CACHE_VERSION, current_secret_fingerprint()).tick(
+        Market(market_value), symbol
+    )
+    if tick is None:
+        return Quote(
+            symbol=quote.symbol, market=quote.market, price=quote.price,
+            previous_close=quote.previous_close, timestamp=quote.timestamp,
+            bid=bid, ask=ask, volume=quote.volume, turnover=quote.turnover,
+            session=quote.session, source=quote.source,
+        )
     return Quote(
-        symbol=quote.symbol, market=quote.market, price=quote.price,
-        previous_close=quote.previous_close, timestamp=quote.timestamp,
-        bid=bid, ask=ask, volume=quote.volume, turnover=quote.turnover,
-        session=quote.session, source=quote.source,
+        symbol=quote.symbol, market=quote.market, price=tick.price,
+        previous_close=quote.previous_close, timestamp=tick.timestamp,
+        bid=tick.bid if tick.bid is not None else bid,
+        ask=tick.ask if tick.ask is not None else ask,
+        volume=tick.volume if tick.volume is not None else quote.volume,
+        turnover=quote.turnover, session=quote.session, source=tick.source,
     )
 
 
@@ -533,6 +551,7 @@ def render_chart(bars: pd.DataFrame, plan: Any, key: str) -> None:
 
 
 client = current_client()
+realtime_hub = get_realtime_hub(CLIENT_CACHE_VERSION, current_secret_fingerprint())
 event_store = get_event_store()
 cycle_store = get_cycle_store()
 store = ValidationStore(VALIDATION_ROOT, event_store=event_store)
@@ -555,13 +574,14 @@ with st.sidebar:
         st.caption(" · ".join(f"{name}: {value}" for name, value in client.connection_diagnostics.items()))
     budget = client.budget_status
     st.caption(f"호출 보호: 1분 {budget.minute_used}/{budget.minute_limit} · 5시간 {budget.five_hour_used}/{budget.five_hour_limit}")
-    st.caption("상승 후보 목록 30분 · 정밀 현재가 120초 · 구조/호가 10~15분 갱신 · 자동 주문 없음")
+    st.caption(realtime_hub.status_label())
+    st.caption("상승 후보 목록 30분 · KIS 체결 현재가 1초 · 구조/호가 10~15분 갱신 · 자동 주문 없음")
 
 kis_connected = client.ready
 if kis_connected:
-    # This is a dashboard, not a button-driven analysis form. It reruns at the
-    # permitted minimum cadence and refreshes all visible card prices automatically.
-    st_autorefresh(interval=120_000, key=f"live_dashboard_{market.value}")
+    # Price ticks arrive in a background KIS WebSocket. The 1-second rerun only
+    # redraws in-memory ticks; completed-bar analysis remains cached.
+    st_autorefresh(interval=1_000, key=f"live_dashboard_{market.value}")
 
 st.markdown("<div class='mobile-head'><h1>실시간 상승·반복단타 혼합 스캐너</h1><p>상승 추세 후보의 현재가 · 진입 기준가 · 5분 1차/2차 목표 · 구조 손절가를 바로 비교하고, 반복단타 구조는 별도로 구분합니다.</p></div>", unsafe_allow_html=True)
 
@@ -601,7 +621,16 @@ else:
                 if direct_request is not None and str(candidate["symbol"]) == direct_request["symbol"]:
                     continue
                 requests.append(candidate)
-            for candidate in requests[:MAX_LIVE_CARDS + 1]:
+            visible_requests = requests[:MAX_LIVE_CARDS + 1]
+            realtime_hub.configure(
+                (
+                    market,
+                    str(candidate["symbol"]),
+                    str(candidate.get("exchange") or ("NAS" if market == Market.US else "")),
+                )
+                for candidate in visible_requests
+            )
+            for candidate in visible_requests:
                 symbol = str(candidate["symbol"])
                 exchange = str(candidate.get("exchange") or ("NAS" if market == Market.US else ""))
                 try:
@@ -641,7 +670,7 @@ if cards:
     updated_at = max(card["quote"].timestamp for card in cards)
     source_labels = {str(card.get("candidate_source") or "시장 실시간 순위") for card in cards}
     source_text = " · ".join(sorted(source_labels))
-    st.markdown(f"<div class='connection ok'>실시간 현재가 기준 {updated_at.strftime('%H:%M:%S')} · {source_text} · 상승 추세를 우선으로 {len(cards)}개를 분석했습니다. `반복단타 가능`은 추가 구조 표시이며, 초록색 목표가와 빨간색 손절가는 사용자 전략의 목표·손절 레벨입니다.</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='connection ok'>실시간 현재가 기준 {updated_at.strftime('%H:%M:%S')} · {html.escape(realtime_hub.status_label())} · {source_text} · 상승 추세를 우선으로 {len(cards)}개를 분석했습니다. `반복단타 가능`은 추가 구조 표시이며, 초록색 목표가와 빨간색 손절가는 사용자 전략의 목표·손절 레벨입니다.</div>", unsafe_allow_html=True)
     for card_item in cards:
         render_live_card(card_item, float(cost_pct))
 elif kis_connected and not errors and not candidates:
@@ -651,4 +680,4 @@ for error in errors:
     st.warning(f"일부 후보는 분석 데이터를 만들지 못했습니다: {error}")
 
 with st.expander("숫자와 전략 신호 읽는 법"):
-    st.markdown("**현재가**는 120초마다 갱신합니다. **진입 기준가·1차/2차 목표가·손절가**는 완료된 1분봉과 5분봉 구조, 거래량·거래대금·호가 상태에 따라 계산합니다. `강한 매수 검토 · 실측 80% 이상`은 동일 전략·세션·점수 구간의 사후 표본이 30건 이상이고 1차 목표가가 Hard Stop보다 먼저 도달한 비율이 80% 이상일 때만 표시합니다. 표본 부족 구간은 80%라고 표시하지 않고 누적 상태로 남깁니다. 자동 주문 기능은 없습니다.")
+    st.markdown("**현재가**는 KIS 공식 실시간 체결가 연결이 유지되는 동안 1초마다 화면에 반영되고, 재연결 중에는 REST 현재가를 임시 표시합니다. **진입 기준가·1차/2차 목표가·손절가**는 완료된 1분봉과 5분봉 구조, 거래량·거래대금·호가 상태에 따라 계산합니다. `강한 매수 검토 · 실측 80% 이상`은 동일 전략·세션·점수 구간의 사후 표본이 30건 이상이고 1차 목표가가 Hard Stop보다 먼저 도달한 비율이 80% 이상일 때만 표시합니다. 표본 부족 구간은 80%라고 표시하지 않고 누적 상태로 남깁니다. 자동 주문 기능은 없습니다.")
