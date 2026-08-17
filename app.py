@@ -20,7 +20,7 @@ from scanner.models import Market, Quote, Regime, Signal
 from scanner.persistence import EventStore
 from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
-from scanner.validation import ValidationStore
+from scanner.validation import ValidationCase, ValidationStore
 
 APP_VERSION = "5.5-market-wide-price-filter"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
@@ -368,10 +368,21 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
         minimum_score=min_score, cooldown_active=cycle.cooldown_active, hard_kill=cycle.hard_kill,
         calibration_probability=calibration.probability_pct, calibration_samples=calibration.samples,
     )
+    # Complete earlier same-symbol signals first, then record a new fully specified
+    # entry/target/stop signal. This supplies the real target-before-stop outcomes
+    # used by the strategy-specific 80% calibration; no synthetic history is created.
+    scored_cases = store.score_ready(symbol, market.value, bars, float(cost_pct))
+    recorded_case = False
+    if plan.signal == Signal.BUY and plan.entry and plan.target and plan.hard_stop:
+        case = ValidationCase.from_plan(plan, quote.price, quote.session, version=APP_VERSION)
+        _, recorded_case = store.save_once(case, cooldown_seconds=300)
     if event_store.configured:
         marker = str(plan.diagnostics.get("completed_bar_at") or quote.timestamp.isoformat())
         cycle_store.apply_risk_state(cycle, plan.risk_state, marker)
-    return {"quote": quote, "bars": bars, "plan": plan, "exchange": exchange}
+    return {
+        "quote": quote, "bars": bars, "plan": plan, "exchange": exchange,
+        "validation_recorded": recorded_case, "validation_scored": scored_cases,
+    }
 
 
 def trade_card_html(item: dict[str, Any], cost_pct: float) -> str:

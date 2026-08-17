@@ -6,6 +6,7 @@ from scanner.calibration import calibration_for
 from scanner.cycle import CycleStore
 from scanner.models import Market
 from scanner.persistence import EventStore
+from scanner.validation import ValidationStore
 
 
 class RowsOnlyStore:
@@ -81,3 +82,22 @@ def test_calibration_can_scope_samples_to_target_rule_version():
 
     assert result.samples == 30
     assert result.probability_pct == 100.0
+
+
+def test_strategy_summary_includes_expectancy_and_profit_factor(tmp_path):
+    strategy = "BREAKOUT_CONTINUATION · TREND_SWING"
+    rows = [
+        {"market": "KR", "session": "KR_REGULAR", "strategy": strategy, "target_pass": True, "net_return_pct": 0.60},
+        {"market": "KR", "session": "KR_REGULAR", "strategy": strategy, "target_pass": True, "net_return_pct": 0.40},
+        {"market": "KR", "session": "KR_REGULAR", "strategy": strategy, "target_pass": False, "net_return_pct": -0.20},
+    ]
+    store = ValidationStore(tmp_path)
+    store.load_all = lambda: rows  # type: ignore[method-assign]
+
+    report = store.summary()["by_strategy_session"][f"KR:KR_REGULAR:{strategy}"]
+
+    assert round(report["target_first_rate"], 1) == 66.7
+    assert round(report["expectancy_pct"], 4) == 0.2667
+    assert report["average_win_pct"] == 0.5
+    assert report["average_loss_pct"] == -0.2
+    assert report["profit_factor"] == 5.0

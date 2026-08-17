@@ -301,14 +301,28 @@ class ValidationStore:
             groups.setdefault(key, []).append(float(row["net_return_pct"]))
         by_strategy_session = {}
         for key, values in groups.items():
-            wins = sum(value > 0 for value in values)
-            rate = wins / len(values) * 100
+            wins = [value for value in values if value > 0]
+            losses = [value for value in values if value <= 0]
+            win_rate = len(wins) / len(values) * 100
+            average_win = sum(wins) / len(wins) if wins else None
+            average_loss = sum(losses) / len(losses) if losses else None
+            expectancy = sum(values) / len(values)
+            profit_factor = (
+                sum(wins) / abs(sum(losses))
+                if wins and losses and abs(sum(losses)) > 1e-12
+                else None
+            )
             by_strategy_session[key] = {
                 "samples": len(values),
-                "net_win_rate": rate,
-                "average_net_return_pct": sum(values) / len(values),
+                "target_first_rate": sum(1 for row in rows if f"{row.get('market', '')}:{row.get('session', '')}:{row.get('strategy', '')}" == key and row.get("target_pass") is True) / len(values) * 100,
+                "net_win_rate": win_rate,
+                "average_net_return_pct": expectancy,
+                "average_win_pct": average_win,
+                "average_loss_pct": average_loss,
+                "expectancy_pct": expectancy,
+                "profit_factor": profit_factor,
                 "eligible_for_80pct_review": len(values) >= 50,
-                "meets_80pct_goal": len(values) >= 50 and rate >= 80.0,
+                "meets_80pct_goal": len(values) >= 50 and win_rate >= 80.0 and expectancy > 0,
             }
         return {
             "storage": self.storage_status,
