@@ -642,7 +642,7 @@ def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
 
     with st.container(border=True):
         st.subheader(title)
-        st.dataframe(pd.DataFrame([structure]), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame([structure]), hide_index=True, width="stretch")
         render_realtime_price(
             quote.symbol,
             quote.market.value,
@@ -707,7 +707,7 @@ def render_new_candidate_watchlist(market_value: str, fixed_symbols: tuple[str, 
     st.subheader(f"새 상승 후보 자동 감시 · {len(rows)}개")
     st.caption("5분마다 순위·가격 조건을 다시 확인합니다. 현재 보고 있는 상세 카드와 직접 검색 종목은 바꾸지 않습니다.")
     if rows:
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     else:
         st.caption("새로 교체할 후보가 아직 없습니다.")
 
@@ -726,7 +726,7 @@ def render_chart(bars: pd.DataFrame, plan: Any, key: str) -> None:
     fig.update_layout(height=320, margin=dict(l=4, r=4, t=24, b=4), xaxis_rangeslider_visible=False, paper_bgcolor="#ffffff", plot_bgcolor="#ffffff", font_color="#172033")
     fig.update_xaxes(gridcolor="#edf1f6")
     fig.update_yaxes(gridcolor="#edf1f6")
-    st.plotly_chart(fig, use_container_width=True, key=key)
+    st.plotly_chart(fig, width="stretch", key=key)
 
 
 client = current_client()
@@ -861,7 +861,7 @@ if candidates:
         })
     limit_text = "30만 원 미만" if market == Market.KR else "170달러 미만"
     st.subheader(f"새 상승 후보 · {len(candidates)}개")
-    st.dataframe(pd.DataFrame(list_rows), hide_index=True, use_container_width=True)
+    st.dataframe(pd.DataFrame(list_rows), hide_index=True, width="stretch")
     render_new_candidate_watchlist(market.value, fixed_symbols)
 
 for error in errors:
