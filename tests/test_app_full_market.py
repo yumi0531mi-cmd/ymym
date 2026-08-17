@@ -34,7 +34,7 @@ def test_full_market_button_renders_candidates_with_connected_mock_client():
     original_init = KISClient.__init__
 
     def init_with_mock_token(self, secrets=None, cache_dir=".scanner_cache"):
-        original_init(self, {"KIS_ACCESS_TOKEN": "test-token"}, cache_dir=cache_dir)
+        original_init(self, {"KIS_APP_KEY": "test-key", "KIS_APP_SECRET": "test-secret", "KIS_ACCESS_TOKEN": "test-token"}, cache_dir=cache_dir)
 
     st.cache_resource.clear()
     with (

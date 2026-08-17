@@ -43,7 +43,7 @@ def test_selected_candidate_renders_mobile_trade_card_without_live_kis_request()
     original_init = KISClient.__init__
 
     def init_with_mock_token(self, secrets=None, cache_dir=".scanner_cache"):
-        original_init(self, {"KIS_ACCESS_TOKEN": "test-token"}, cache_dir=cache_dir)
+        original_init(self, {"KIS_APP_KEY": "test-key", "KIS_APP_SECRET": "test-secret", "KIS_ACCESS_TOKEN": "test-token"}, cache_dir=cache_dir)
 
     rankings = {
         "거래대금·거래량 순위": [{"mksc_shrn_iscd": "005930", "hts_kor_isnm": "삼성전자", "stck_prpr": "70000"}],

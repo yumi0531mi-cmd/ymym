@@ -305,11 +305,13 @@ with st.sidebar:
     market = Market.KR if market_label.startswith("국내") else Market.US
     symbol = st.text_input("직접 볼 종목", placeholder="005930 또는 SOXL").strip().upper()
     exchange = st.selectbox("미국 거래소", ["NAS", "NYS", "AMS"], disabled=market == Market.KR)
-    kis_connected = bool(client.access_token)
+    kis_connected = client.ready
     if kis_connected:
         st.success("한국투자증권 연결됨")
     else:
         st.warning("한국투자증권 연결 대기 중\n\n연결되면 아래 검색 버튼이 켜집니다.")
+        status = client.connection_diagnostics
+        st.caption(" · ".join(f"{name}: {value}" for name, value in status.items()))
     full_market_scan_now = st.button("전종목 후보 찾기", use_container_width=True, disabled=not kis_connected)
     direct_card_now = st.button("입력 종목 카드 만들기", type="primary", use_container_width=True, disabled=not kis_connected or not symbol)
     live = st.toggle("60초 카드 새로고침", False, disabled=not kis_connected)
@@ -327,7 +329,9 @@ st.markdown("<div class='mobile-head'><h1>반복단타 후보 카드</h1><p>여�
 if kis_connected:
     st.markdown("<div class='connection ok'>한국투자증권 연결이 준비되었습니다. 전종목 후보를 찾거나 종목코드를 입력해 카드로 확인하세요.</div>", unsafe_allow_html=True)
 else:
-    st.markdown("<div class='connection wait'>한국투자증권 연결을 기다리고 있습니다. 연결되기 전에는 가격을 임의로 보여 주지 않으며, 검색 버튼도 자동으로 막습니다.</div>", unsafe_allow_html=True)
+    status = client.connection_diagnostics
+    status_text = " · ".join(f"{html.escape(name)} {html.escape(value)}" for name, value in status.items())
+    st.markdown("<div class='connection wait'>한국투자증권 연결을 기다리고 있습니다. 연결되기 전에는 가격을 임의로 보여 주지 않으며, 검색 버튼도 자동으로 막습니다.<br><small>연결 확인: " + status_text + "</small></div>", unsafe_allow_html=True)
 
 if full_market_scan_now:
     try:

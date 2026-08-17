@@ -22,31 +22,42 @@ class KISError(RuntimeError):
     pass
 
 
-def _secret(names: tuple[str, ...], secrets: Any | None = None, default: str = "") -> str:
-    """Read a KIS value from top-level or common nested Streamlit Secrets.
+def _secret_with_source(
+    names: tuple[str, ...], secrets: Any | None = None, default: str = ""
+) -> tuple[str, str]:
+    """Read a secret without ever returning its value to a diagnostic view.
 
-    Values are never logged. Nested support makes `[kis]` / `[KIS]` TOML
-    sections work alongside the documented top-level Secrets format.
+    The second result is only an origin label. It lets the UI explain whether
+    a saved key was found at the top level, in any TOML section, or in an
+    environment variable. Secret text is never logged or rendered.
     """
     for name in names:
         if secrets is not None:
             try:
                 value = secrets[name]
                 if value:
-                    return str(value)
+                    return str(value), "최상위 Secrets"
             except Exception:
                 pass
-            for section_name in ("kis", "KIS"):
+            try:
+                section_names = list(secrets.keys())
+            except Exception:
+                section_names = ("kis", "KIS")
+            for section_name in section_names:
                 try:
                     section = secrets[section_name]
                     value = section[name]
                     if value:
-                        return str(value)
+                        return str(value), "하위 Secrets 설정"
                 except Exception:
                     pass
         if os.getenv(name):
-            return str(os.getenv(name))
-    return default
+            return str(os.getenv(name)), "환경 변수"
+    return default, "미확인"
+
+
+def _secret(names: tuple[str, ...], secrets: Any | None = None, default: str = "") -> str:
+    return _secret_with_source(names, secrets, default)[0]
 
 
 def secrets_fingerprint(secrets: Any | None = None) -> str:
@@ -97,9 +108,15 @@ class KISClient:
     """
 
     def __init__(self, secrets: Any | None = None, cache_dir: str | Path = ".scanner_cache"):
-        self.app_key = _secret(("KIS_APP_KEY", "APP_KEY", "app_key"), secrets)
-        self.app_secret = _secret(("KIS_APP_SECRET", "APP_SECRET", "app_secret"), secrets)
-        self.access_token = _secret(("KIS_ACCESS_TOKEN", "KIS_TOKEN", "ACCESS_TOKEN", "TOKEN", "access_token"), secrets)
+        self.app_key, app_key_source = _secret_with_source(("KIS_APP_KEY", "APP_KEY", "app_key"), secrets)
+        self.app_secret, app_secret_source = _secret_with_source(("KIS_APP_SECRET", "APP_SECRET", "app_secret"), secrets)
+        self.access_token, token_source = _secret_with_source(("KIS_ACCESS_TOKEN", "KIS_TOKEN", "ACCESS_TOKEN", "TOKEN", "access_token"), secrets)
+        self.connection_diagnostics = {
+            "앱 키": "확인됨" if self.app_key else "미확인",
+            "앱 시크릿": "확인됨" if self.app_secret else "미확인",
+            "당일 토큰": "확인됨" if self.access_token else "미확인",
+            "저장 위치": token_source if self.access_token else (app_key_source if self.app_key else app_secret_source),
+        }
         self.access_token_expires_at = _secret(("KIS_ACCESS_TOKEN_EXPIRES_AT",), secrets)
         self.allow_token_issue = _as_bool(_secret(("KIS_ALLOW_TOKEN_ISSUE",), secrets, "false"))
         self.base = _secret(("KIS_BASE_URL", "BASE_URL"), secrets, "https://openapi.koreainvestment.com:9443").rstrip("/")
@@ -122,6 +139,11 @@ class KISClient:
     @property
     def configured(self) -> bool:
         return bool(self.app_key and self.app_secret)
+
+    @property
+    def ready(self) -> bool:
+        """True only when a manual token and both app credentials are available."""
+        return bool(self.configured and self.access_token)
 
     @property
     def token_mode(self) -> str:

@@ -119,3 +119,34 @@ def test_us_market_rankings_use_two_requests_per_exchange(tmp_path):
     assert {call[2]["EXCD"] for call in calls} == {"NAS", "NYS", "AMS"}
     assert len(rankings["거래대금·거래량 순위"]) == 3
     assert len(rankings["상승률 순위"]) == 3
+
+
+def test_connection_diagnostics_hides_values_and_accepts_any_nested_section(tmp_path):
+    client = KISClient(
+        {
+            "broker": {
+                "KIS_APP_KEY": "private-key",
+                "KIS_APP_SECRET": "private-secret",
+                "KIS_ACCESS_TOKEN": "private-token",
+            }
+        },
+        cache_dir=tmp_path,
+    )
+    assert client.ready
+    assert client.connection_diagnostics == {
+        "앱 키": "확인됨",
+        "앱 시크릿": "확인됨",
+        "당일 토큰": "확인됨",
+        "저장 위치": "하위 Secrets 설정",
+    }
+    assert "private-key" not in repr(client.connection_diagnostics)
+    assert "private-secret" not in repr(client.connection_diagnostics)
+    assert "private-token" not in repr(client.connection_diagnostics)
+
+
+def test_connection_diagnostics_identifies_missing_manual_token(tmp_path):
+    client = KISClient({"KIS_APP_KEY": "key", "KIS_APP_SECRET": "secret"}, cache_dir=tmp_path)
+    assert not client.ready
+    assert client.connection_diagnostics["앱 키"] == "확인됨"
+    assert client.connection_diagnostics["앱 시크릿"] == "확인됨"
+    assert client.connection_diagnostics["당일 토큰"] == "미확인"
