@@ -113,6 +113,7 @@ def analyze(
     calibration_probability: float | None = None,
     calibration_samples: int = 0,
     calibration_expectancy_pct: float | None = None,
+    live_data_fresh: bool = True,
 ) -> TradePlan:
     """Create one explainable v5.1 manual repeated-scalping evaluation.
 
@@ -129,6 +130,8 @@ def analyze(
         )
 
     missing: list[str] = []
+    if not live_data_fresh:
+        missing.append("실시간 체결 지연")
     if bars is None or len(bars) < 31:
         missing.append("충분한 완료 1분봉")
     if orderbook_required and (not quote.bid or not quote.ask):
@@ -228,7 +231,7 @@ def analyze(
         spread_ok and rvol_ok and notional_ok and not flags["fake_breakout"]
         and not flags["upper_rejection"] and not ensemble.conflicts
     )
-    data_verified = not missing
+    data_verified = not missing and live_data_fresh
 
     execution_score = (
         15 if entry_zone_ok else 0
@@ -279,6 +282,8 @@ def analyze(
         reasons.append("당일 Hard Kill 상태입니다. 신규 진입을 차단합니다.")
     if calibration_samples < 30:
         reasons.append(f"보정확률 미표시: 동일 조건 실측 표본 {calibration_samples}건 / 30건")
+    if not live_data_fresh:
+        reasons.append("실시간 체결이 지연되어 새 신호를 대기 상태로 낮춥니다.")
 
     hard_block = regime == Regime.DOWN or not session_ok or risk.state in {"REAL_BREAKDOWN", "HARD_EXIT"} or hard_kill
     signal = Signal.BLOCK if hard_block else Signal.BUY if final_buy else Signal.WAIT
@@ -310,6 +315,7 @@ def analyze(
         "strategy_ensemble": ensemble.to_dict(),
         "calibration_probability_pct": calibration_probability if calibration_samples >= 30 else None,
         "calibration_expectancy_pct": calibration_expectancy_pct if calibration_samples >= 30 else None,
+        "live_data_fresh": live_data_fresh,
     }
     strategy_label = f"{ensemble.calibration_key} · {strategy}"
     return _plan(

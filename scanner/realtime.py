@@ -111,6 +111,14 @@ class KISRealtimeHub:
         with self._lock:
             return self._ticks.get((market, str(symbol).strip().upper()))
 
+    def tick_age_seconds(self, market: Market, symbol: str, now: datetime | None = None) -> float | None:
+        """Return age of the latest trade for one symbol, or None before its first tick."""
+        tick = self.tick(market, symbol)
+        if tick is None:
+            return None
+        observed = now or datetime.now(tick.timestamp.tzinfo)
+        return max(0.0, (observed - tick.timestamp).total_seconds())
+
     def completed_bar_rows(self, market: Market, symbol: str) -> list[dict[str, object]]:
         """Return locally completed one-minute bars derived from live KIS trades.
 

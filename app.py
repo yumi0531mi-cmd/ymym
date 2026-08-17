@@ -224,6 +224,19 @@ def quote_with_live_tick(base: Quote) -> Quote:
     )
 
 
+def realtime_freshness(quote: Quote) -> tuple[bool, float | None, int]:
+    """Avoid new signals when a subscribed, liquid candidate stops receiving trades."""
+    hub = get_realtime_hub(CLIENT_CACHE_VERSION, current_secret_fingerprint())
+    max_age = 20 if quote.market == Market.KR or quote.session == "US_REGULAR" else 60
+    tick_age = hub.tick_age_seconds(quote.market, quote.symbol)
+    if tick_age is None:
+        # The first subscription can take a few seconds.  A newly fetched REST quote
+        # remains a safe temporary baseline; stale REST snapshots do not.
+        rest_age = max(0.0, (datetime.now(quote.timestamp.tzinfo) - quote.timestamp).total_seconds())
+        return rest_age <= max_age, None, max_age
+    return tick_age <= max_age, tick_age, max_age
+
+
 def price_ceiling(market: Market) -> float:
     return KR_PRICE_CEILING if market == Market.KR else US_PRICE_CEILING
 
@@ -251,7 +264,7 @@ def sort_rising_candidates(candidates: list[dict[str, Any]], market: Market) -> 
     )
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def load_dashboard_candidates(market_value: str) -> list[dict[str, Any]]:
     """Return up to 20 rising price-eligible candidates without detailed analysis yet."""
     market = Market(market_value)
@@ -402,6 +415,7 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
     """Fetch and analyze one automatic dashboard card from REST history plus live completed bars."""
     quote = quote_with_live_tick(load_dashboard_quote(symbol, market.value, exchange))
     bars = merge_live_completed_bars(load_bars(symbol, market.value, exchange), symbol, market)
+    live_data_fresh, tick_age_seconds, stale_after_seconds = realtime_freshness(quote)
     cycle = cycle_store.get(symbol, market, quote.timestamp)
     preliminary = analyze(
         quote, bars, orderbook_required=True, round_trip_cost_pct=cost_pct,
@@ -417,6 +431,7 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
         calibration_probability=getattr(calibration, "recent_probability_pct", calibration.probability_pct),
         calibration_samples=getattr(calibration, "recent_samples", calibration.samples),
         calibration_expectancy_pct=getattr(calibration, "recent_average_net_return_pct", calibration.average_net_return_pct if hasattr(calibration, "average_net_return_pct") else None),
+        live_data_fresh=live_data_fresh,
     )
     # Complete earlier same-symbol signals first, then record a new fully specified
     # entry/target/stop signal. This supplies the real target-before-stop outcomes
@@ -434,6 +449,9 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
         "calibration": calibration.to_dict() if hasattr(calibration, "to_dict") else {
             "samples": calibration.samples, "probability_pct": calibration.probability_pct,
         },
+        "live_data_fresh": live_data_fresh,
+        "tick_age_seconds": tick_age_seconds,
+        "stale_after_seconds": stale_after_seconds,
         "validation_recorded": recorded_case, "validation_scored": scored_cases,
     }
 
@@ -556,6 +574,11 @@ def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
             )
         top[1].metric("전략 신호", strategy_signal_text(plan), f"{state} · 점수 {plan.score}/100")
         st.caption(f"구조: {repeat_text} · 위험 상태: {plan.risk_state}")
+        if not item.get("live_data_fresh", True):
+            age = item.get("tick_age_seconds")
+            stale_after = item.get("stale_after_seconds")
+            age_text = f"{int(age)}초" if isinstance(age, (float, int)) else "최근 체결 미수신"
+            st.warning(f"데이터 지연: {age_text} · {stale_after}초 기준을 넘겨 새 신호를 대기 상태로 낮췄습니다.")
         ensemble = plan.diagnostics.get("strategy_ensemble") or {}
         active_strategies = ", ".join(ensemble.get("active_names") or [])
         st.caption(f"전략 조합: {ensemble.get('calibration_key') or '계산 대기'} · {active_strategies or '완료봉 확인 대기'}")
@@ -597,6 +620,34 @@ def render_card_detail(item: dict[str, Any]) -> None:
         st.caption(f"보정 확률: {plan.calibration_probability:.1f}%" if plan.calibration_probability is not None else f"보정 표본 수: {plan.calibration_samples}/30")
         if not item["bars"].empty:
             render_chart(item["bars"].tail(120), plan, key=f"chart_{quote.market.value}_{quote.symbol}")
+
+
+@st.fragment(run_every=300)
+def render_new_candidate_watchlist(market_value: str, fixed_symbols: tuple[str, ...]) -> None:
+    """Refresh only replacement candidates; open cards and direct searches remain fixed."""
+    market = Market(market_value)
+    try:
+        fresh_candidates = load_dashboard_candidates(market.value)
+    except KISError:
+        st.caption("새 후보 감시 목록은 다음 갱신 때 다시 확인합니다.")
+        return
+    fixed = {symbol.upper() for symbol in fixed_symbols}
+    replacements = [candidate for candidate in fresh_candidates if str(candidate.get("symbol", "")).upper() not in fixed]
+    rows = [
+        {
+            "종목": f"{candidate.get('symbol')} · {candidate.get('name') or ''}",
+            "현재가": price_text(float(candidate["price"])) if isinstance(candidate.get("price"), (int, float)) else "미확인",
+            "등락률": f"{float(candidate['change_pct']):+.2f}%" if isinstance(candidate.get("change_pct"), (int, float)) else "미확인",
+            "거래대금": money(float(candidate.get("turnover") or 0.0)),
+        }
+        for candidate in replacements[:MAX_CANDIDATE_LIST]
+    ]
+    st.subheader(f"새 상승 후보 자동 감시 · {len(rows)}개")
+    st.caption("5분마다 순위·가격 조건을 다시 확인합니다. 현재 보고 있는 상세 카드와 직접 검색 종목은 바꾸지 않습니다.")
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    else:
+        st.caption("새로 교체할 후보가 아직 없습니다.")
 
 
 def render_chart(bars: pd.DataFrame, plan: Any, key: str) -> None:
@@ -729,6 +780,10 @@ if candidates:
     st.subheader(f"가격 조건 통과 상승 후보 · {len(candidates)}개")
     st.caption(f"{limit_text} · 상승률·거래대금·거래량 순위를 바탕으로 넓게 선별한 목록입니다. 아래 정밀 카드는 상위 {MAX_LIVE_CARDS}개를 계산합니다.")
     st.dataframe(pd.DataFrame(list_rows), hide_index=True, use_container_width=True)
+    fixed_symbols = tuple(str(card["quote"].symbol) for card in cards)
+    if direct_request is not None:
+        fixed_symbols = tuple(dict.fromkeys((*fixed_symbols, str(direct_request["symbol"]))))
+    render_new_candidate_watchlist(market.value, fixed_symbols)
 elif kis_connected:
     limit_text = "30만 원 미만" if market == Market.KR else "170달러 미만"
     st.info(f"현재 {limit_text} 가격 조건과 상승 후보 기준을 함께 통과한 종목이 없습니다. 다음 30분 후보 목록 갱신 때 자동으로 다시 확인합니다.")

@@ -69,3 +69,19 @@ def test_kis_realtime_excludes_forming_minute_from_completed_bars():
     assert rows[0]["low"] == 70000
     assert rows[0]["close"] == 70100
     assert rows[0]["volume"] == 30
+
+
+def test_kis_realtime_reports_symbol_tick_age():
+    from datetime import datetime, timedelta
+    from scanner.realtime import RealtimeTick
+    from scanner.sessions import KST
+
+    hub = KISRealtimeHub(ApprovalOnlyClient())
+    observed = datetime(2026, 8, 17, 10, 1, 0, tzinfo=KST)
+    tick = RealtimeTick("005930", Market.KR, 70000, 0.0, observed - timedelta(seconds=25))
+    with hub._lock:
+        hub._ticks[(Market.KR, "005930")] = tick
+        hub._accumulate_bar(tick)
+
+    assert hub.tick_age_seconds(Market.KR, "005930", now=observed) == 25.0
+    assert hub.tick_age_seconds(Market.KR, "000660", now=observed) is None
