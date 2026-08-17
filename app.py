@@ -765,8 +765,8 @@ else:
                     cards.append(card)
                 except (KISError, ValueError, KeyError, OSError) as exc:
                     errors.append(f"{symbol}: {type(exc).__name__}")
-                except Exception:
-                    errors.append(f"{symbol}: 분석 준비 오류")
+                except Exception as exc:
+                    errors.append(f"{symbol}: {type(exc).__name__}")
     except KISError:
         st.error("실시간 후보를 가져오지 못했습니다. 잠시 뒤 화면이 자동으로 다시 확인합니다.")
 
@@ -786,6 +786,8 @@ if candidates:
     st.subheader(f"가격 조건 통과 상승 후보 · {len(candidates)}개")
     st.caption(f"{limit_text} · 상승률·거래대금·거래량 순위를 바탕으로 넓게 선별한 목록입니다. 아래 정밀 카드는 상위 {MAX_LIVE_CARDS}개를 계산합니다.")
     st.dataframe(pd.DataFrame(list_rows), hide_index=True, use_container_width=True)
+    if errors:
+        st.error("상세 카드 분석 오류: " + " · ".join(errors))
     fixed_symbols = tuple(
         dict.fromkeys(
             [str(request.get("symbol", "")) for request in visible_requests]
