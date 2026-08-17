@@ -64,12 +64,33 @@ class ValidationCase:
     score: int = 0
     risk_state: str = ""
     persistence_score: int | None = None
+    latest_trade_time: str | None = None
+    orderbook_available: bool | None = None
+    spread_pct: float | None = None
+    entry_executable: bool | None = None
+    structural_target_confirmed: bool | None = None
+    data_completeness: str = "PENDING"
+    target_outcome: str | None = None
 
     @classmethod
-    def from_plan(cls, plan: TradePlan, latest_trade_price: float | None, session: str, version: str = "1.0.0"):
+    def from_plan(
+        cls,
+        plan: TradePlan,
+        latest_trade_price: float | None,
+        session: str,
+        version: str = "1.0.0",
+        latest_trade_time: datetime | None = None,
+    ):
         case_id = f"{plan.market.value}-{plan.symbol}-{plan.created_at.strftime('%Y%m%dT%H%M%S%f')}"
         tick_tolerance = max(plan.current_price * 0.0002, 0.01 if plan.market.value == "US" else 1)
         quote_pass = None if latest_trade_price is None else abs(plan.current_price - latest_trade_price) <= tick_tolerance
+        quote_age = None if latest_trade_time is None else max(0.0, (plan.created_at - latest_trade_time).total_seconds())
+        orderbook_available = bool(plan.diagnostics.get("bid") or plan.diagnostics.get("ask"))
+        if not orderbook_available:
+            orderbook_available = bool(plan.diagnostics.get("spread_pct") is not None)
+        spread_pct = plan.diagnostics.get("spread_pct")
+        structural_target_confirmed = any(token in (plan.target_basis or "") for token in ("스윙", "반복박스", "저항"))
+        entry_executable = bool(quote_pass is True and orderbook_available and plan.entry and plan.stop)
         horizons = [HorizonResult(point.minutes, point.low, point.base, point.high, point.direction.value) for point in plan.forecasts]
         return cls(
             case_id=case_id,
@@ -81,7 +102,7 @@ class ValidationCase:
             signal=plan.signal.value,
             quote_price=plan.current_price,
             latest_trade_price=latest_trade_price,
-            quote_age_seconds=None,
+            quote_age_seconds=quote_age,
             quote_pass=quote_pass,
             entry=plan.entry,
             predicted_regime=plan.regime.value,
@@ -99,6 +120,11 @@ class ValidationCase:
             score=plan.score,
             risk_state=plan.risk_state,
             persistence_score=plan.persistence_score,
+            latest_trade_time=latest_trade_time.isoformat() if latest_trade_time else None,
+            orderbook_available=orderbook_available,
+            spread_pct=float(spread_pct) if isinstance(spread_pct, (int, float)) else None,
+            entry_executable=entry_executable,
+            structural_target_confirmed=structural_target_confirmed,
         )
 
     def score_path(self, actual_prices: dict[int, float], actual_regime: Regime | None = None) -> None:
@@ -117,12 +143,21 @@ class ValidationCase:
             horizon.direction_pass = actual_direction == horizon.predicted_direction
             horizon.pass_all = bool(horizon.range_pass and horizon.direction_pass)
         self.full_path_pass = bool(self.horizons) and all(horizon.pass_all is True for horizon in self.horizons)
+        self.data_completeness = "COMPLETE" if self.horizons and all(horizon.actual is not None for horizon in self.horizons) else "PARTIAL"
         if actual_regime is not None:
             self.actual_regime = actual_regime.value
             self.regime_pass = self.actual_regime == self.predicted_regime
         self.complete_four_area_pass = all(
-            value is True for value in (self.quote_pass, self.full_path_pass, self.regime_pass, self.target_pass)
-        )
+            value is True
+            for value in (
+                self.quote_pass,
+                self.full_path_pass,
+                self.regime_pass,
+                self.target_pass,
+                self.entry_executable,
+                self.structural_target_confirmed,
+            )
+        ) and self.data_completeness == "COMPLETE"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -164,11 +199,13 @@ class ValidationCase:
             self.target_first = False
             self.stopped_first = True
             self.target_pass = False
+            self.target_outcome = "AMBIGUOUS_SAME_BAR"
             self.missing.append("1차 목표 5분 창에서 목표·손절 동시 접촉: 보수적으로 실패 처리")
         else:
             self.target_first = target_time is not None and (stop_time is None or target_time < stop_time)
             self.stopped_first = stop_time is not None and (target_time is None or stop_time < target_time)
             self.target_pass = self.target_first
+            self.target_outcome = "TARGET_FIRST" if self.target_first else "STOP_FIRST" if self.stopped_first else "TIME_EXPIRED"
         exit_price = self.target if self.target_first else self.stop if self.stopped_first else float(target_window.close.iloc[-1]) if not target_window.empty else float(end.close.iloc[-1])
         self.net_return_pct = (float(exit_price) / origin - 1) * 100 - cost_pct
 
@@ -326,9 +363,22 @@ class ValidationStore:
                 and (sum(1 for row in rows if f"{row.get('market', '')}:{row.get('session', '')}:{row.get('strategy', '')}" == key and row.get("target_pass") is True) / len(values) * 100) >= 80.0
                 and expectancy > 0,
             }
+        quote_verified = [row for row in rows if row.get("quote_pass") is True]
+        complete_data = [row for row in rows if row.get("data_completeness") == "COMPLETE"]
+        executable = [row for row in rows if row.get("entry_executable") is True]
+        full_path = [row for row in rows if row.get("full_path_pass") is True]
+        target_first = [row for row in rows if row.get("target_pass") is True]
+        structural_target = [row for row in rows if row.get("structural_target_confirmed") is True]
         return {
             "storage": self.storage_status,
             "signals": len(rows),
+            "quote_verified": len(quote_verified),
+            "complete_data": len(complete_data),
+            "entry_executable": len(executable),
+            "full_path_pass": len(full_path),
+            "structural_target_confirmed": len(structural_target),
+            "target_first": len(target_first),
+            "cost_positive": sum(value > 0 for value in net),
             "fully_scored": len(complete),
             "four_area_pass": len(passed),
             "four_area_rate": len(passed) / len(complete) * 100 if complete else None,
@@ -343,9 +393,12 @@ class ValidationStore:
         path = Path(output)
         path.parent.mkdir(parents=True, exist_ok=True)
         fields = [
-            "case_id", "version", "symbol", "market", "session", "signal_time", "signal", "score", "risk_state", "quote_pass",
-            "predicted_regime", "actual_regime", "regime_pass", "target_pass", "full_path_pass",
-            "complete_four_area_pass", "mfe_pct", "mae_pct", "net_return_pct",
+            "case_id", "version", "symbol", "market", "session", "signal_time", "signal", "score", "risk_state",
+            "quote_price", "latest_trade_price", "latest_trade_time", "quote_age_seconds", "quote_pass",
+            "entry", "entry_executable", "orderbook_available", "spread_pct",
+            "predicted_regime", "actual_regime", "regime_pass", "structural_target_confirmed",
+            "target", "target_basis", "stop", "target_outcome", "target_pass", "full_path_pass",
+            "data_completeness", "complete_four_area_pass", "mfe_pct", "mae_pct", "net_return_pct",
         ]
         with path.open("w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
@@ -379,8 +432,8 @@ class ValidationStore:
         document = f"""<!doctype html><meta charset='utf-8'><title>스캐너 검증 보고서</title>
 <style>body{{font-family:Arial,sans-serif;margin:24px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:7px;text-align:left}}th{{background:#f3f5f8}}</style>
 <h1>스캐너 원본 신호 검증 보고서</h1>
-<p>저장소 {html.escape(str(summary['storage']))} · 신호 {summary['signals']}건 · 4영역 채점완료 {summary['fully_scored']}건 · 엄격 통과 {summary['four_area_pass']}건 · 통과율 {summary['four_area_rate']}</p>
-<table><thead><tr><th>신호시각</th><th>시장</th><th>종목</th><th>신호</th><th>5~30분 경로</th><th>MFE%</th><th>MAE%</th><th>목표 우선</th><th>4영역 통과</th></tr></thead>
+<p>저장소 {html.escape(str(summary['storage']))} · 관찰 신호 {summary['signals']}건 · 현재가 검증 {summary['quote_verified']}건 · 완전 데이터 {summary['complete_data']}건 · 체결 가능 {summary['entry_executable']}건 · 전체 경로 적중 {summary['full_path_pass']}건 · 구조 목표 확인 {summary['structural_target_confirmed']}건 · 목표 선도달 {summary['target_first']}건 · 비용 차감 양수 {summary['cost_positive']}건 · 엄격 통과 {summary['four_area_pass']}건</p>
+<table><thead><tr><th>신호시각</th><th>시장</th><th>종목</th><th>신호</th><th>5~30분 경로</th><th>MFE%</th><th>MAE%</th><th>목표 우선</th><th>엄격 통과</th></tr></thead>
 <tbody>{''.join(body)}</tbody></table>"""
         path.write_text(document, encoding="utf-8")
         return path

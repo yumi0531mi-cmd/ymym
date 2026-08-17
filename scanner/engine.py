@@ -4,6 +4,7 @@ from datetime import datetime
 
 import pandas as pd
 
+from .calibration import MIN_COMPLETE_PATH_SAMPLES
 from .forecast import forecast_path
 from .indicators import enrich
 from .models import Market, Quote, Regime, Signal, TradePlan
@@ -290,8 +291,8 @@ def analyze(
         reasons.append("이전 구조붕괴 뒤 쿨다운 중입니다.")
     if hard_kill:
         reasons.append("당일 Hard Kill 상태입니다. 신규 진입을 차단합니다.")
-    if calibration_samples < 30:
-        reasons.append(f"보정확률 미표시: 동일 조건 실측 표본 {calibration_samples}건 / 30건")
+    if calibration_samples < MIN_COMPLETE_PATH_SAMPLES:
+        reasons.append(f"전체 경로 검증 누적 중: 동일 조건 실측 표본 {calibration_samples}건 / {MIN_COMPLETE_PATH_SAMPLES}건")
     hard_block = regime == Regime.DOWN or not session_ok or risk.state in {"REAL_BREAKDOWN", "HARD_EXIT"} or hard_kill
     signal = Signal.BLOCK if hard_block else Signal.BUY if final_buy else Signal.WAIT
     diagnostics: dict[str, object] = {
@@ -300,6 +301,8 @@ def analyze(
         "persistence": persistence.to_dict(),
         "risk": risk.to_dict(),
         "spread_pct": spread,
+        "bid": quote.bid,
+        "ask": quote.ask,
         "max_spread_pct": max_spread,
         "vwap": float(latest.vwap),
         "ema9": float(latest.ema9),
@@ -320,8 +323,8 @@ def analyze(
         "remaining_session_minutes": remaining,
         "completed_bar_at": str(completed.index[-1]),
         "strategy_ensemble": ensemble.to_dict(),
-        "calibration_probability_pct": calibration_probability if calibration_samples >= 30 else None,
-        "calibration_expectancy_pct": calibration_expectancy_pct if calibration_samples >= 30 else None,
+        "calibration_probability_pct": calibration_probability if calibration_samples >= MIN_COMPLETE_PATH_SAMPLES else None,
+        "calibration_expectancy_pct": calibration_expectancy_pct if calibration_samples >= MIN_COMPLETE_PATH_SAMPLES else None,
     }
     strategy_label = f"{ensemble.calibration_key} · {strategy}"
     return _plan(
@@ -345,6 +348,6 @@ def analyze(
         hard_stop=displayed_stop,
         risk_status=risk.state,
         persistence=persistence,
-        calibration_probability=calibration_probability if calibration_samples >= 30 else None,
+        calibration_probability=calibration_probability if calibration_samples >= MIN_COMPLETE_PATH_SAMPLES else None,
         calibration_samples=calibration_samples,
     )

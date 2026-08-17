@@ -13,6 +13,7 @@ import streamlit as st
 from scanner.calibration import calibration_for
 from scanner.cycle import CycleStore
 from scanner.engine import analyze
+from scanner.indicators import resample
 from scanner.kis_client import KISClient, KISError, secrets_fingerprint
 from scanner.market_screener import merge_rankings
 from scanner.models import Market, Quote, Regime, Signal
@@ -171,27 +172,19 @@ def _load_orderbook(symbol: str, market_value: str, exchange: str) -> tuple[floa
     )
 
 
-def load_dashboard_quote(symbol: str, market_value: str, exchange: str) -> Quote:
+def load_rest_dashboard_quote(symbol: str, market_value: str, exchange: str) -> Quote:
     quote = _quote_from_cache_record(_load_quote_record(symbol, market_value, exchange))
     bid, ask = _load_orderbook(symbol, market_value, exchange)
-    tick = current_realtime_hub().tick(
-        Market(market_value), symbol
-    )
-    if tick is None:
-        return Quote(
-            symbol=quote.symbol, market=quote.market, price=quote.price,
-            previous_close=quote.previous_close, timestamp=quote.timestamp,
-            bid=bid, ask=ask, volume=quote.volume, turnover=quote.turnover,
-            session=quote.session, source=quote.source,
-        )
     return Quote(
-        symbol=quote.symbol, market=quote.market, price=tick.price,
-        previous_close=quote.previous_close, timestamp=tick.timestamp,
-        bid=tick.bid if tick.bid is not None else bid,
-        ask=tick.ask if tick.ask is not None else ask,
-        volume=tick.volume if tick.volume is not None else quote.volume,
-        turnover=quote.turnover, session=quote.session, source=tick.source,
+        symbol=quote.symbol, market=quote.market, price=quote.price,
+        previous_close=quote.previous_close, timestamp=quote.timestamp,
+        bid=bid, ask=ask, volume=quote.volume, turnover=quote.turnover,
+        session=quote.session, source=quote.source,
     )
+
+
+def load_dashboard_quote(symbol: str, market_value: str, exchange: str) -> Quote:
+    return quote_with_live_tick(load_rest_dashboard_quote(symbol, market_value, exchange))
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -221,7 +214,7 @@ def merge_live_completed_bars(base: pd.DataFrame, symbol: str, market: Market) -
 
 
 def quote_with_live_tick(base: Quote) -> Quote:
-    tick = get_realtime_hub(CLIENT_CACHE_VERSION, current_secret_fingerprint()).tick(base.market, base.symbol)
+    tick = current_realtime_hub().tick(base.market, base.symbol)
     if tick is None:
         return base
     return Quote(
@@ -422,6 +415,53 @@ def buy_range_text(plan: Any, quote: Quote) -> str:
     return price_text(low) if abs(high - low) < 0.01 else f"{price_text(low)} ~ {price_text(high)}"
 
 
+def regime_text(regime: Regime) -> str:
+    return {
+        Regime.UP: "상승 추세",
+        Regime.RANGE: "박스권",
+        Regime.DOWN: "하락 추세",
+        Regime.TRANSITION: "전환 구간",
+    }.get(regime, "구조 확인 중")
+
+
+def dashboard_structure(item: dict[str, Any]) -> dict[str, str]:
+    """Build the short structure row shown above the price levels."""
+    plan = item["plan"]
+    bars: pd.DataFrame = item["bars"]
+    timeframes = plan.diagnostics.get("timeframes") or {}
+    trend_60 = str(timeframes.get(60) or timeframes.get("60") or plan.regime.value)
+    trend_label = regime_text(Regime(trend_60)) if trend_60 in {item.value for item in Regime} else regime_text(plan.regime)
+    completed_60 = max(0, len(resample(bars, 60)) - 1) if not bars.empty else 0
+    box = plan.repeat_box
+    if plan.regime == Regime.UP and box:
+        kind = "우상향 반복단타"
+    elif plan.regime == Regime.UP:
+        kind = "상승 추세"
+    elif plan.regime == Regime.RANGE:
+        kind = "박스 반복단타"
+    elif plan.regime == Regime.DOWN:
+        kind = "하락 추세"
+    else:
+        kind = "전환 관찰"
+    box_text = "박스 확인" if box else "박스 형성 중"
+    current_state = {
+        "NORMAL_SWING": "정상 상승",
+        "NORMAL_PULLBACK": "정상 눌림",
+        "SHAKEOUT": "이탈 후 회복",
+        "WARNING": "지지 확인",
+        "REAL_BREAKDOWN": "구조 이탈",
+        "HARD_EXIT": "손절 구조",
+    }.get(plan.risk_state, "구조 확인 중")
+    return {
+        "유형": kind,
+        "큰 추세": trend_label,
+        "60분봉 구조": trend_label,
+        "60분봉 수": str(completed_60),
+        "박스 판정": box_text,
+        "현재 상태": current_state,
+    }
+
+
 def compact_directions(plan: Any) -> str:
     signs = {Regime.UP: "+", Regime.DOWN: "-", Regime.RANGE: "0"}
     values = []
@@ -437,7 +477,7 @@ def strategy_signal_text(plan: Any) -> str:
         return "강한 매수 검토 · 실측 80% 이상"
     if plan.signal == Signal.BUY:
         return "매수 검토 신호 · 진입 조건 충족"
-    if plan.signal == Signal.WAIT and plan.calibration_samples >= 30 and plan.calibration_probability is not None and plan.calibration_probability < 80.0:
+    if plan.signal == Signal.WAIT and plan.calibration_samples >= 100 and plan.calibration_probability is not None and plan.calibration_probability < 80.0:
         return "진입 대기 · 실측 80% 미만"
     mapping = {
         Signal.WAIT: "진입 대기",
@@ -450,7 +490,9 @@ def strategy_signal_text(plan: Any) -> str:
 
 def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
     """Fetch and analyze one automatic dashboard card from REST history plus live completed bars."""
-    quote = quote_with_live_tick(load_dashboard_quote(symbol, market.value, exchange))
+    rest_quote = load_rest_dashboard_quote(symbol, market.value, exchange)
+    live_tick = current_realtime_hub().tick(market, symbol)
+    quote = quote_with_live_tick(rest_quote)
     bars = merge_live_completed_bars(load_bars(symbol, market.value, exchange), symbol, market)
     cycle = cycle_store.get(symbol, market, quote.timestamp)
     preliminary = analyze(
@@ -473,8 +515,14 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
     # used by the strategy-specific 80% calibration; no synthetic history is created.
     scored_cases = store.score_ready(symbol, market.value, bars, float(cost_pct))
     recorded_case = False
-    if plan.signal == Signal.BUY and plan.entry and plan.target and plan.hard_stop:
-        case = ValidationCase.from_plan(plan, quote.price, quote.session, version=APP_VERSION)
+    if plan.entry and plan.target and plan.hard_stop:
+        case = ValidationCase.from_plan(
+            plan,
+            live_tick.price if live_tick is not None else None,
+            quote.session,
+            version=APP_VERSION,
+            latest_trade_time=live_tick.timestamp if live_tick is not None else None,
+        )
         _, recorded_case = store.save_once(case, cooldown_seconds=300)
     if event_store.configured:
         marker = str(plan.diagnostics.get("completed_bar_at") or quote.timestamp.isoformat())
@@ -582,19 +630,19 @@ def mixed_card_priority(item: dict[str, Any]) -> tuple[int, int, int]:
 
 
 def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
-    """Render the compact price card; detailed calculations remain inside the engine."""
+    """Render the short, price-first dashboard card requested by the user."""
     quote: Quote = item["quote"]
     plan = item["plan"]
-    forecast_5 = forecast_point_for(plan, 5)
-    forecast_15 = forecast_point_for(plan, 15)
-    forecast_30 = forecast_point_for(plan, 30)
-    target_1 = plan.target if plan.target is not None else (forecast_5.base if forecast_5 else None)
-    target_2 = plan.target2 if plan.target2 is not None else (forecast_15.base if forecast_15 else None)
+    structure = dashboard_structure(item)
+    target_1 = plan.target or (forecast_point_for(plan, 5).base if forecast_point_for(plan, 5) else None)
+    target_2 = plan.target2 or (forecast_point_for(plan, 15).base if forecast_point_for(plan, 15) else None)
+    support = plan.soft_stop
     stop = plan.hard_stop or plan.invalidation or plan.stop
     title = f"{quote.symbol} · {item.get('name') or quote.market.value}"
 
     with st.container(border=True):
         st.subheader(title)
+        st.dataframe(pd.DataFrame([structure]), hide_index=True, use_container_width=True)
         render_realtime_price(
             quote.symbol,
             quote.market.value,
@@ -602,13 +650,21 @@ def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
             quote.previous_close,
             quote.timestamp.isoformat(),
         )
+        forecast_columns = st.columns(4)
+        for column, minutes in zip(forecast_columns, (5, 10, 15, 30)):
+            point = forecast_point_for(plan, minutes)
+            column.metric(
+                f"{minutes}분 예상",
+                price_text(point.base if point else None),
+                forecast_direction_text(point),
+            )
         prices = st.columns(2)
         prices[0].metric("추천 매수가", buy_range_text(plan, quote))
         prices[1].metric("추천 매도가 1차", price_text(target_1))
-        exits = st.columns(2)
+        exits = st.columns(3)
         exits[0].metric("추천 매도가 2차", price_text(target_2))
-        exits[1].metric("손절가", price_text(stop))
-        st.caption(f"방향  {compact_directions(plan)}")
+        exits[1].metric("현재 차트 지지", price_text(support))
+        exits[2].metric("손절가", price_text(stop))
 
 
 def render_card_detail(item: dict[str, Any]) -> None:
@@ -623,7 +679,7 @@ def render_card_detail(item: dict[str, Any]) -> None:
         for reason in plan.reasons or ["특별 경고 없음"]:
             st.write(f"- {reason}")
         st.caption(f"1차 목표 근거: {plan.target_basis or '구조 미확인'} · 2차 목표 근거: {plan.target2_basis or '구조 미확인'}")
-        st.caption(f"보정 확률: {plan.calibration_probability:.1f}%" if plan.calibration_probability is not None else f"보정 표본 수: {plan.calibration_samples}/30")
+        st.caption(f"전체 경로 검증: {plan.calibration_probability:.1f}%" if plan.calibration_probability is not None else f"전체 경로 검증 표본: {plan.calibration_samples}/100")
         if not item["bars"].empty:
             render_chart(item["bars"].tail(120), plan, key=f"chart_{quote.market.value}_{quote.symbol}")
 
@@ -773,32 +829,12 @@ else:
         st.error("실시간 후보를 가져오지 못했습니다. 잠시 뒤 화면이 자동으로 다시 확인합니다.")
 
 if candidates:
-    list_rows = []
-    for candidate in candidates[:MAX_CANDIDATE_LIST]:
-        price = candidate.get("price")
-        change = candidate.get("change_pct")
-        list_rows.append({
-            "종목": f"{candidate.get('symbol')} · {candidate.get('name') or ''}",
-            "현재가": price_text(float(price)) if isinstance(price, (int, float)) else "미확인",
-            "등락률": f"{float(change):+.2f}%" if isinstance(change, (int, float)) else "미확인",
-            "거래대금": money(float(candidate.get('turnover') or 0.0)),
-            "출처": str(candidate.get("candidate_source") or "시장 실시간 순위"),
-        })
-    limit_text = "30만 원 미만" if market == Market.KR else "170달러 미만"
-    st.subheader(f"가격 조건 통과 상승 후보 · {len(candidates)}개")
-    st.caption(f"{limit_text} · 상승률·거래대금·거래량 순위를 바탕으로 넓게 선별한 목록입니다. 아래 정밀 카드는 상위 {MAX_LIVE_CARDS}개를 계산합니다.")
-    st.dataframe(pd.DataFrame(list_rows), hide_index=True, use_container_width=True)
-    if errors:
-        st.error("상세 카드 분석 오류: " + " · ".join(errors))
     fixed_symbols = tuple(
         dict.fromkeys(
             [str(request.get("symbol", "")) for request in visible_requests]
             + [str(card["quote"].symbol) for card in cards]
         )
     )
-elif kis_connected:
-    limit_text = "30만 원 미만" if market == Market.KR else "170달러 미만"
-    st.info(f"현재 {limit_text} 가격 조건과 상승 후보 기준을 함께 통과한 종목이 없습니다. 다음 30분 후보 목록 갱신 때 자동으로 다시 확인합니다.")
 
 if cards:
     cards.sort(key=mixed_card_priority, reverse=True)
@@ -809,9 +845,23 @@ if cards:
     for card_item in cards:
         render_live_card(card_item, float(cost_pct))
 elif kis_connected and not errors and not candidates:
-    st.info("현재 분석할 상승 추세 후보가 없습니다. 관심 종목은 왼쪽 검색칸에 바로 입력할 수 있습니다.")
+    limit_text = "30만 원 미만" if market == Market.KR else "170달러 미만"
+    st.info(f"현재 {limit_text} 가격 조건과 상승 후보 기준을 함께 통과한 종목이 없습니다.")
 
 if candidates:
+    list_rows = []
+    for candidate in candidates[:MAX_CANDIDATE_LIST]:
+        price = candidate.get("price")
+        change = candidate.get("change_pct")
+        list_rows.append({
+            "종목": f"{candidate.get('symbol')} · {candidate.get('name') or ''}",
+            "현재가": price_text(float(price)) if isinstance(price, (int, float)) else "미확인",
+            "등락률": f"{float(change):+.2f}%" if isinstance(change, (int, float)) else "미확인",
+            "거래대금": money(float(candidate.get('turnover') or 0.0)),
+        })
+    limit_text = "30만 원 미만" if market == Market.KR else "170달러 미만"
+    st.subheader(f"새 상승 후보 · {len(candidates)}개")
+    st.dataframe(pd.DataFrame(list_rows), hide_index=True, use_container_width=True)
     render_new_candidate_watchlist(market.value, fixed_symbols)
 
 for error in errors:

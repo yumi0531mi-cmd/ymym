@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .calibration import MIN_COMPLETE_PATH_SAMPLES
 from .indicators import enrich
 from .models import Regime
 
@@ -342,11 +343,10 @@ def final_buy_decision(
         "위험 상태": risk.state not in {"REAL_BREAKDOWN", "HARD_EXIT"},
         "쿨다운": not cooldown_active,
         "Hard Kill": not hard_kill,
-        # 표본이 30건 이상이면 동일 전략·세션·점수 구간의 실제 1차 목표 선도달률이
-        # 80% 이상일 때만 강한 매수 검토 신호를 허용한다. 표본 부족 구간은 성과를
-        # 꾸며 표시하지 않고 학습·관찰 상태로 남긴다.
-        "80% 목표가 실측": calibration_samples < 30 or calibration_probability is None or calibration_probability >= 80.0,
-        "비용 반영 기대값": calibration_samples < 30 or calibration_expectancy_pct is None or calibration_expectancy_pct > 0,
+        # 동일 시장·세션·전략·점수 구간의 실제 전체 경로 검증 100건을 채운 뒤에만
+        # 80% 적중과 비용 반영 기대값을 신호 관문에 적용한다.
+        "80% 전체 경로 실측": calibration_samples < MIN_COMPLETE_PATH_SAMPLES or calibration_probability is None or calibration_probability >= 80.0,
+        "비용 반영 기대값": calibration_samples < MIN_COMPLETE_PATH_SAMPLES or calibration_expectancy_pct is None or calibration_expectancy_pct > 0,
     }
     reasons = [name for name, passed in gates.items() if not passed]
     return FinalDecision(all(gates.values()), gates, reasons)

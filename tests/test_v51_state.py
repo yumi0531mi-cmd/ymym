@@ -28,33 +28,35 @@ def test_cycle_real_breakdown_is_counted_once_per_completed_bar():
     assert state.hard_kill is True
 
 
-def test_calibration_hides_probability_before_thirty_samples():
+def test_calibration_hides_probability_before_one_hundred_complete_samples():
     rows = [
         {
             "market": "KR", "session": "KR_REGULAR", "strategy": "TREND_SWING · 상승 추세 눌림",
-            "score": 82, "target_pass": True, "net_return_pct": 0.2,
+            "score": 82, "complete_four_area_pass": True, "data_completeness": "COMPLETE",
+            "entry_executable": True, "structural_target_confirmed": True, "net_return_pct": 0.2,
         }
-        for _ in range(29)
+        for _ in range(99)
     ]
     result = calibration_for(
         RowsOnlyStore(rows), market="KR", session="KR_REGULAR", strategy="TREND_SWING · 상승 추세 눌림", score=83,
     )
-    assert result.samples == 29
+    assert result.samples == 99
     assert result.probability_pct is None
 
 
-def test_calibration_uses_t1_before_stop_rate_after_thirty_samples():
+def test_calibration_uses_complete_path_rate_after_one_hundred_samples():
     rows = [
         {
             "market": "US", "session": "US_REGULAR", "strategy": "RANGE_SWING · 박스 하단 평균회귀",
-            "score": 76, "target_pass": index < 24, "net_return_pct": 0.3 if index < 24 else -0.2,
+            "score": 76, "complete_four_area_pass": index < 80, "data_completeness": "COMPLETE",
+            "entry_executable": True, "structural_target_confirmed": True, "net_return_pct": 0.3 if index < 80 else -0.2,
         }
-        for index in range(30)
+        for index in range(100)
     ]
     result = calibration_for(
         RowsOnlyStore(rows), market="US", session="US_REGULAR", strategy="RANGE_SWING · 박스 하단 평균회귀", score=78,
     )
-    assert result.samples == 30
+    assert result.samples == 100
     assert result.probability_pct == 80.0
 
 
@@ -62,15 +64,17 @@ def test_calibration_can_scope_samples_to_target_rule_version():
     rows = [
         {
             "market": "US", "session": "US_REGULAR", "strategy": "TREND_SWING · 상승 추세 눌림",
-            "score": 84, "target_pass": True, "net_return_pct": 0.3,
+            "score": 84, "complete_four_area_pass": True, "data_completeness": "COMPLETE",
+            "entry_executable": True, "structural_target_confirmed": True, "net_return_pct": 0.3,
             "version": "5.1.1-five-minute-target",
         }
-        for _ in range(30)
+        for _ in range(100)
     ]
     rows.append(
         {
             "market": "US", "session": "US_REGULAR", "strategy": "TREND_SWING · 상승 추세 눌림",
-            "score": 84, "target_pass": False, "net_return_pct": -0.2,
+            "score": 84, "complete_four_area_pass": False, "data_completeness": "COMPLETE",
+            "entry_executable": True, "structural_target_confirmed": True, "net_return_pct": -0.2,
             "version": "5.1-persistence-cycle",
         }
     )
@@ -80,7 +84,7 @@ def test_calibration_can_scope_samples_to_target_rule_version():
         version="5.1.1-five-minute-target",
     )
 
-    assert result.samples == 30
+    assert result.samples == 100
     assert result.probability_pct == 100.0
 
 

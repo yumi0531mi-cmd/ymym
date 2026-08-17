@@ -7,6 +7,10 @@ from .persistence import EventStore, PersistenceError
 from .validation import ValidationStore
 
 
+MIN_COMPLETE_PATH_SAMPLES = 100
+RECENT_COMPLETE_PATH_WINDOW = 100
+
+
 @dataclass
 class CalibrationResult:
     market: str
@@ -22,7 +26,7 @@ class CalibrationResult:
 
     @property
     def calibrated(self) -> bool:
-        return self.samples >= 30 and self.probability_pct is not None
+        return self.samples >= MIN_COMPLETE_PATH_SAMPLES and self.probability_pct is not None
 
     @property
     def positive_expectancy(self) -> bool:
@@ -35,10 +39,10 @@ class CalibrationResult:
 
     @property
     def target_80_verified(self) -> bool:
-        """Require 30 real current-version outcomes, positive costs-adjusted expectancy, and a recent 30-case check."""
+        """Require 100 real complete-path outcomes and positive cost-adjusted expectancy."""
         return bool(
             self.calibrated
-            and self.recent_samples >= 30
+            and self.recent_samples >= MIN_COMPLETE_PATH_SAMPLES
             and self.probability_pct is not None and self.probability_pct >= 80.0
             and self.recent_probability_pct is not None and self.recent_probability_pct >= 80.0
             and self.positive_expectancy
@@ -73,16 +77,19 @@ def calibration_for(
         and row.get("session") == session
         and row.get("strategy") == strategy
         and bucket(int(row.get("score", 0))) == current_bucket
-        and row.get("target_pass") is not None
+        and row.get("data_completeness") == "COMPLETE"
+        and row.get("entry_executable") is True
+        and row.get("structural_target_confirmed") is True
+        and row.get("complete_four_area_pass") is not None
         and (version is None or row.get("version") == version)
     ]
     matches = sorted(matches, key=lambda row: str(row.get("signal_time", "")))
     samples = len(matches)
-    wins = sum(row.get("target_pass") is True for row in matches)
+    wins = sum(row.get("complete_four_area_pass") is True for row in matches)
     net = [float(row["net_return_pct"]) for row in matches if row.get("net_return_pct") is not None]
-    recent = matches[-30:]
+    recent = matches[-RECENT_COMPLETE_PATH_WINDOW:]
     recent_samples = len(recent)
-    recent_wins = sum(row.get("target_pass") is True for row in recent)
+    recent_wins = sum(row.get("complete_four_area_pass") is True for row in recent)
     recent_net = [float(row["net_return_pct"]) for row in recent if row.get("net_return_pct") is not None]
     return CalibrationResult(
         market=market,
@@ -90,10 +97,10 @@ def calibration_for(
         strategy=strategy,
         score_bucket=current_bucket,
         samples=samples,
-        probability_pct=round(wins / samples * 100, 1) if samples >= 30 else None,
+        probability_pct=round(wins / samples * 100, 1) if samples >= MIN_COMPLETE_PATH_SAMPLES else None,
         average_net_return_pct=round(sum(net) / len(net), 4) if net else None,
         recent_samples=recent_samples,
-        recent_probability_pct=round(recent_wins / recent_samples * 100, 1) if recent_samples >= 30 else None,
+        recent_probability_pct=round(recent_wins / recent_samples * 100, 1) if recent_samples >= MIN_COMPLETE_PATH_SAMPLES else None,
         recent_average_net_return_pct=round(sum(recent_net) / len(recent_net), 4) if recent_net else None,
     )
 

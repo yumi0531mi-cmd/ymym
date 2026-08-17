@@ -103,7 +103,7 @@ def test_connected_app_automatically_renders_live_candidate_card_without_user_se
     assert any("실시간 상승·반복단타 혼합 스캐너" in str(item.value) for item in app.markdown)
     assert any("005930" in str(item.value) for item in app.subheader)
     assert {metric.label for metric in app.metric} >= {"현재가", "추천 매수가", "추천 매도가 1차", "추천 매도가 2차", "손절가"}
-    assert any("방향  5분 + · 10분 ? · 15분 + · 30분 +" in str(item.value) for item in app.caption)
+    assert {metric.label for metric in app.metric} >= {"5분 예상", "10분 예상", "15분 예상", "30분 예상", "현재 차트 지지"}
     assert any("상세 카드 1개" in str(item.value) for item in app.caption)
 
 
