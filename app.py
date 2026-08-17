@@ -30,32 +30,33 @@ st.set_page_config(
     page_title="반복단타 후보 카드",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="auto",
 )
 st.markdown(
     """
 <style>
-:root{--bg:#090d16;--panel:#121927;--panel2:#182133;--line:#2a3750;--text:#f4f7fc;--muted:#9da9bd;--green:#55d580;--red:#ff7d7d;--yellow:#ffd66b;--blue:#6ba7ff}
-.stApp{background:var(--bg);color:var(--text)}
-.block-container{max-width:860px;padding:1rem .8rem 3rem}
-[data-testid="stSidebar"]{background:#101725;border-right:1px solid var(--line)}
-[data-testid="stSidebar"] *{color:var(--text)}
-h1,h2,h3,p,label{color:var(--text)!important}
-[data-testid="stCaptionContainer"] p{color:var(--muted)!important}
-[data-testid="stMetric"]{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:.55rem}
-[data-testid="stMetricLabel"]{color:var(--muted)}
-[data-testid="stMetricValue"]{color:var(--text);font-size:1.1rem!important}
-.mobile-head{margin:.25rem 0 1rem}.mobile-head h1{margin:0;font-size:clamp(1.55rem,7vw,2.35rem);letter-spacing:-.05em}.mobile-head p{margin:.35rem 0 0;color:var(--muted)!important;font-size:.88rem}
-.connection{border-radius:14px;padding:.8rem 1rem;margin:.35rem 0 1rem;border:1px solid}.connection.ok{background:#0e2a20;border-color:#267d52;color:#b9f6d1}.connection.wait{background:#2b2513;border-color:#806a25;color:#ffe49a}
-.candidate-row{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:.55rem .7rem;margin:.35rem 0;color:var(--text);display:flex;justify-content:space-between;gap:.5rem}.candidate-row small{color:var(--muted)}
-.trade-card{background:linear-gradient(145deg,#151d2c,#0d131e);border:1px solid #33425e;border-radius:18px;padding:1rem;margin:.8rem 0 1rem;box-shadow:0 10px 30px rgba(0,0,0,.24);color:var(--text)}
-.card-top{display:flex;justify-content:space-between;gap:.6rem;align-items:flex-start}.ticker{font-size:1.25rem;font-weight:850;letter-spacing:-.02em}.name{font-size:.78rem;color:var(--muted);margin-top:.16rem}.price{font-size:1.35rem;font-weight:850;text-align:right}.change.up{color:var(--green)}.change.down{color:var(--red)}.change.flat{color:var(--muted)}
-.badges{display:flex;flex-wrap:wrap;gap:.35rem;margin:.7rem 0}.badge{border-radius:999px;padding:.22rem .55rem;font-size:.73rem;font-weight:750;background:#27344b;color:#dce8ff}.badge.buy{background:#164d34;color:#bdf8d0}.badge.wait{background:#594918;color:#ffe4a0}.badge.block{background:#57272d;color:#ffc3c5}.badge.risk{background:#3a2632;color:#ffbdcf}
-.warn-box{border:1px solid #77414a;background:#2a181f;color:#ffcad0;border-radius:11px;padding:.55rem .65rem;margin:.55rem 0;font-size:.82rem}.note-box{background:#1d2637;color:#cdd9ef;border-radius:11px;padding:.55rem .65rem;margin:.55rem 0;font-size:.82rem}
-.data-grid{display:grid;grid-template-columns:1fr 1fr;gap:.35rem .75rem;margin:.75rem 0}.data-item{border-bottom:1px solid #28354c;padding:.35rem 0}.data-label{color:var(--muted);font-size:.72rem}.data-value{font-size:.9rem;font-weight:700;margin-top:.1rem}
-.plan-title{font-weight:800;font-size:.95rem;margin:.85rem 0 .35rem}.plan-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.4rem}.plan-item{background:#1a2333;border-radius:10px;padding:.48rem}.plan-item .data-label{font-size:.7rem}.entry{color:#f5d66b}.target{color:var(--green)}.stop{color:var(--red)}
-.card-foot{color:var(--muted);font-size:.72rem;margin-top:.65rem}.card-expander{margin-top:.25rem}
-@media(max-width:700px){.block-container{padding:.65rem .55rem 2rem}.trade-card{padding:.8rem;border-radius:15px}.ticker{font-size:1.1rem}.price{font-size:1.18rem}.data-grid{gap:.25rem .55rem}.plan-grid{gap:.3rem}.plan-item{padding:.42rem}.stButton>button{min-height:2.5rem;font-size:.92rem}}
+:root{--bg:#ffffff;--panel:#ffffff;--panel2:#f7f9fc;--line:#dbe2ec;--text:#172033;--muted:#64748b;--green:#17834a;--red:#d54444;--yellow:#a66c00;--blue:#2563eb}
+	.stApp{background:var(--bg);color:var(--text)}
+	.block-container{max-width:1440px;padding:1.1rem 1.25rem 3rem}
+	[data-testid="stSidebar"]{background:#f8fafc;border-right:1px solid var(--line)}
+	[data-testid="stSidebar"] *{color:var(--text)}
+	h1,h2,h3,p,label{color:var(--text)!important}
+	[data-testid="stCaptionContainer"] p{color:var(--muted)!important}
+	[data-testid="stMetric"]{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:.55rem}
+	[data-testid="stMetricLabel"]{color:var(--muted)}
+	[data-testid="stMetricValue"]{color:var(--text);font-size:1.1rem!important}
+	.mobile-head{margin:.2rem 0 1rem}.mobile-head h1{margin:0;font-size:clamp(1.6rem,5vw,2.5rem);letter-spacing:-.05em}.mobile-head p{margin:.35rem 0 0;color:var(--muted)!important;font-size:.92rem}
+	.connection{border-radius:14px;padding:.85rem 1rem;margin:.35rem 0 1rem;border:1px solid}.connection.ok{background:#effbf3;border-color:#8ed3aa;color:#176238}.connection.wait{background:#fff9e8;border-color:#e8cc72;color:#785000}
+	.candidate-row{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:.6rem .75rem;margin:.4rem 0;color:var(--text);display:flex;justify-content:space-between;gap:.5rem;box-shadow:0 2px 8px rgba(15,23,42,.04)}.candidate-row small{color:var(--muted)}
+	.cards-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:1rem;align-items:start}.trade-card{background:var(--panel);border:1px solid #d6dfeb;border-radius:18px;padding:1rem;margin:0;box-shadow:0 7px 22px rgba(15,23,42,.08);color:var(--text);height:100%;box-sizing:border-box}
+	.card-top{display:flex;justify-content:space-between;gap:.6rem;align-items:flex-start}.ticker{font-size:1.25rem;font-weight:850;letter-spacing:-.02em}.name{font-size:.78rem;color:var(--muted);margin-top:.16rem}.price{font-size:1.35rem;font-weight:850;text-align:right}.change.up{color:var(--green)}.change.down{color:var(--red)}.change.flat{color:var(--muted)}
+	.badges{display:flex;flex-wrap:wrap;gap:.35rem;margin:.7rem 0}.badge{border-radius:999px;padding:.24rem .55rem;font-size:.73rem;font-weight:750;background:#edf2f8;color:#34445d}.badge.buy{background:#dff7e7;color:#176238}.badge.wait{background:#fff3cc;color:#885b00}.badge.block{background:#ffe4e5;color:#a32f37}.badge.risk{background:#f8e7ec;color:#a32f57}
+	.warn-box{border:1px solid #f0b7b7;background:#fff4f4;color:#9f3131;border-radius:11px;padding:.55rem .65rem;margin:.55rem 0;font-size:.82rem}.note-box{background:#edf4ff;color:#274f85;border-radius:11px;padding:.55rem .65rem;margin:.55rem 0;font-size:.82rem}
+	.data-grid{display:grid;grid-template-columns:1fr 1fr;gap:.35rem .75rem;margin:.75rem 0}.data-item{border-bottom:1px solid #e3e9f1;padding:.35rem 0}.data-label{color:var(--muted);font-size:.72rem}.data-value{font-size:.9rem;font-weight:700;margin-top:.1rem}
+	.plan-title{font-weight:800;font-size:.95rem;margin:.85rem 0 .35rem}.plan-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.4rem}.plan-item{background:#f5f8fc;border-radius:10px;padding:.48rem}.plan-item .data-label{font-size:.7rem}.entry{color:#a66c00}.target{color:var(--green)}.stop{color:var(--red)}
+	.card-foot{color:var(--muted);font-size:.72rem;margin-top:.65rem}.card-detail{margin:.15rem 0 1rem}
+	@media(max-width:700px){.block-container{padding:.65rem .55rem 2rem}.cards-grid{grid-template-columns:1fr;gap:.75rem}.trade-card{padding:.8rem;border-radius:15px}.ticker{font-size:1.1rem}.price{font-size:1.18rem}.data-grid{gap:.25rem .55rem}.plan-grid{gap:.3rem}.plan-item{padding:.42rem}.stButton>button{min-height:2.5rem;font-size:.92rem}}
+
 </style>
 """,
     unsafe_allow_html=True,
@@ -206,7 +207,7 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
     return {"quote": quote, "bars": bars, "plan": plan, "exchange": exchange}
 
 
-def render_trade_card(item: dict[str, Any], cost_pct: float) -> None:
+def trade_card_html(item: dict[str, Any], cost_pct: float) -> str:
     quote: Quote = item["quote"]
     plan = item["plan"]
     change = quote.change_pct
@@ -244,7 +245,7 @@ def render_trade_card(item: dict[str, Any], cost_pct: float) -> None:
     <div class="data-item"><div class="data-label">상대거래량</div><div class="data-value">{number_text(rvol, 'x')}</div></div>
     <div class="data-item"><div class="data-label">호가 스프레드</div><div class="data-value">{number_text(spread, '%')}</div></div>
   </div>
-  <div class="plan-title">매매 레벨 <span style="font-size:.72rem;color:#9da9bd">수동매매 참고값</span></div>
+  <div class="plan-title">매매 레벨 <span style="font-size:.72rem;color:#64748b">수동매매 참고값</span></div>
   <div class="plan-grid">
     <div class="plan-item"><div class="data-label">진입 기준가</div><div class="data-value entry">{price_text(plan.entry)}</div></div>
     <div class="plan-item"><div class="data-label">1차 목표 · 5분</div><div class="data-value target">{price_text(plan.target)}</div></div>
@@ -256,7 +257,12 @@ def render_trade_card(item: dict[str, Any], cost_pct: float) -> None:
   <div class="card-foot">1차·2차 목표는 완료된 5분봉 구조를 우선 사용합니다. 왕복비용 가정 {cost_pct:.2f}% · 주문 기능 없음</div>
 </section>
 """
-    st.markdown(card, unsafe_allow_html=True)
+    return card
+
+
+def render_card_detail(item: dict[str, Any]) -> None:
+    quote: Quote = item["quote"]
+    plan = item["plan"]
     with st.expander(f"{quote.symbol} 카드 자세히 보기"):
         repeat_box = plan.repeat_box
         if repeat_box:
@@ -282,7 +288,9 @@ def render_chart(bars: pd.DataFrame, plan: Any) -> None:
     ):
         if value is not None:
             fig.add_hline(y=value, line_color=color, line_dash=dash, annotation_text=f"{name} {price_text(value)}")
-    fig.update_layout(height=320, margin=dict(l=4, r=4, t=24, b=4), xaxis_rangeslider_visible=False, paper_bgcolor="#121927", plot_bgcolor="#121927", font_color="#f4f7fc")
+    fig.update_layout(height=320, margin=dict(l=4, r=4, t=24, b=4), xaxis_rangeslider_visible=False, paper_bgcolor="#ffffff", plot_bgcolor="#ffffff", font_color="#172033")
+    fig.update_xaxes(gridcolor="#edf1f6")
+    fig.update_yaxes(gridcolor="#edf1f6")
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -371,8 +379,12 @@ if selected_requests or (live and symbol and kis_connected):
 cards = st.session_state.get("mobile_cards") or []
 if cards:
     st.subheader(f"정밀 분석 카드 · {len(cards)}개")
+    st.markdown(
+        "<div class='cards-grid'>" + "".join(trade_card_html(card_item, float(cost_pct)) for card_item in cards) + "</div>",
+        unsafe_allow_html=True,
+    )
     for card_item in cards:
-        render_trade_card(card_item, float(cost_pct))
+        render_card_detail(card_item)
 elif kis_connected:
     st.info("왼쪽에서 **전종목 후보 찾기**를 누른 뒤 최대 3개를 고르거나, 종목코드를 입력해 카드로 확인하세요.")
 
