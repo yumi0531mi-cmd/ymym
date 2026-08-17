@@ -330,8 +330,8 @@ if kis_connected:
     st.markdown("<div class='connection ok'>한국투자증권 연결이 준비되었습니다. 전종목 후보를 찾거나 종목코드를 입력해 카드로 확인하세요.</div>", unsafe_allow_html=True)
 else:
     status = client.connection_diagnostics
-    status_text = " · ".join(f"{html.escape(name)} {html.escape(value)}" for name, value in status.items())
-    st.markdown("<div class='connection wait'>한국투자증권 연결을 기다리고 있습니다. 연결되기 전에는 가격을 임의로 보여 주지 않으며, 검색 버튼도 자동으로 막습니다.<br><small>연결 확인: " + status_text + "</small></div>", unsafe_allow_html=True)
+    st.markdown("<div class='connection wait'>한국투자증권 연결을 기다리고 있습니다. 연결되기 전에는 가격을 임의로 보여 주지 않으며, 검색 버튼도 자동으로 막습니다.</div>", unsafe_allow_html=True)
+    st.info("연결 확인 — " + " · ".join(f"{name}: {value}" for name, value in status.items()))
 
 if full_market_scan_now:
     try:
