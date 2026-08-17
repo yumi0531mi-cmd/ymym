@@ -21,9 +21,15 @@ class CalibrationResult:
     def calibrated(self) -> bool:
         return self.samples >= 30 and self.probability_pct is not None
 
+    @property
+    def target_80_verified(self) -> bool:
+        """True only when this exact strategy/session/score bucket has real 80%+ outcomes."""
+        return self.calibrated and bool(self.probability_pct is not None and self.probability_pct >= 80.0)
+
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["calibrated"] = self.calibrated
+        payload["target_80_verified"] = self.target_80_verified
         return payload
 
 

@@ -341,8 +341,10 @@ def final_buy_decision(
         "위험 상태": risk.state not in {"REAL_BREAKDOWN", "HARD_EXIT"},
         "쿨다운": not cooldown_active,
         "Hard Kill": not hard_kill,
-        # 표본 30건 미만일 때는 확률을 표시하지 않을 뿐, 임의의 확률 게이트로 차단하지 않는다.
-        "보정 확률": calibration_samples < 30 or calibration_probability is None or calibration_probability >= 50.0,
+        # 표본이 30건 이상이면 동일 전략·세션·점수 구간의 실제 1차 목표 선도달률이
+        # 80% 이상일 때만 강한 매수 검토 신호를 허용한다. 표본 부족 구간은 성과를
+        # 꾸며 표시하지 않고 학습·관찰 상태로 남긴다.
+        "80% 목표가 실측": calibration_samples < 30 or calibration_probability is None or calibration_probability >= 80.0,
     }
     reasons = [name for name, passed in gates.items() if not passed]
     return FinalDecision(all(gates.values()), gates, reasons)

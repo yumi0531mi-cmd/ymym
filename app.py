@@ -22,12 +22,15 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationStore
 
-APP_VERSION = "5.4-mixed-live-scanner"
+APP_VERSION = "5.5-market-wide-price-filter"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
-CLIENT_CACHE_VERSION = "client-contract-v5-mixed-search"
+CLIENT_CACHE_VERSION = "client-contract-v6-market-wide"
 VALIDATION_ROOT = Path(".scanner_data/validation")
-MAX_CARD_CANDIDATES = 3
+MAX_LIVE_CARDS = 5
+MAX_CANDIDATE_LIST = 20
+KR_PRICE_CEILING = 300_000.0
+US_PRICE_CEILING = 170.0
 KR_SEARCH_INDEX_PATH = Path("data/kr_stock_index.json")
 
 st.set_page_config(
@@ -135,7 +138,7 @@ def _quote_from_cache_record(record: dict[str, object]) -> Quote:
     )
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def _load_quote_record(symbol: str, market_value: str, exchange: str) -> dict[str, object]:
     # Last price is the only per-card request made every minute.
     quote = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).quote(
@@ -164,44 +167,68 @@ def load_dashboard_quote(symbol: str, market_value: str, exchange: str) -> Quote
     )
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def load_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
-    # Completed 1-minute bars are refreshed every 10 minutes. Current price above
-    # remains live every minute, while 5-minute structure stays stable and explainable.
+    # Completed 1-minute bars are refreshed every 15 minutes. Current price above
+    # remains separate so the card stays responsive without rebuilding structure on every refresh.
     return get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).intraday(
         symbol, Market(market_value), exchange
     )
 
 
-@st.cache_data(ttl=7200, show_spinner=False)
+def price_ceiling(market: Market) -> float:
+    return KR_PRICE_CEILING if market == Market.KR else US_PRICE_CEILING
+
+
+def eligible_price(candidate: dict[str, Any], market: Market) -> bool:
+    try:
+        price = float(candidate.get("price") or 0.0)
+        change_pct = float(candidate.get("change_pct") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return 0 < price < price_ceiling(market) and change_pct > 0
+
+
+def sort_rising_candidates(candidates: list[dict[str, Any]], market: Market) -> list[dict[str, Any]]:
+    """Keep the user's price range and rank rising candidates by screen strength."""
+    eligible = [candidate for candidate in candidates if eligible_price(candidate, market)]
+    return sorted(
+        eligible,
+        key=lambda candidate: (
+            float(candidate.get("screen_score") or 0.0),
+            float(candidate.get("change_pct") or -999.0),
+            float(candidate.get("turnover") or 0.0),
+        ),
+        reverse=True,
+    )
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_dashboard_candidates(market_value: str) -> list[dict[str, Any]]:
-    """Return automatic candidates, falling back safely when ranking is unavailable."""
+    """Return up to 20 rising price-eligible candidates without detailed analysis yet."""
     market = Market(market_value)
     client = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint())
     try:
         rankings = client.market_rankings(market)
-        candidates = [candidate.to_dict() for candidate in merge_rankings(market, rankings, limit=MAX_CARD_CANDIDATES)]
+        candidates = [candidate.to_dict() for candidate in merge_rankings(market, rankings, limit=MAX_CANDIDATE_LIST)]
         for candidate in candidates:
             candidate["candidate_source"] = "시장 실시간 순위"
-        if candidates:
-            return candidates
+        ranked = sort_rising_candidates(candidates, market)
+        if ranked:
+            return ranked[:MAX_CANDIDATE_LIST]
     except KISError:
-        # Some ranking endpoints can be unavailable by account or session. A known
-        # liquid list keeps the first screen useful without pretending it is a full-market rank.
+        # Ranking availability differs by market session and account entitlement.
+        # A transparent liquid-list fallback avoids a blank first screen.
         pass
 
     items = KR_LIQUID if market == Market.KR else US_LIQUID
-    quotes: list[tuple[Quote, Any]] = []
+    fallback: list[dict[str, Any]] = []
     for item in items:
         try:
             quote = client.quote(item.symbol, market, item.exchange, include_orderbook=False)
-            if quote.price > 0:
-                quotes.append((quote, item))
         except KISError:
             continue
-    quotes.sort(key=lambda pair: (pair[0].change_pct, pair[0].turnover or 0.0), reverse=True)
-    return [
-        {
+        fallback.append({
             "symbol": quote.symbol,
             "name": item.name,
             "market": market.value,
@@ -211,9 +238,8 @@ def load_dashboard_candidates(market_value: str) -> list[dict[str, Any]]:
             "volume": quote.volume,
             "turnover": quote.turnover,
             "candidate_source": "유동성 시작목록 자동 대체",
-        }
-        for quote, item in quotes[:MAX_CARD_CANDIDATES]
-    ]
+        })
+    return sort_rising_candidates(fallback, market)[:MAX_CANDIDATE_LIST]
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -307,16 +333,21 @@ def signal_class(signal: Signal) -> str:
     return "wait"
 
 
-def strategy_signal_text(signal: Signal) -> str:
-    """Present the user's own strategy decision language in the live cards."""
+def strategy_signal_text(plan: Any) -> str:
+    """Present strategy status without labelling an untested condition as 80% verified."""
+    if plan.signal == Signal.BUY and plan.calibration_probability is not None and plan.calibration_probability >= 80.0:
+        return "강한 매수 검토 · 실측 80% 이상"
+    if plan.signal == Signal.BUY:
+        return "매수 검토 신호 · 진입 조건 충족"
+    if plan.signal == Signal.WAIT and plan.calibration_samples >= 30 and plan.calibration_probability is not None and plan.calibration_probability < 80.0:
+        return "진입 대기 · 실측 80% 미만"
     mapping = {
-        Signal.BUY: "매수 검토 신호 · 진입 조건 충족",
         Signal.WAIT: "진입 대기",
         Signal.BLOCK: "진입 차단",
         Signal.SELL: "청산 검토",
         Signal.UNVERIFIED: "데이터 확인 대기",
     }
-    return mapping.get(signal, str(signal.value))
+    return mapping.get(plan.signal, str(plan.signal.value))
 
 
 def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
@@ -428,8 +459,11 @@ def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
         st.caption(f"{item.get('candidate_source') or '시장 실시간 순위'} · {quote.session} · {plan.strategy}")
         top = st.columns(2)
         top[0].metric("현재가", price_text(quote.price), f"{quote.change_pct:+.2f}%")
-        top[1].metric("전략 신호", strategy_signal_text(plan.signal), f"{state} · 점수 {plan.score}/100")
+        top[1].metric("전략 신호", strategy_signal_text(plan), f"{state} · 점수 {plan.score}/100")
         st.caption(f"구조: {repeat_text} · 위험 상태: {plan.risk_state}")
+        ensemble = plan.diagnostics.get("strategy_ensemble") or {}
+        active_strategies = ", ".join(ensemble.get("active_names") or [])
+        st.caption(f"전략 조합: {ensemble.get('calibration_key') or '계산 대기'} · {active_strategies or '완료봉 확인 대기'}")
         levels = st.columns(3)
         levels[0].metric("진입 기준가", price_text(plan.entry))
         levels[1].metric("1차 목표 · 5분", price_text(plan.target))
@@ -444,7 +478,12 @@ def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
         basis[0].caption(f"진입 기준: {plan.strategy}")
         basis[1].caption(f"목표 근거: {plan.target_basis or '5분 구조 확인 대기'}")
         basis[2].caption(f"손절 근거: {plan.stop_basis or '1분 구조 확인 대기'}")
-        st.caption(f"현재가 60초 갱신 · 구조 10분 · 호가 15분 · 왕복비용 가정 {cost_pct:.2f}% · 자동 주문 없음")
+        if plan.calibration_samples >= 30 and plan.calibration_probability is not None:
+            status = "80% 목표 검증 통과" if plan.calibration_probability >= 80.0 else "80% 목표 검증 미통과 · 강한 신호 제외"
+            st.caption(f"동일 전략 실측: {plan.calibration_probability:.1f}% · 표본 {plan.calibration_samples}건 · {status}")
+        else:
+            st.caption(f"동일 전략 실측 표본 누적 중: {plan.calibration_samples}/30건 · 80% 검증 수치를 아직 표시하지 않습니다.")
+        st.caption(f"정밀 현재가 120초 갱신 · 구조 15분 · 호가 15분 · 왕복비용 가정 {cost_pct:.2f}% · 자동 주문 없음")
         render_card_detail(item)
 
 
@@ -505,18 +544,19 @@ with st.sidebar:
         st.caption(" · ".join(f"{name}: {value}" for name, value in client.connection_diagnostics.items()))
     budget = client.budget_status
     st.caption(f"호출 보호: 1분 {budget.minute_used}/{budget.minute_limit} · 5시간 {budget.five_hour_used}/{budget.five_hour_limit}")
-    st.caption("현재가 60초 · 구조/호가 10~15분 갱신 · 자동 주문 없음")
+    st.caption("상승 후보 목록 30분 · 정밀 현재가 120초 · 구조/호가 10~15분 갱신 · 자동 주문 없음")
 
 kis_connected = client.ready
 if kis_connected:
     # This is a dashboard, not a button-driven analysis form. It reruns at the
     # permitted minimum cadence and refreshes all visible card prices automatically.
-    st_autorefresh(interval=60_000, key=f"live_dashboard_{market.value}")
+    st_autorefresh(interval=120_000, key=f"live_dashboard_{market.value}")
 
 st.markdown("<div class='mobile-head'><h1>실시간 상승·반복단타 혼합 스캐너</h1><p>상승 추세 후보의 현재가 · 진입 기준가 · 5분 1차/2차 목표 · 구조 손절가를 바로 비교하고, 반복단타 구조는 별도로 구분합니다.</p></div>", unsafe_allow_html=True)
 
 cards: list[dict[str, Any]] = []
 errors: list[str] = []
+candidates: list[dict[str, Any]] = []
 direct_request: dict[str, str] | None = None
 if search_query:
     if market == Market.KR:
@@ -541,16 +581,16 @@ if not kis_connected:
     st.info("연결 확인 — " + " · ".join(f"{name}: {value}" for name, value in client.connection_diagnostics.items()))
 else:
     try:
-        with st.spinner("시장 전체에서 실시간 반복단타 후보를 자동으로 찾는 중…"):
+        with st.spinner("시장 전체에서 가격 조건을 통과한 상승 후보를 자동으로 찾는 중…"):
             candidates = load_dashboard_candidates(market.value)
             requests: list[dict[str, Any]] = []
             if direct_request is not None:
                 requests.append({**direct_request, "candidate_source": "관심 종목 직접 검색"})
-            for candidate in candidates[:MAX_CARD_CANDIDATES]:
+            for candidate in candidates[:MAX_LIVE_CARDS]:
                 if direct_request is not None and str(candidate["symbol"]) == direct_request["symbol"]:
                     continue
                 requests.append(candidate)
-            for candidate in requests[:MAX_CARD_CANDIDATES + 1]:
+            for candidate in requests[:MAX_LIVE_CARDS + 1]:
                 symbol = str(candidate["symbol"])
                 exchange = str(candidate.get("exchange") or ("NAS" if market == Market.US else ""))
                 try:
@@ -565,6 +605,26 @@ else:
     except KISError:
         st.error("실시간 후보를 가져오지 못했습니다. 잠시 뒤 화면이 자동으로 다시 확인합니다.")
 
+if candidates:
+    list_rows = []
+    for candidate in candidates[:MAX_CANDIDATE_LIST]:
+        price = candidate.get("price")
+        change = candidate.get("change_pct")
+        list_rows.append({
+            "종목": f"{candidate.get('symbol')} · {candidate.get('name') or ''}",
+            "현재가": price_text(float(price)) if isinstance(price, (int, float)) else "미확인",
+            "등락률": f"{float(change):+.2f}%" if isinstance(change, (int, float)) else "미확인",
+            "거래대금": money(float(candidate.get('turnover') or 0.0)),
+            "출처": str(candidate.get("candidate_source") or "시장 실시간 순위"),
+        })
+    limit_text = "30만 원 미만" if market == Market.KR else "170달러 미만"
+    st.subheader(f"가격 조건 통과 상승 후보 · {len(candidates)}개")
+    st.caption(f"{limit_text} · 상승률·거래대금·거래량 순위를 바탕으로 넓게 선별한 목록입니다. 아래 정밀 카드는 상위 {MAX_LIVE_CARDS}개를 계산합니다.")
+    st.dataframe(pd.DataFrame(list_rows), hide_index=True, use_container_width=True)
+elif kis_connected:
+    limit_text = "30만 원 미만" if market == Market.KR else "170달러 미만"
+    st.info(f"현재 {limit_text} 가격 조건과 상승 후보 기준을 함께 통과한 종목이 없습니다. 다음 30분 후보 목록 갱신 때 자동으로 다시 확인합니다.")
+
 if cards:
     cards.sort(key=mixed_card_priority, reverse=True)
     updated_at = max(card["quote"].timestamp for card in cards)
@@ -573,11 +633,11 @@ if cards:
     st.markdown(f"<div class='connection ok'>실시간 현재가 기준 {updated_at.strftime('%H:%M:%S')} · {source_text} · 상승 추세를 우선으로 {len(cards)}개를 분석했습니다. `반복단타 가능`은 추가 구조 표시이며, 초록색 목표가와 빨간색 손절가는 사용자 전략의 목표·손절 레벨입니다.</div>", unsafe_allow_html=True)
     for card_item in cards:
         render_live_card(card_item, float(cost_pct))
-elif kis_connected and not errors:
-    st.info("현재 분석할 상승 추세 후보가 없습니다. 화면은 60초마다 자동으로 다시 확인합니다. 관심 종목은 왼쪽 검색칸에 바로 입력할 수 있습니다.")
+elif kis_connected and not errors and not candidates:
+    st.info("현재 분석할 상승 추세 후보가 없습니다. 관심 종목은 왼쪽 검색칸에 바로 입력할 수 있습니다.")
 
 for error in errors:
     st.warning(f"일부 후보는 분석 데이터를 만들지 못했습니다: {error}")
 
 with st.expander("숫자와 전략 신호 읽는 법"):
-    st.markdown("**현재가**는 60초마다 갱신합니다. **진입 기준가·1차/2차 목표가·손절가**는 완료된 1분봉과 5분봉 구조, 거래량·거래대금·호가 상태에 따라 계산합니다. `매수 검토 신호 · 진입 조건 충족`은 사용자가 정한 전략 게이트를 통과했다는 뜻이며, `진입 대기`와 `진입 차단`은 그 시점의 전략 조건이 충족되지 않았다는 뜻입니다. 자동 주문 기능은 없습니다.")
+    st.markdown("**현재가**는 120초마다 갱신합니다. **진입 기준가·1차/2차 목표가·손절가**는 완료된 1분봉과 5분봉 구조, 거래량·거래대금·호가 상태에 따라 계산합니다. `강한 매수 검토 · 실측 80% 이상`은 동일 전략·세션·점수 구간의 사후 표본이 30건 이상이고 1차 목표가가 Hard Stop보다 먼저 도달한 비율이 80% 이상일 때만 표시합니다. 표본 부족 구간은 80%라고 표시하지 않고 누적 상태로 남깁니다. 자동 주문 기능은 없습니다.")

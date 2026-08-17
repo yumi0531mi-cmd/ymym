@@ -10,6 +10,7 @@ from .models import Market, Quote, Regime, Signal, TradePlan
 from .persistence_engine import final_buy_decision, persistence_score, risk_state
 from .sessions import remaining_session_minutes
 from .strategy import confirmed_levels, fake_signal_flags, multi_timeframe, price_zone_in_box, repeat_box, trade_levels
+from .strategy_ensemble import evaluate_ensemble
 
 
 ACTIVE_SESSIONS = {"KR_REGULAR", "US_PRE", "US_REGULAR", "US_AFTER"}
@@ -202,13 +203,36 @@ def analyze(
     range_entry_ok = bool(box and zone == "하단 진입 구간")
     trend_entry_ok = trend_confirmed and vwap_ok and ema_ok
     entry_zone_ok = trend_entry_ok or range_entry_ok
-    execution_ok = spread_ok and rvol_ok and notional_ok and not flags["fake_breakout"] and not flags["upper_rejection"]
+    opening_window = completed.head(30)
+    opening_range_breakout = bool(
+        len(opening_window) == 30
+        and len(completed) > 30
+        and float(latest.close) >= float(opening_window.high.max()) * 0.998
+        and float(latest.rvol) >= 1.0
+    )
+    ensemble = evaluate_ensemble(
+        completed,
+        regime=regime,
+        box_valid=bool(box),
+        price=quote.price,
+        vwap_ok=vwap_ok,
+        ema_ok=ema_ok,
+        rvol=float(latest.rvol),
+        notional_rvol=float(latest.notional_rvol),
+        fake_breakout=bool(flags["fake_breakout"]),
+        upper_rejection=bool(flags["upper_rejection"]),
+        opening_range_breakout=opening_range_breakout,
+    )
+    execution_ok = (
+        spread_ok and rvol_ok and notional_ok and not flags["fake_breakout"]
+        and not flags["upper_rejection"] and not ensemble.conflicts
+    )
     data_verified = not missing
 
     execution_score = (
         15 if entry_zone_ok else 0
     ) + (10 if vwap_ok and ema_ok else 0) + (10 if rvol_ok else 0) + (10 if notional_ok else 0) + (10 if spread_ok else 0) + (15 if rr_ok else 0) + (10 if execution_ok else 0)
-    score = int(round(min(100, persistence.score * 0.45 + execution_score * 0.55)))
+    score = int(round(min(100, persistence.score * 0.40 + execution_score * 0.45 + ensemble.score * 0.15)))
 
     decision = final_buy_decision(
         persistence=persistence,
@@ -224,10 +248,11 @@ def analyze(
         calibration_samples=calibration_samples,
     )
     gates = dict(decision.gates)
+    gates["호환 전략 조합"] = ensemble.cluster not in {"CONFLICT", "DATA_WAIT"} and ensemble.score >= 30
     gates["사용자 최소점수"] = score >= minimum_score
     final_buy = all(gates.values())
 
-    reasons: list[str] = list(persistence.reasons)
+    reasons: list[str] = list(persistence.reasons) + list(ensemble.reasons)
     if not session_ok:
         reasons.append(f"거래 가능 세션이 아닙니다: {quote.session}")
     if not entry_zone_ok:
@@ -244,6 +269,7 @@ def analyze(
         reasons.append("가짜 돌파 경고: 저항 위 고가 뒤 종가가 저항 아래로 복귀했습니다.")
     if flags["upper_rejection"]:
         reasons.append("매도 압력 경고: 완료 1분봉의 윗꼬리가 길어 추격을 피합니다.")
+    reasons.extend(f"전략 충돌: {item}" for item in ensemble.conflicts)
     reasons.extend(risk.reasons)
     if cooldown_active:
         reasons.append("이전 구조붕괴 뒤 쿨다운 중입니다.")
@@ -279,9 +305,11 @@ def analyze(
         "five_hour_data_ready": persistence.horizon_state == "OBSERVED_300",
         "remaining_session_minutes": remaining,
         "completed_bar_at": str(completed.index[-1]),
+        "strategy_ensemble": ensemble.to_dict(),
     }
+    strategy_label = f"{ensemble.calibration_key} · {strategy}"
     return _plan(
-        quote, now, signal, strategy, regime,
+        quote, now, signal, strategy_label, regime,
         entry=entry if structure_ok else None,
         target1=target1 if structure_ok else None,
         target2=target2 if structure_ok else None,
