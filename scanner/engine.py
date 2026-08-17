@@ -112,6 +112,7 @@ def analyze(
     hard_kill: bool = False,
     calibration_probability: float | None = None,
     calibration_samples: int = 0,
+    calibration_expectancy_pct: float | None = None,
 ) -> TradePlan:
     """Create one explainable v5.1 manual repeated-scalping evaluation.
 
@@ -246,6 +247,7 @@ def analyze(
         hard_kill=hard_kill,
         calibration_probability=calibration_probability,
         calibration_samples=calibration_samples,
+        calibration_expectancy_pct=calibration_expectancy_pct,
     )
     gates = dict(decision.gates)
     gates["호환 전략 조합"] = ensemble.cluster not in {"CONFLICT", "DATA_WAIT"} and ensemble.score >= 30
@@ -306,6 +308,8 @@ def analyze(
         "remaining_session_minutes": remaining,
         "completed_bar_at": str(completed.index[-1]),
         "strategy_ensemble": ensemble.to_dict(),
+        "calibration_probability_pct": calibration_probability if calibration_samples >= 30 else None,
+        "calibration_expectancy_pct": calibration_expectancy_pct if calibration_samples >= 30 else None,
     }
     strategy_label = f"{ensemble.calibration_key} · {strategy}"
     return _plan(

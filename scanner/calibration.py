@@ -16,15 +16,33 @@ class CalibrationResult:
     samples: int
     probability_pct: float | None
     average_net_return_pct: float | None
+    recent_samples: int = 0
+    recent_probability_pct: float | None = None
+    recent_average_net_return_pct: float | None = None
 
     @property
     def calibrated(self) -> bool:
         return self.samples >= 30 and self.probability_pct is not None
 
     @property
+    def positive_expectancy(self) -> bool:
+        return bool(
+            self.average_net_return_pct is not None
+            and self.recent_average_net_return_pct is not None
+            and self.average_net_return_pct > 0
+            and self.recent_average_net_return_pct > 0
+        )
+
+    @property
     def target_80_verified(self) -> bool:
-        """True only when this exact strategy/session/score bucket has real 80%+ outcomes."""
-        return self.calibrated and bool(self.probability_pct is not None and self.probability_pct >= 80.0)
+        """Require 30 real current-version outcomes, positive costs-adjusted expectancy, and a recent 30-case check."""
+        return bool(
+            self.calibrated
+            and self.recent_samples >= 30
+            and self.probability_pct is not None and self.probability_pct >= 80.0
+            and self.recent_probability_pct is not None and self.recent_probability_pct >= 80.0
+            and self.positive_expectancy
+        )
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -58,9 +76,14 @@ def calibration_for(
         and row.get("target_pass") is not None
         and (version is None or row.get("version") == version)
     ]
+    matches = sorted(matches, key=lambda row: str(row.get("signal_time", "")))
     samples = len(matches)
     wins = sum(row.get("target_pass") is True for row in matches)
     net = [float(row["net_return_pct"]) for row in matches if row.get("net_return_pct") is not None]
+    recent = matches[-30:]
+    recent_samples = len(recent)
+    recent_wins = sum(row.get("target_pass") is True for row in recent)
+    recent_net = [float(row["net_return_pct"]) for row in recent if row.get("net_return_pct") is not None]
     return CalibrationResult(
         market=market,
         session=session,
@@ -69,6 +92,9 @@ def calibration_for(
         samples=samples,
         probability_pct=round(wins / samples * 100, 1) if samples >= 30 else None,
         average_net_return_pct=round(sum(net) / len(net), 4) if net else None,
+        recent_samples=recent_samples,
+        recent_probability_pct=round(recent_wins / recent_samples * 100, 1) if recent_samples >= 30 else None,
+        recent_average_net_return_pct=round(sum(recent_net) / len(recent_net), 4) if recent_net else None,
     )
 
 

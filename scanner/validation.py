@@ -321,8 +321,10 @@ class ValidationStore:
                 "average_loss_pct": average_loss,
                 "expectancy_pct": expectancy,
                 "profit_factor": profit_factor,
-                "eligible_for_80pct_review": len(values) >= 50,
-                "meets_80pct_goal": len(values) >= 50 and win_rate >= 80.0 and expectancy > 0,
+                "eligible_for_80pct_review": len(values) >= 30,
+                "meets_80pct_goal": len(values) >= 30
+                and (sum(1 for row in rows if f"{row.get('market', '')}:{row.get('session', '')}:{row.get('strategy', '')}" == key and row.get("target_pass") is True) / len(values) * 100) >= 80.0
+                and expectancy > 0,
             }
         return {
             "storage": self.storage_status,

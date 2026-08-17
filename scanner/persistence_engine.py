@@ -326,6 +326,7 @@ def final_buy_decision(
     hard_kill: bool,
     calibration_probability: float | None,
     calibration_samples: int,
+    calibration_expectancy_pct: float | None = None,
 ) -> FinalDecision:
     gates = {
         "세션": session_ok,
@@ -345,6 +346,7 @@ def final_buy_decision(
         # 80% 이상일 때만 강한 매수 검토 신호를 허용한다. 표본 부족 구간은 성과를
         # 꾸며 표시하지 않고 학습·관찰 상태로 남긴다.
         "80% 목표가 실측": calibration_samples < 30 or calibration_probability is None or calibration_probability >= 80.0,
+        "비용 반영 기대값": calibration_samples < 30 or calibration_expectancy_pct is None or calibration_expectancy_pct > 0,
     }
     reasons = [name for name, passed in gates.items() if not passed]
     return FinalDecision(all(gates.values()), gates, reasons)

@@ -414,7 +414,9 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
     plan = analyze(
         quote, bars, orderbook_required=True, round_trip_cost_pct=cost_pct,
         minimum_score=min_score, cooldown_active=cycle.cooldown_active, hard_kill=cycle.hard_kill,
-        calibration_probability=calibration.probability_pct, calibration_samples=calibration.samples,
+        calibration_probability=getattr(calibration, "recent_probability_pct", calibration.probability_pct),
+        calibration_samples=getattr(calibration, "recent_samples", calibration.samples),
+        calibration_expectancy_pct=getattr(calibration, "recent_average_net_return_pct", calibration.average_net_return_pct if hasattr(calibration, "average_net_return_pct") else None),
     )
     # Complete earlier same-symbol signals first, then record a new fully specified
     # entry/target/stop signal. This supplies the real target-before-stop outcomes
@@ -429,6 +431,9 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
         cycle_store.apply_risk_state(cycle, plan.risk_state, marker)
     return {
         "quote": quote, "bars": bars, "plan": plan, "exchange": exchange,
+        "calibration": calibration.to_dict() if hasattr(calibration, "to_dict") else {
+            "samples": calibration.samples, "probability_pct": calibration.probability_pct,
+        },
         "validation_recorded": recorded_case, "validation_scored": scored_cases,
     }
 
