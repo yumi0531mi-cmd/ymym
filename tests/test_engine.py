@@ -5,6 +5,7 @@ import pandas as pd
 
 from scanner.engine import analyze
 from scanner.models import Market, Quote, Regime, Signal
+from scanner.persistence import EventStore, ManualTrade
 from scanner.strategy import confirmed_levels, repeat_box
 from scanner.validation import ValidationCase
 from scanner.universe import rank_quotes
@@ -30,7 +31,7 @@ def test_no_current_means_no_plan():
 def test_insufficient_bars_hides_plan():
     plan = analyze(quote(), bars(10))
     assert plan.entry is None
-    assert "충분한 1분봉" in plan.missing
+    assert "충분한 완료 1분봉" in plan.missing
 
 
 def test_levels_are_observed_bars():
@@ -80,3 +81,38 @@ def test_future_scoring_is_chronological_and_strict():
     case.score_future_bars(future)
     assert case.mfe_pct is not None and case.mae_pct is not None
     assert len([h for h in case.horizons if h.actual is not None]) == 4
+
+
+def test_repeat_box_rejects_price_outside_the_box():
+    df = bars(slope=0)
+    assert repeat_box(df, 150) is None
+
+
+def test_missing_orderbook_cannot_produce_buy_signal():
+    df = bars()
+    current = float(df.close.iloc[-1])
+    no_orderbook = Quote("TEST", Market.US, current, 100, datetime.now().astimezone(), None, None, 100000, 10000000, "US_REGULAR")
+    plan = analyze(no_orderbook, df)
+    assert plan.signal != Signal.BUY
+    assert "실시간 1호가" in plan.missing
+
+
+def test_closed_market_cannot_produce_buy_signal():
+    df = bars()
+    current = float(df.close.iloc[-1])
+    closed = Quote("TEST", Market.US, current, 100, datetime.now().astimezone(), current - .01, current + .01, 100000, 10000000, "US_CLOSED")
+    plan = analyze(closed, df)
+    assert plan.signal != Signal.BUY
+    assert "거래 가능 세션" in plan.missing
+
+
+def test_event_store_is_inert_without_supabase_secrets():
+    store = EventStore({})
+    assert store.configured is False
+    store.upsert("id-1", "manual_trade", datetime.now().astimezone().isoformat(), {"hello": "world"})
+    assert store.list("manual_trade") == []
+
+
+def test_manual_trade_calculates_realized_pnl_after_fees():
+    trade = ManualTrade.create("TEST", "US", "매수", 100, 2, exit_price=110, fees=1)
+    assert trade.realized_pnl == 19

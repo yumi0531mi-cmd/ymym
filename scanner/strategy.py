@@ -43,19 +43,24 @@ def classify(frame: pd.DataFrame, minutes: int) -> TimeframeState:
 
 
 def multi_timeframe(frame: pd.DataFrame) -> dict[int, TimeframeState]:
-    return {m: classify(frame, m) for m in (1, 5, 15, 60)}
+    """Classify completed one-minute bars only.
+
+    The newest KIS minute can still be forming, so callers should pass a frame
+    without that observation when creating a tradable signal.
+    """
+    return {minutes: classify(frame, minutes) for minutes in (1, 5, 15, 60)}
 
 
-def confirmed_levels(frame: pd.DataFrame, current: float) -> tuple[float | None, float | None, str, str]:
-    """Return only swing levels observed in completed bars; never invent percentage targets."""
+def confirmed_levels(frame: pd.DataFrame, entry: float) -> tuple[float | None, float | None, str, str]:
+    """Return observed swing levels from completed bars; never invent percentage targets."""
     df = enrich(frame)
     if len(df) < 20:
         return None, None, "저항 미확인", "지지 미확인"
     completed = df.iloc[:-1].tail(120)
     highs = completed.high[(completed.high.shift(1) < completed.high) & (completed.high.shift(-1) < completed.high)]
     lows = completed.low[(completed.low.shift(1) > completed.low) & (completed.low.shift(-1) > completed.low)]
-    resistance = sorted(float(v) for v in highs if v > current)
-    support = sorted((float(v) for v in lows if v < current), reverse=True)
+    resistance = sorted(float(value) for value in highs if value > entry)
+    support = sorted((float(value) for value in lows if value < entry), reverse=True)
     return (
         resistance[0] if resistance else None,
         support[0] if support else None,
@@ -65,14 +70,21 @@ def confirmed_levels(frame: pd.DataFrame, current: float) -> tuple[float | None,
 
 
 def repeat_box(frame: pd.DataFrame, current: float) -> tuple[float, float] | None:
-    df = enrich(resample(frame, 5))
+    """Return a validated completed 5-minute range only while price remains inside it."""
+    grouped = resample(frame, 5)
+    if len(grouped) < 9:
+        return None
+    # The final 5-minute aggregation may still be forming. Exclude it from range detection.
+    df = enrich(grouped.iloc[:-1])
     if len(df) < 8:
         return None
     recent = df.tail(12)
-    low, high = float(recent.low.quantile(.2)), float(recent.high.quantile(.8))
-    width = (high / low - 1) * 100 if low > 0 else 0
+    low, high = float(recent.low.quantile(0.2)), float(recent.high.quantile(0.8))
+    if low <= 0 or not low <= current <= high:
+        return None
+    width = (high / low - 1) * 100
     touches_low = int((recent.low <= low * 1.002).sum())
-    touches_high = int((recent.high >= high * .998).sum())
+    touches_high = int((recent.high >= high * 0.998).sum())
     if 0.5 <= width <= 3.0 and touches_low >= 2 and touches_high >= 2:
         return low, high
     return None

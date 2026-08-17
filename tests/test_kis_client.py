@@ -51,3 +51,19 @@ def test_missing_live_price_is_an_error_not_a_fake_plan():
     except KISError:
         return
     raise AssertionError("missing current price must raise KISError")
+
+
+def test_manual_streamlit_token_never_issues_a_new_token(tmp_path):
+    client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
+    assert client.token_mode == "수동 토큰"
+    assert client._token() == "daily-token"
+
+
+def test_token_issuance_is_disabled_without_explicit_local_opt_in(tmp_path):
+    client = KISClient({"KIS_APP_KEY": "test", "KIS_APP_SECRET": "test"}, cache_dir=tmp_path)
+    try:
+        client._token()
+    except KISError as exc:
+        assert "KIS_ACCESS_TOKEN" in str(exc)
+        return
+    raise AssertionError("automatic issuance must be disabled by default")
