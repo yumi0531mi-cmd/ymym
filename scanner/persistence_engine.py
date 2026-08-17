@@ -11,14 +11,14 @@ from .indicators import enrich
 from .models import Regime
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Pivot:
     at: pd.Timestamp
     kind: str  # LOW or HIGH
     price: float
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Swing:
     start_at: pd.Timestamp
     end_at: pd.Timestamp
@@ -35,7 +35,7 @@ class Swing:
         return max(1.0, (self.end_at - self.start_at).total_seconds() / 60)
 
 
-@dataclass(slots=True)
+@dataclass
 class SwingStatistics:
     up_swings: list[Swing] = field(default_factory=list)
     down_swings: list[Swing] = field(default_factory=list)
@@ -51,7 +51,7 @@ class SwingStatistics:
         return len(self.up_swings)
 
 
-@dataclass(slots=True)
+@dataclass
 class PersistenceResult:
     score: int
     band: str
@@ -88,7 +88,7 @@ class PersistenceResult:
         return payload
 
 
-@dataclass(slots=True)
+@dataclass
 class RiskResult:
     state: str
     soft_stop: float | None
@@ -100,7 +100,7 @@ class RiskResult:
         return asdict(self)
 
 
-@dataclass(slots=True)
+@dataclass
 class FinalDecision:
     final_buy: bool
     gates: dict[str, bool]

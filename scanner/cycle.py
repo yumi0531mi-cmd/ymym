@@ -9,7 +9,7 @@ from .persistence import EventStore, PersistenceError
 from .sessions import ET, KST
 
 
-@dataclass(slots=True)
+@dataclass
 class CycleState:
     symbol: str
     market: str

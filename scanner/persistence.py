@@ -88,7 +88,7 @@ class EventStore:
         return [dict(row.get("payload") or {}) for row in rows if isinstance(row, dict)]
 
 
-@dataclass(slots=True)
+@dataclass
 class ManualTrade:
     trade_id: str
     created_at: str

@@ -9,7 +9,7 @@ from .indicators import enrich, resample
 from .models import Regime
 
 
-@dataclass(slots=True)
+@dataclass
 class TimeframeState:
     minutes: int
     regime: Regime

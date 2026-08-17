@@ -27,7 +27,7 @@ class Signal(str, Enum):
     UNVERIFIED = "미검증"
 
 
-@dataclass(slots=True)
+@dataclass
 class Quote:
     symbol: str
     market: Market
@@ -52,7 +52,7 @@ class Quote:
         return (self.ask - self.bid) / ((self.ask + self.bid) / 2) * 100
 
 
-@dataclass(slots=True)
+@dataclass
 class ForecastPoint:
     minutes: int
     low: float
@@ -61,7 +61,7 @@ class ForecastPoint:
     direction: Regime
 
 
-@dataclass(slots=True)
+@dataclass
 class TradePlan:
     symbol: str
     market: Market

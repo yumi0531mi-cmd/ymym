@@ -7,7 +7,7 @@ from .persistence import EventStore, PersistenceError
 from .validation import ValidationStore
 
 
-@dataclass(slots=True)
+@dataclass
 class CalibrationResult:
     market: str
     session: str

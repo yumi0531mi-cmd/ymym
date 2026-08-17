@@ -47,3 +47,5 @@ Secrets 지문 기반 KISClient 캐시 수정 커밋 `27e2f2f` 재배포 후 초
 후보 데이터 모델 안정성 수정 커밋 `7a811df` 재배포 후 초기 화면을 재확인했다. 이전 관리 로그의 NoneType 오류 화면은 현재 앱 본문에 표시되지 않았고, 토큰 미설정 상태의 쉬운 한국어 안내와 비활성화된 검색 버튼만 정상 표시된다. 확인 과정에서 KIS API 요청은 실행하지 않았다.
 
 관리 로그를 확인한 결과, `AttributeError: 'NoneType' object has no attribute '__dict__'`의 직접 원인은 `scanner.universe.UniverseItem`에 적용된 `@dataclass(frozen=True, slots=True)`였다. Streamlit Cloud의 코드 갱신 중 모듈을 다시 불러오는 과정에서 Python 3.12 dataclass가 해당 slotted class의 모듈 정보를 찾지 못한 과거 실행 기록이 남았다. `UniverseItem`도 slots 없이 immutable dataclass로 변경했으며 전체 41개 테스트와 초기 화면 검증을 통과했다. 이후 로그에는 이 오류 화면이 사용자 본문에 나타나지 않는다.
+
+사용자 승인으로 Streamlit 앱을 재시작했다. 재시작 후 초기 화면이 정상 렌더링됐고, 이전의 내부 dataclass 오류 화면은 본문에 다시 나타나지 않았다. 화면에는 토큰 미설정 상태용 한국어 안내와 비활성화된 검색 버튼만 표시된다. 초기 화면 확인에서는 KIS API 요청을 실행하지 않았다.

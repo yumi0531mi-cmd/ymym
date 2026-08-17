@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -15,23 +16,46 @@ from scanner.engine import analyze
 from scanner.kis_client import KISClient, KISError, secrets_fingerprint
 from scanner.market_screener import merge_rankings
 from scanner.models import Market, Quote, Signal
-from scanner.persistence import EventStore, ManualTrade, PersistenceError, save_manual_trade
+from scanner.persistence import EventStore
 from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
-from scanner.validation import ValidationCase, ValidationStore
+from scanner.validation import ValidationStore
 
-APP_VERSION = "5.1.1-five-minute-target"
-CLIENT_CACHE_VERSION = "full-market-rankings-v1"
+APP_VERSION = "5.2-mobile-cards"
+CLIENT_CACHE_VERSION = "mobile-card-flow-v1"
 VALIDATION_ROOT = Path(".scanner_data/validation")
+MAX_CARD_CANDIDATES = 3
 
-st.set_page_config(page_title="한투 혼합형 주식 스캐너", page_icon="📡", layout="wide")
+st.set_page_config(
+    page_title="반복단타 후보 카드",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 st.markdown(
     """
 <style>
-.block-container{padding-top:.8rem;max-width:1280px}.stMetric{background:#f7f8fb;border:1px solid #e6e8ee;padding:.65rem;border-radius:12px}
-[data-testid="stMetricValue"]{font-size:clamp(1.05rem,2.8vw,1.8rem)!important}.signal{padding:.85rem 1rem;border-radius:13px;font-size:1.22rem;font-weight:800;margin:.4rem 0}
-.buy{background:#e4f6eb;color:#126b39}.wait{background:#fff5d8;color:#775400}.block{background:#fde9e8;color:#9e2923}.unknown{background:#edf2fc;color:#315caa}
-@media(max-width:700px){.block-container{padding:.4rem}.signal{font-size:1rem}[data-testid="stMetricValue"]{font-size:1.08rem!important}}
+:root{--bg:#090d16;--panel:#121927;--panel2:#182133;--line:#2a3750;--text:#f4f7fc;--muted:#9da9bd;--green:#55d580;--red:#ff7d7d;--yellow:#ffd66b;--blue:#6ba7ff}
+.stApp{background:var(--bg);color:var(--text)}
+.block-container{max-width:860px;padding:1rem .8rem 3rem}
+[data-testid="stSidebar"]{background:#101725;border-right:1px solid var(--line)}
+[data-testid="stSidebar"] *{color:var(--text)}
+h1,h2,h3,p,label{color:var(--text)!important}
+[data-testid="stCaptionContainer"] p{color:var(--muted)!important}
+[data-testid="stMetric"]{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:.55rem}
+[data-testid="stMetricLabel"]{color:var(--muted)}
+[data-testid="stMetricValue"]{color:var(--text);font-size:1.1rem!important}
+.mobile-head{margin:.25rem 0 1rem}.mobile-head h1{margin:0;font-size:clamp(1.55rem,7vw,2.35rem);letter-spacing:-.05em}.mobile-head p{margin:.35rem 0 0;color:var(--muted)!important;font-size:.88rem}
+.connection{border-radius:14px;padding:.8rem 1rem;margin:.35rem 0 1rem;border:1px solid}.connection.ok{background:#0e2a20;border-color:#267d52;color:#b9f6d1}.connection.wait{background:#2b2513;border-color:#806a25;color:#ffe49a}
+.candidate-row{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:.55rem .7rem;margin:.35rem 0;color:var(--text);display:flex;justify-content:space-between;gap:.5rem}.candidate-row small{color:var(--muted)}
+.trade-card{background:linear-gradient(145deg,#151d2c,#0d131e);border:1px solid #33425e;border-radius:18px;padding:1rem;margin:.8rem 0 1rem;box-shadow:0 10px 30px rgba(0,0,0,.24);color:var(--text)}
+.card-top{display:flex;justify-content:space-between;gap:.6rem;align-items:flex-start}.ticker{font-size:1.25rem;font-weight:850;letter-spacing:-.02em}.name{font-size:.78rem;color:var(--muted);margin-top:.16rem}.price{font-size:1.35rem;font-weight:850;text-align:right}.change.up{color:var(--green)}.change.down{color:var(--red)}.change.flat{color:var(--muted)}
+.badges{display:flex;flex-wrap:wrap;gap:.35rem;margin:.7rem 0}.badge{border-radius:999px;padding:.22rem .55rem;font-size:.73rem;font-weight:750;background:#27344b;color:#dce8ff}.badge.buy{background:#164d34;color:#bdf8d0}.badge.wait{background:#594918;color:#ffe4a0}.badge.block{background:#57272d;color:#ffc3c5}.badge.risk{background:#3a2632;color:#ffbdcf}
+.warn-box{border:1px solid #77414a;background:#2a181f;color:#ffcad0;border-radius:11px;padding:.55rem .65rem;margin:.55rem 0;font-size:.82rem}.note-box{background:#1d2637;color:#cdd9ef;border-radius:11px;padding:.55rem .65rem;margin:.55rem 0;font-size:.82rem}
+.data-grid{display:grid;grid-template-columns:1fr 1fr;gap:.35rem .75rem;margin:.75rem 0}.data-item{border-bottom:1px solid #28354c;padding:.35rem 0}.data-label{color:var(--muted);font-size:.72rem}.data-value{font-size:.9rem;font-weight:700;margin-top:.1rem}
+.plan-title{font-weight:800;font-size:.95rem;margin:.85rem 0 .35rem}.plan-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.4rem}.plan-item{background:#1a2333;border-radius:10px;padding:.48rem}.plan-item .data-label{font-size:.7rem}.entry{color:#f5d66b}.target{color:var(--green)}.stop{color:var(--red)}
+.card-foot{color:var(--muted);font-size:.72rem;margin-top:.65rem}.card-expander{margin-top:.25rem}
+@media(max-width:700px){.block-container{padding:.65rem .55rem 2rem}.trade-card{padding:.8rem;border-radius:15px}.ticker{font-size:1.1rem}.price{font-size:1.18rem}.data-grid{gap:.25rem .55rem}.plan-grid{gap:.3rem}.plan-item{padding:.42rem}.stButton>button{min-height:2.5rem;font-size:.92rem}}
 </style>
 """,
     unsafe_allow_html=True,
@@ -40,11 +64,7 @@ st.markdown(
 
 @st.cache_resource
 def get_client(cache_version: str, secret_fingerprint: str) -> KISClient:
-    """Create one KIS client per explicit capability version.
-
-    Passing the version at every call prevents a stale cached client from an
-    earlier deployment missing newly added methods.
-    """
+    """Cache one read-only client for the currently stored secret values."""
     return KISClient(st.secrets)
 
 
@@ -63,7 +83,6 @@ def get_cycle_store() -> CycleStore:
 
 
 def _quote_to_cache_record(quote: Quote) -> dict[str, object]:
-    """Convert a slots dataclass to basic types before using st.cache_data."""
     return {
         "symbol": quote.symbol,
         "market": quote.market.value,
@@ -97,7 +116,9 @@ def _quote_from_cache_record(record: dict[str, object]) -> Quote:
 
 @st.cache_data(ttl=10, show_spinner=False)
 def _load_quote_record(symbol: str, market_value: str, exchange: str) -> dict[str, object]:
-    quote = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).quote(symbol, Market(market_value), exchange, include_orderbook=True)
+    quote = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).quote(
+        symbol, Market(market_value), exchange, include_orderbook=True
+    )
     return _quote_to_cache_record(quote)
 
 
@@ -107,339 +128,259 @@ def load_quote(symbol: str, market_value: str, exchange: str) -> Quote:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
-    return get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).intraday(symbol, Market(market_value), exchange)
+    return get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).intraday(
+        symbol, Market(market_value), exchange
+    )
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def scan_starter_universe(market_value: str) -> tuple[list[tuple[str, float]], list[str]]:
-    """Cache only strings and numbers; Quote uses slots and is not cache-pickleable."""
     scan_market = Market(market_value)
     items = KR_LIQUID if scan_market == Market.KR else US_LIQUID
-    quotes, errors = [], []
+    quotes: list[Quote] = []
+    errors: list[str] = []
     for item in items:
         try:
-            quotes.append(get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).quote(item.symbol, scan_market, item.exchange, include_orderbook=False))
+            quotes.append(
+                get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).quote(
+                    item.symbol, scan_market, item.exchange, include_orderbook=False
+                )
+            )
         except Exception as exc:
             errors.append(f"{item.symbol}: {type(exc).__name__}")
     ranked = rank_quotes(quotes, scan_market)
     return [(quote.symbol, float(quote.change_pct)) for quote in ranked], errors
 
 
-def secret_value(name: str) -> str:
-    try:
-        value = st.secrets[name]
-        return str(value) if value else ""
-    except Exception:
-        return ""
+def money(value: float | None) -> str:
+    if value is None:
+        return "미확인"
+    if abs(value) >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f}B"
+    if abs(value) >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if float(value).is_integer():
+        return f"{value:,.0f}"
+    return f"{value:,.2f}"
 
 
-def admin_unlocked() -> bool:
-    password = secret_value("APP_ADMIN_PASSWORD")
-    if not password:
-        return False
-    if st.session_state.get("admin_unlocked"):
-        return True
-    candidate = st.sidebar.text_input("관리자 비밀번호", type="password", help="검증 보고서와 수동 매매 기록은 관리자만 볼 수 있습니다.")
-    if candidate:
-        if candidate == password:
-            st.session_state["admin_unlocked"] = True
-            st.rerun()
-        else:
-            st.sidebar.error("관리자 비밀번호가 일치하지 않습니다.")
-    return False
+def price_text(value: float | None) -> str:
+    return money(value) if value is not None else "조건 미확인"
 
 
-def render_chart(bars: pd.DataFrame, plan) -> None:
-    fig = go.Figure(
-        go.Candlestick(x=bars.index, open=bars.open, high=bars.high, low=bars.low, close=bars.close, name="완료·진행 1분봉")
+def number_text(value: Any, suffix: str = "") -> str:
+    if isinstance(value, (float, int)):
+        return f"{value:.2f}{suffix}"
+    return "미확인"
+
+
+def signal_class(signal: Signal) -> str:
+    if signal == Signal.BUY:
+        return "buy"
+    if signal in (Signal.BLOCK, Signal.SELL):
+        return "block"
+    return "wait"
+
+
+def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
+    """Fetch and analyze one explicitly selected card candidate (max three per run)."""
+    quote = load_quote(symbol, market.value, exchange)
+    bars = load_bars(symbol, market.value, exchange)
+    cycle = cycle_store.get(symbol, market, quote.timestamp)
+    preliminary = analyze(
+        quote, bars, orderbook_required=True, round_trip_cost_pct=cost_pct,
+        minimum_score=min_score, cooldown_active=cycle.cooldown_active, hard_kill=cycle.hard_kill,
     )
+    calibration = calibration_for(
+        store, market=market.value, session=quote.session, strategy=preliminary.strategy,
+        score=preliminary.score, version=APP_VERSION,
+    )
+    plan = analyze(
+        quote, bars, orderbook_required=True, round_trip_cost_pct=cost_pct,
+        minimum_score=min_score, cooldown_active=cycle.cooldown_active, hard_kill=cycle.hard_kill,
+        calibration_probability=calibration.probability_pct, calibration_samples=calibration.samples,
+    )
+    if event_store.configured:
+        marker = str(plan.diagnostics.get("completed_bar_at") or quote.timestamp.isoformat())
+        cycle_store.apply_risk_state(cycle, plan.risk_state, marker)
+    return {"quote": quote, "bars": bars, "plan": plan, "exchange": exchange}
+
+
+def render_trade_card(item: dict[str, Any], cost_pct: float) -> None:
+    quote: Quote = item["quote"]
+    plan = item["plan"]
+    change = quote.change_pct
+    change_class = "up" if change > 0 else "down" if change < 0 else "flat"
+    diagnostics = plan.diagnostics
+    reasons = list(plan.reasons or [])[:2]
+    flags = diagnostics.get("false_signal_flags") or []
+    warnings = reasons + [str(flag) for flag in flags[:1]]
+    warning_html = "".join(f"<div>⚠ {html.escape(str(reason))}</div>" for reason in warnings)
+    if not warning_html:
+        warning_html = "<div>현재 특별 경고는 확인되지 않았습니다.</div>"
+    spread = diagnostics.get("spread_pct")
+    rvol = diagnostics.get("rvol")
+    rr_value = diagnostics.get("reward_risk_net")
+    volume = quote.volume
+    turnover = quote.turnover
+    hard_stop = plan.hard_stop or plan.invalidation or plan.stop
+    persistence = plan.persistence_score
+    card = f"""
+<section class="trade-card">
+  <div class="card-top">
+    <div><div class="ticker">{html.escape(quote.symbol)}</div><div class="name">{html.escape(quote.market.value)} · {html.escape(quote.session)} · {html.escape(plan.strategy)}</div></div>
+    <div><div class="price">{price_text(quote.price)}</div><div class="change {change_class}">{change:+.2f}%</div></div>
+  </div>
+  <div class="badges">
+    <span class="badge {signal_class(plan.signal)}">{html.escape(plan.signal.value)}</span>
+    <span class="badge risk">위험: {html.escape(plan.risk_state)}</span>
+    <span class="badge">점수 {plan.score}/100</span>
+    <span class="badge">지속성 {persistence if persistence is not None else '미확인'}</span>
+  </div>
+  <div class="warn-box">{warning_html}</div>
+  <div class="data-grid">
+    <div class="data-item"><div class="data-label">거래량</div><div class="data-value">{money(volume)}</div></div>
+    <div class="data-item"><div class="data-label">거래대금</div><div class="data-value">{money(turnover)}</div></div>
+    <div class="data-item"><div class="data-label">상대거래량</div><div class="data-value">{number_text(rvol, 'x')}</div></div>
+    <div class="data-item"><div class="data-label">호가 스프레드</div><div class="data-value">{number_text(spread, '%')}</div></div>
+  </div>
+  <div class="plan-title">매매 레벨 <span style="font-size:.72rem;color:#9da9bd">수동매매 참고값</span></div>
+  <div class="plan-grid">
+    <div class="plan-item"><div class="data-label">진입 기준가</div><div class="data-value entry">{price_text(plan.entry)}</div></div>
+    <div class="plan-item"><div class="data-label">1차 목표 · 5분</div><div class="data-value target">{price_text(plan.target)}</div></div>
+    <div class="plan-item"><div class="data-label">2차 목표 · 5분</div><div class="data-value target">{price_text(plan.target2)}</div></div>
+    <div class="plan-item"><div class="data-label">Soft Stop</div><div class="data-value stop">{price_text(plan.soft_stop)}</div></div>
+    <div class="plan-item"><div class="data-label">Hard Stop</div><div class="data-value stop">{price_text(hard_stop)}</div></div>
+    <div class="plan-item"><div class="data-label">비용 반영 손익비</div><div class="data-value">{number_text(rr_value)}</div></div>
+  </div>
+  <div class="card-foot">1차·2차 목표는 완료된 5분봉 구조를 우선 사용합니다. 왕복비용 가정 {cost_pct:.2f}% · 주문 기능 없음</div>
+</section>
+"""
+    st.markdown(card, unsafe_allow_html=True)
+    with st.expander(f"{quote.symbol} 카드 자세히 보기"):
+        repeat_box = plan.repeat_box
+        if repeat_box:
+            low, high = repeat_box
+            st.caption(f"반복박스: {price_text(low)} ~ {price_text(high)}")
+        st.write("대기·경고 이유")
+        for reason in plan.reasons or ["특별 경고 없음"]:
+            st.write(f"- {reason}")
+        st.caption(f"1차 목표 근거: {plan.target_basis or '구조 미확인'} · 2차 목표 근거: {plan.target2_basis or '구조 미확인'}")
+        st.caption(f"보정 확률: {plan.calibration_probability:.1f}%" if plan.calibration_probability is not None else f"보정 표본 수: {plan.calibration_samples}/30")
+        if not item["bars"].empty:
+            render_chart(item["bars"].tail(120), plan)
+
+
+def render_chart(bars: pd.DataFrame, plan: Any) -> None:
+    fig = go.Figure(go.Candlestick(x=bars.index, open=bars.open, high=bars.high, low=bars.low, close=bars.close, name="1분봉"))
     for value, name, color, dash in (
-        (plan.entry, "진입 기준", "#1565c0", "solid"),
-        (plan.target, "1차 목표 · 완료 5분봉", "#2e7d32", "solid"),
-        (plan.target2, "2차 목표 · 완료 5분봉", "#00897b", "dash"),
-        (plan.soft_stop, "Soft Stop", "#ef6c00", "dash"),
-        (plan.hard_stop or plan.invalidation or plan.stop, "Hard Stop", "#c62828", "solid"),
+        (plan.entry, "진입", "#6ba7ff", "solid"),
+        (plan.target, "1차", "#55d580", "solid"),
+        (plan.target2, "2차", "#55d580", "dash"),
+        (plan.soft_stop, "Soft", "#ffd66b", "dash"),
+        (plan.hard_stop or plan.invalidation or plan.stop, "Hard", "#ff7d7d", "solid"),
     ):
         if value is not None:
-            fig.add_hline(y=value, line_color=color, line_dash=dash, annotation_text=f"{name} {value:g}")
-    if plan.repeat_box:
-        low, high = plan.repeat_box
-        fig.add_hrect(y0=low, y1=high, fillcolor="#90caf9", opacity=0.10, line_width=0, annotation_text="반복박스")
-    fig.update_layout(
-        height=460, margin=dict(l=4, r=4, t=24, b=4), xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h"),
-    )
+            fig.add_hline(y=value, line_color=color, line_dash=dash, annotation_text=f"{name} {price_text(value)}")
+    fig.update_layout(height=320, margin=dict(l=4, r=4, t=24, b=4), xaxis_rangeslider_visible=False, paper_bgcolor="#121927", plot_bgcolor="#121927", font_color="#f4f7fc")
     st.plotly_chart(fig, use_container_width=True)
 
 
 client = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint())
 event_store = get_event_store()
 cycle_store = get_cycle_store()
+store = ValidationStore(VALIDATION_ROOT, event_store=event_store)
 
 with st.sidebar:
-    st.title("📡 스캐너 설정")
+    st.title("📈 카드 설정")
     market_label = st.radio("시장", ["국내 정규장", "미국 전 세션"], horizontal=True)
     market = Market.KR if market_label.startswith("국내") else Market.US
-    symbol = st.text_input("종목코드/티커 직접 검색", placeholder="005930 또는 SOXL").strip().upper()
+    symbol = st.text_input("직접 볼 종목", placeholder="005930 또는 SOXL").strip().upper()
     exchange = st.selectbox("미국 거래소", ["NAS", "NYS", "AMS"], disabled=market == Market.KR)
     kis_connected = bool(client.access_token)
     if kis_connected:
-        st.success("한국투자증권 연결: 준비됨")
+        st.success("한국투자증권 연결됨")
     else:
-        st.warning("한국투자증권 연결: 아직 준비 중입니다. 연결이 끝날 때까지 검색·분석 버튼은 눌러도 작동하지 않습니다.")
-    scan_now = st.button("고정 유동성 시작목록 검색", use_container_width=True, disabled=not kis_connected)
-    full_market_scan_now = st.button("전종목 후보 검색", help="연결이 준비되면 시장 전체의 1차 후보를 찾습니다.", use_container_width=True, disabled=not kis_connected)
-    analyze_now = st.button("선택 종목 분석", type="primary", use_container_width=True, disabled=not kis_connected)
-    live = st.toggle("자동 새로고침", False, help="기본은 꺼져 있습니다. 5시간 호출 예산 안에서 저빈도 갱신만 사용하세요.")
-    refresh_seconds = st.select_slider("자동 새로고침 간격(초)", options=[60, 120, 300], value=60, disabled=not live)
-    save_validation = st.toggle("매수 신호 검증 저장", False, help="진입 고려 신호만 저장합니다. 주문은 실행하지 않습니다.")
+        st.warning("한국투자증권 연결 대기 중\n\n연결되면 아래 검색 버튼이 켜집니다.")
+    full_market_scan_now = st.button("전종목 후보 찾기", use_container_width=True, disabled=not kis_connected)
+    direct_card_now = st.button("입력 종목 카드 만들기", type="primary", use_container_width=True, disabled=not kis_connected or not symbol)
+    live = st.toggle("60초 카드 새로고침", False, disabled=not kis_connected)
     cost_default = 0.05 if market == Market.KR else 0.10
     cost_pct = st.number_input("왕복비용 가정(%)", min_value=0.0, max_value=5.0, value=cost_default, step=0.01)
-    min_score = st.slider("최소 신호 점수", min_value=60, max_value=100, value=80, step=5, help="점수는 승률이 아니라 현재 데이터·유동성·구조의 조건 충족도입니다.")
-    st.caption(f"현재 세션: {market_session(market)}")
-    st.caption("연결 상태는 위의 초록색 또는 노란색 안내를 확인하세요.")
+    min_score = st.slider("최소 신호 점수", min_value=60, max_value=100, value=80, step=5)
     budget = client.budget_status
-    st.caption(
-        f"KIS 호출 보호(현재 서버): 1분 {budget.minute_used}/{budget.minute_limit} · "
-        f"5시간 {budget.five_hour_used}/{budget.five_hour_limit}"
-    )
-    st.caption("선택 종목 분석은 현재가·1호가·1분봉으로 최대 3건을 사용합니다. 자동 새로고침 60초는 5시간 최대 약 900건입니다.")
-    st.caption(f"검증 저장: {event_store.status}")
-    admin = admin_unlocked()
+    st.caption(f"호출 보호: 1분 {budget.minute_used}/{budget.minute_limit} · 5시간 {budget.five_hour_used}/{budget.five_hour_limit}")
+    st.caption("카드는 최대 3개만 정밀 분석합니다. 자동 주문은 없습니다.")
 
-if live and symbol:
-    st_autorefresh(interval=int(refresh_seconds * 1000), key=f"live_refresh_{refresh_seconds}")
+if live and symbol and kis_connected:
+    st_autorefresh(interval=60_000, key="mobile_card_refresh")
 
-st.title("실시간 반복단타 후보")
-st.caption(
-    "수동매매 판단 보조 도구입니다. 진입·손절은 완료 1분봉 구조를, 1차·2차 목표는 완료 5분봉 구조를 우선 반영합니다. 화면 가격은 호가, 거래량·거래대금, 비용과 유동성 조건을 함께 계산한 참고 구간이며 수익을 보장하지 않습니다."
-)
-st.caption("API 보호: 화면을 열기만 해서는 KIS 시세를 요청하지 않습니다. 종목 분석은 최대 3건, 고정 시작목록 검색은 국내 14건·미국 21건의 현재가 요청을 사용합니다. 전종목 후보 검색은 국내 2건·미국 6건의 시장 순위 요청만 사용하며, 개별 분봉·호가 조회는 선택한 종목에만 실행합니다.")
-
-if scan_now:
-    with st.spinner("시작목록의 현재가 1차 필터 확인 중…"):
-        ranked, scan_errors = scan_starter_universe(market.value)
-    st.session_state["ranked_market"] = market.value
-    st.session_state["ranked_candidates"] = ranked[:10]
-    st.session_state["scan_errors"] = scan_errors
-
-if st.session_state.get("ranked_market") == market.value and st.session_state.get("ranked_candidates"):
-    st.subheader("고정 유동성 시작목록 1차 결과")
-    st.caption("전체 시장 스캔이 아닙니다. 공개된 시작목록의 가격·상승률 결과이며, 정밀 조건을 통과하기 전에는 매수 후보가 아닙니다.")
-    st.dataframe(
-        pd.DataFrame(st.session_state["ranked_candidates"], columns=["종목", "등락률(%)"]),
-        hide_index=True,
-        use_container_width=True,
-    )
-if st.session_state.get("ranked_market") == market.value and st.session_state.get("scan_errors"):
-    st.caption(f"현재가 미수신: {len(st.session_state['scan_errors'])}건")
+st.markdown("<div class='mobile-head'><h1>반복단타 후보 카드</h1><p>여러 후보의 진입 기준가 · 5분 목표가 · 구조 손절가를 휴대전화에서 비교합니다.</p></div>", unsafe_allow_html=True)
+if kis_connected:
+    st.markdown("<div class='connection ok'>한국투자증권 연결이 준비되었습니다. 전종목 후보를 찾거나 종목코드를 입력해 카드로 확인하세요.</div>", unsafe_allow_html=True)
+else:
+    st.markdown("<div class='connection wait'>한국투자증권 연결을 기다리고 있습니다. 연결되기 전에는 가격을 임의로 보여 주지 않으며, 검색 버튼도 자동으로 막습니다.</div>", unsafe_allow_html=True)
 
 if full_market_scan_now:
     try:
-        with st.spinner("시장 전체 순위에서 반복단타 후보를 1차 선별 중…"):
+        with st.spinner("시장 전체 순위에서 1차 후보를 찾는 중…"):
             full_rankings = client.market_rankings(market)
             full_candidates = merge_rankings(market, full_rankings, limit=20)
         st.session_state["full_market"] = market.value
         st.session_state["full_candidates"] = [candidate.to_dict() for candidate in full_candidates]
-        st.session_state["full_scan_sources"] = {source: len(rows) for source, rows in full_rankings.items()}
+        st.session_state["mobile_cards"] = []
     except KISError as exc:
-        if "KIS_ACCESS_TOKEN" in str(exc):
-            st.error("한국투자증권 연결이 아직 준비되지 않았습니다. 연결이 확인된 뒤 다시 시도해 주세요.")
-        else:
-            st.error(f"전종목 후보 검색을 지금 실행할 수 없습니다: {exc}")
+        st.error("후보를 가져오지 못했습니다. 잠시 뒤 다시 시도해 주세요." if "KIS_ACCESS_TOKEN" not in str(exc) else "한국투자증권 연결이 아직 준비되지 않았습니다.")
 
-analyze_candidate = False
+selected_requests: list[dict[str, str]] = []
 if st.session_state.get("full_market") == market.value and st.session_state.get("full_candidates"):
-    st.subheader("전종목 1차 후보 결과")
-    st.caption("시장 전체 순위 응답에서 거래대금·거래량과 상승률이 겹치는 종목을 우선 정렬했습니다. 이 점수는 매수 신호나 승률이 아닙니다.")
-    candidates = pd.DataFrame(st.session_state["full_candidates"])
-    display_columns = [column for column in ["symbol", "name", "exchange", "screen_score", "sources", "price", "change_pct", "volume", "turnover"] if column in candidates]
-    st.dataframe(candidates[display_columns], hide_index=True, use_container_width=True)
-    selected = st.selectbox(
-        "전종목 후보를 골라 정밀 분석",
-        options=[""] + list(range(len(st.session_state["full_candidates"]))),
-        format_func=lambda index: "후보 선택" if index == "" else f"{st.session_state['full_candidates'][index]['symbol']} · {st.session_state['full_candidates'][index]['name']}",
-    )
-    if selected != "":
-        selected_candidate = st.session_state["full_candidates"][selected]
-        symbol = str(selected_candidate["symbol"])
-        if market == Market.US and selected_candidate.get("exchange"):
-            exchange = str(selected_candidate["exchange"])
-        analyze_candidate = st.button(f"{symbol} 정밀 분석", type="primary")
+    candidates = list(st.session_state["full_candidates"])
+    st.subheader("전종목 1차 후보")
+    st.caption("거래대금·거래량·상승률 순위를 먼저 걸러 낸 후보입니다. 아래에서 최대 3개만 골라 카드로 정밀 분석하세요.")
+    labels = [f"{candidate['symbol']} · {candidate.get('name') or '종목명 미확인'}" for candidate in candidates]
+    label_map = {label: candidate for label, candidate in zip(labels, candidates)}
+    for candidate in candidates[:8]:
+        change = candidate.get("change_pct")
+        change_text = f"{float(change):+.2f}%" if isinstance(change, (int, float)) else "등락률 미확인"
+        st.markdown(f"<div class='candidate-row'><span><b>{html.escape(str(candidate['symbol']))}</b> <small>{html.escape(str(candidate.get('name') or ''))}</small></span><span>{change_text} · 점수 {candidate.get('screen_score', '-')}</span></div>", unsafe_allow_html=True)
+    chosen_labels = st.multiselect("카드로 자세히 볼 후보 (최대 3개)", labels, max_selections=MAX_CARD_CANDIDATES)
+    if st.button("선택 후보 카드 만들기", type="primary", use_container_width=True, disabled=not kis_connected or not chosen_labels):
+        selected_requests = [
+            {"symbol": str(label_map[label]["symbol"]), "exchange": str(label_map[label].get("exchange") or exchange)}
+            for label in chosen_labels
+        ]
 
-if not symbol:
-    st.info("왼쪽에 종목코드 또는 티커를 입력하고 **선택 종목 분석**을 누르세요. 자동 새로고침은 기본 해제되어 API 호출을 줄입니다.")
-    st.stop()
-if not (analyze_now or analyze_candidate or live):
-    st.info("준비되었습니다. **선택 종목 분석**을 눌러 KIS 시세를 요청하세요.")
-    st.stop()
+if direct_card_now and symbol:
+    selected_requests = [{"symbol": symbol, "exchange": exchange}]
 
-store = ValidationStore(VALIDATION_ROOT, event_store=event_store)
-try:
-    quote = load_quote(symbol, market.value, exchange)
-    bars = load_bars(symbol, market.value, exchange)
-    cycle = cycle_store.get(symbol, market, quote.timestamp)
-    preliminary = analyze(
-        quote, bars, orderbook_required=True, round_trip_cost_pct=float(cost_pct),
-        minimum_score=int(min_score), cooldown_active=cycle.cooldown_active, hard_kill=cycle.hard_kill,
-    )
-    calibration = calibration_for(
-        store, market=market.value, session=quote.session, strategy=preliminary.strategy, score=preliminary.score,
-        version=APP_VERSION,
-    )
-    plan = analyze(
-        quote, bars, orderbook_required=True, round_trip_cost_pct=float(cost_pct), minimum_score=int(min_score),
-        cooldown_active=cycle.cooldown_active, hard_kill=cycle.hard_kill,
-        calibration_probability=calibration.probability_pct, calibration_samples=calibration.samples,
-    )
-    if event_store.configured:
-        marker = str(plan.diagnostics.get("completed_bar_at") or quote.timestamp.isoformat())
-        cycle = cycle_store.apply_risk_state(cycle, plan.risk_state, marker)
-except (KISError, ValueError, KeyError, OSError) as exc:
-    if isinstance(exc, KISError) and "KIS_ACCESS_TOKEN" in str(exc):
-        st.error("한국투자증권 연결이 아직 준비되지 않았습니다. 연결이 확인된 뒤 분석을 시작해 주세요.")
-    else:
-        st.error(f"시세를 받지 못했습니다: {exc}")
-    st.caption("실시간 현재가와 호가를 확인하지 못했으므로 진입·목표·손절가는 표시하지 않습니다.")
-    st.stop()
-except Exception as exc:
-    st.error(f"예상하지 못한 오류: {type(exc).__name__}: {exc}")
-    st.stop()
+if selected_requests or (live and symbol and kis_connected):
+    requests = selected_requests or [{"symbol": symbol, "exchange": exchange}]
+    cards: list[dict[str, Any]] = []
+    errors: list[str] = []
+    with st.spinner("선택 종목의 현재가·호가·1분봉을 확인해 카드를 만드는 중…"):
+        for request in requests[:MAX_CARD_CANDIDATES]:
+            try:
+                cards.append(analyze_card(request["symbol"], market, request["exchange"], float(cost_pct), int(min_score), store))
+            except (KISError, ValueError, KeyError, OSError) as exc:
+                errors.append(f"{request['symbol']}: {type(exc).__name__}")
+            except Exception:
+                errors.append(f"{request['symbol']}: 분석 준비 오류")
+    st.session_state["mobile_cards"] = cards
+    st.session_state["mobile_card_errors"] = errors
 
-css = "buy" if plan.signal == Signal.BUY else "block" if plan.signal in (Signal.BLOCK, Signal.SELL) else "unknown" if plan.signal == Signal.UNVERIFIED else "wait"
-st.markdown(
-    f'<div class="signal {css}">{html.escape(plan.signal.value)} · {html.escape(plan.strategy)}</div>',
-    unsafe_allow_html=True,
-)
+cards = st.session_state.get("mobile_cards") or []
+if cards:
+    st.subheader(f"정밀 분석 카드 · {len(cards)}개")
+    for card_item in cards:
+        render_trade_card(card_item, float(cost_pct))
+elif kis_connected:
+    st.info("왼쪽에서 **전종목 후보 찾기**를 누른 뒤 최대 3개를 고르거나, 종목코드를 입력해 카드로 확인하세요.")
 
-if plan.signal == Signal.BUY:
-    st.success("현재 조건에서는 진입 기준가와 구조 무효화 가격이 계산되었습니다. 완료 5분봉 구조의 1차 목표 도달 시 일부 청산 여부를 직접 판단하세요.")
-elif plan.signal == Signal.WAIT:
-    st.info("가격 기준은 보여 드리지만, 현재는 진입 조건이 완성되지 않았습니다. 아래 ‘대기 이유’를 먼저 확인하세요.")
-else:
-    st.warning("현재 장세·유동성·데이터 조건에서 신규 진입을 피합니다. 가격 카드가 비어 있으면 필요한 구조가 아직 확인되지 않은 것입니다.")
+for error in st.session_state.get("mobile_card_errors") or []:
+    st.warning(f"일부 카드를 만들지 못했습니다: {error}")
 
-summary = [
-    ("현재가", f"{quote.price:g}"),
-    ("모델 점수", f"{plan.score}/100"),
-    ("지속성", f"{plan.persistence_score if plan.persistence_score is not None else '-'}점 · {plan.persistence_band}"),
-    ("위험 상태", plan.risk_state),
-    ("Horizon", str(plan.diagnostics.get("persistence", {}).get("horizon_state", "미확인"))),
-    ("보정 확률", f"{plan.calibration_probability:.1f}%" if plan.calibration_probability is not None else f"보정 전 ({plan.calibration_samples}/30)"),
-]
-for column, (label, value) in zip(st.columns(6), summary):
-    column.metric(label, value)
+with st.expander("이 카드가 보여 주는 것"):
+    st.markdown("**초록색 목표가**는 완료된 5분봉 구조를 기준으로 계산합니다. **빨간색 손절가**는 구조가 무효가 되는 참고선입니다. 신호가 `대기` 또는 `차단`이면 가격이 보이더라도 매수 권유가 아닙니다. 화면을 여는 것만으로는 KIS 시세를 요청하지 않습니다.")
 
-st.subheader("반복단타 가격 계획")
-price_cards = [
-    ("진입 기준가", plan.entry, "실제 매수 참고가"),
-    ("1차 목표가 (5분)", plan.target, plan.target_basis),
-    ("2차 목표가 (5분)", plan.target2, plan.target2_basis),
-    ("Soft Stop", plan.soft_stop, "지지 훼손 확인 시작선"),
-    ("Hard Stop", plan.hard_stop or plan.invalidation or plan.stop, plan.stop_basis),
-]
-for column, (label, value, basis) in zip(st.columns(5), price_cards):
-    column.metric(label, f"{value:g}" if value is not None else "조건 미확인")
-    column.caption(basis)
-
-rr_value = plan.diagnostics.get("reward_risk_net")
-spread_value = plan.diagnostics.get("spread_pct")
-st.caption(
-    f"비용 반영 1차 목표 손익비: {rr_value:.2f}" if isinstance(rr_value, (int, float)) else "비용 반영 손익비: 구조 미확인"
-)
-st.caption(
-    f"호가 스프레드: {spread_value:.3f}% · 왕복비용 가정: {cost_pct:.2f}%" if isinstance(spread_value, (int, float)) else f"호가 스프레드: 미확인 · 왕복비용 가정: {cost_pct:.2f}%"
-)
-
-if plan.repeat_box:
-    low, high = plan.repeat_box
-    zone = plan.diagnostics.get("box_zone", "박스 위치 미확인")
-    st.success(f"반복박스 확인: {low:g}~{high:g} · 폭 {(high / low - 1) * 100:.2f}% · 현재 위치: {zone}")
-    st.caption("박스 전략은 하단 구간에서만 진입을 검토하고, 중단·상단에서는 추격하지 않습니다. 하단 아래 2개 완료 1분봉 종가가 확인되면 구조 무효화로 봅니다.")
-else:
-    st.caption("0.5~5.0%의 반복박스가 확인되지 않았습니다. 현재는 상승 추세 눌림 또는 장세 전환 관점으로만 평가합니다.")
-
-if plan.reasons:
-    st.subheader("지금 대기하거나 조심해야 하는 이유")
-    for reason in plan.reasons:
-        st.write(f"- {reason}")
-
-st.subheader("실시간 차트 · 진입 / 1차 / 2차 목표 / 구조 무효화")
-if not bars.empty:
-    render_chart(bars.tail(180), plan)
-
-with st.expander("계산 근거와 상세 지표"):
-    diagnostics = plan.diagnostics
-    plain = {
-        "전략": plan.strategy,
-        "장세": plan.regime.value,
-        "완료 1분봉 수": diagnostics.get("completed_bars"),
-        "1차 목표 평가 창(분)": diagnostics.get("target1_window_minutes"),
-        "진입용 1분봉 저항": diagnostics.get("entry_resistance_1m"),
-        "VWAP": diagnostics.get("vwap"),
-        "EMA9": diagnostics.get("ema9"),
-        "ATR": diagnostics.get("atr"),
-        "상대거래량": diagnostics.get("rvol"),
-        "거래대금 상대강도": diagnostics.get("notional_rvol"),
-        "가짜신호 경고": diagnostics.get("false_signal_flags"),
-        "지속성 진단": diagnostics.get("persistence"),
-        "위험 상태": diagnostics.get("risk"),
-        "FINAL_BUY 조건": diagnostics.get("final_buy_gates"),
-        "대기 이유": plan.reasons,
-        "미수신 데이터": plan.missing,
-    }
-    st.json(plain, expanded=True)
-
-with st.expander("상승 여력 시나리오 (보조 참고)"):
-    st.caption("아래 범위는 확정 목표가가 아닙니다. 1차 목표는 위의 완료 5분봉 구조를 사용하고, 아래는 최근 완료 1분봉 변동성으로 계산한 5~30분 보조 참고 범위입니다.")
-    for column, point in zip(st.columns(4), plan.forecasts):
-        column.metric(f"{point.minutes}분 · {point.direction.value}", f"{point.base:g}")
-        column.caption(f"범위 {point.low:g}~{point.high:g}")
-
-if save_validation and plan.signal == Signal.BUY and plan.forecasts:
-    scored = store.score_ready(symbol, market.value, bars, float(cost_pct))
-    latest = float(bars.close.iloc[-2]) if len(bars) >= 2 else None
-    case = ValidationCase.from_plan(plan, latest, quote.session, APP_VERSION)
-    path, created = store.save_once(case)
-    if scored:
-        st.caption(f"30분 경로 사후채점 완료: {scored}건")
-    st.caption(("검증 원본 저장: " if created else "동일 신호 원본 재사용: ") + path.name + f" · {store.storage_status}")
-    if store.last_persistence_error:
-        st.warning(store.last_persistence_error)
-
-if admin:
-    with st.expander("관리자: 검증 현황·보고서"):
-        summary = store.summary()
-        st.json(summary)
-        if store.last_persistence_error:
-            st.warning(store.last_persistence_error)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if st.button("CSV·HTML 보고서 만들기"):
-            csv_path = store.export_csv(Path("reports") / f"validation_{stamp}.csv")
-            html_path = store.export_html(Path("reports") / f"validation_{stamp}.html")
-            st.success(f"보고서 생성: {csv_path} / {html_path}")
-
-    with st.expander("관리자: 직접 매매 기록"):
-        if not event_store.configured:
-            st.warning("수동 매매 기록은 영속 저장소가 필요합니다. `SUPABASE_URL`과 `SUPABASE_KEY`를 Secrets에 설정한 뒤 사용하세요.")
-        else:
-            with st.form("manual_trade_form", clear_on_submit=True):
-                left, middle, right = st.columns(3)
-                journal_symbol = left.text_input("종목", value=symbol)
-                side = middle.selectbox("방향", ["매수", "매도"])
-                quantity = right.number_input("수량", min_value=0.0, value=1.0, step=1.0)
-                entry_price = left.number_input("진입가", min_value=0.0, value=float(quote.ask or quote.price), step=0.01)
-                exit_price = middle.number_input("청산가(미청산 시 0)", min_value=0.0, value=0.0, step=0.01)
-                fees = right.number_input("총비용", min_value=0.0, value=0.0, step=0.01)
-                note = st.text_area("메모", max_chars=500)
-                save_trade = st.form_submit_button("수동 매매 기록 저장")
-            if save_trade:
-                try:
-                    trade = ManualTrade.create(
-                        journal_symbol, market.value, side, entry_price, quantity,
-                        exit_price if exit_price > 0 else None, fees, note,
-                    )
-                    save_manual_trade(event_store, trade)
-                    st.success("수동 매매 기록을 영속 저장했습니다.")
-                except (PersistenceError, ValueError) as exc:
-                    st.error(f"수동 매매 기록 저장 실패: {exc}")
+with st.expander("연결이 계속 안 될 때"):
+    st.markdown("앱의 노란 안내가 계속 보이면, 저장된 한국투자증권 연결 정보가 새 앱에 전달되지 않은 상태입니다. 종목 검색 버튼이 회색일 때는 버튼을 반복해서 누르지 마세요. 앱 관리 화면의 Settings에서 연결 정보를 다시 저장한 뒤 앱을 재시작하면 됩니다. 실제 토큰·앱키 값은 누구에게도 보내지 마세요.")

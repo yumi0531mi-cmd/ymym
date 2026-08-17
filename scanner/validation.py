@@ -14,7 +14,7 @@ from .models import Regime, TradePlan
 from .persistence import EventStore, PersistenceError
 
 
-@dataclass(slots=True)
+@dataclass
 class HorizonResult:
     minutes: int
     predicted_low: float
@@ -27,7 +27,7 @@ class HorizonResult:
     pass_all: bool | None = None
 
 
-@dataclass(slots=True)
+@dataclass
 class ValidationCase:
     case_id: str
     version: str

@@ -7,7 +7,7 @@ import time
 from typing import Callable
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class BudgetSnapshot:
     minute_limit: int
     minute_used: int

@@ -25,10 +25,9 @@ def test_missing_token_disables_kis_request_buttons():
     app.run(timeout=30)
 
     buttons = {button.label: button for button in app.button}
-    assert buttons["고정 유동성 시작목록 검색"].disabled
-    assert buttons["전종목 후보 검색"].disabled
-    assert buttons["선택 종목 분석"].disabled
-    assert any("한국투자증권 연결: 아직 준비 중입니다" in item.value for item in app.warning)
+    assert buttons["전종목 후보 찾기"].disabled
+    assert buttons["입력 종목 카드 만들기"].disabled
+    assert any("한국투자증권 연결 대기 중" in item.value for item in app.warning)
 
 
 def test_full_market_button_renders_candidates_with_connected_mock_client():
@@ -44,11 +43,11 @@ def test_full_market_button_renders_candidates_with_connected_mock_client():
     ):
         app = AppTest.from_file(APP_PATH)
         app.run(timeout=30)
-        full_market_button = next(button for button in app.button if button.label == "전종목 후보 검색")
+        full_market_button = next(button for button in app.button if button.label == "전종목 후보 찾기")
         assert not full_market_button.disabled
         full_market_button.click()
         app.run(timeout=30)
 
     assert not app.exception
-    assert any(item.value == "전종목 1차 후보 결과" for item in app.subheader)
-    assert any(item.label == "전종목 후보를 골라 정밀 분석" for item in app.selectbox)
+    assert any(item.value == "전종목 1차 후보" for item in app.subheader)
+    assert any(item.label == "카드로 자세히 볼 후보 (최대 3개)" for item in app.multiselect)
