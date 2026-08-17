@@ -9,7 +9,7 @@ from .indicators import enrich
 from .models import Market, Quote, Regime, Signal, TradePlan
 from .persistence_engine import final_buy_decision, persistence_score, risk_state
 from .sessions import remaining_session_minutes
-from .strategy import confirmed_levels, fake_signal_flags, multi_timeframe, price_zone_in_box, repeat_box, trade_levels
+from .strategy import chart_entry_level, confirmed_levels, fake_signal_flags, multi_timeframe, price_zone_in_box, repeat_box, trade_levels
 from .strategy_ensemble import evaluate_ensemble
 
 
@@ -44,6 +44,7 @@ def _plan(
     regime: Regime,
     *,
     entry: float | None = None,
+    entry_basis: str = "진입 기준 미확인",
     target1: float | None = None,
     target2: float | None = None,
     stop: float | None = None,
@@ -76,6 +77,7 @@ def _plan(
         regime=regime,
         current_price=quote.price,
         entry=entry,
+        entry_basis=entry_basis,
         target=target1,
         stop=stop,
         target_basis=target1_basis,
@@ -113,7 +115,6 @@ def analyze(
     calibration_probability: float | None = None,
     calibration_samples: int = 0,
     calibration_expectancy_pct: float | None = None,
-    live_data_fresh: bool = True,
 ) -> TradePlan:
     """Create one explainable v5.1 manual repeated-scalping evaluation.
 
@@ -130,8 +131,6 @@ def analyze(
         )
 
     missing: list[str] = []
-    if not live_data_fresh:
-        missing.append("실시간 체결 지연")
     if bars is None or len(bars) < 31:
         missing.append("충분한 완료 1분봉")
     if orderbook_required and (not quote.bid or not quote.ask):
@@ -166,7 +165,8 @@ def analyze(
         regime, strategy = Regime.TRANSITION, "NONE · 장세 전환 대기"
 
     latest = completed.iloc[-1]
-    entry = quote.ask or quote.price
+    entry, entry_basis = chart_entry_level(df, quote.price, regime, box)
+    entry = entry or quote.price
     target1, target2, support, target1_basis, target2_basis, support_basis = trade_levels(df, entry, box)
     entry_resistance_1m, _, _, _ = confirmed_levels(df, entry)
     flags = fake_signal_flags(completed, support, entry_resistance_1m)
@@ -231,7 +231,7 @@ def analyze(
         spread_ok and rvol_ok and notional_ok and not flags["fake_breakout"]
         and not flags["upper_rejection"] and not ensemble.conflicts
     )
-    data_verified = not missing and live_data_fresh
+    data_verified = not missing
 
     execution_score = (
         15 if entry_zone_ok else 0
@@ -282,9 +282,6 @@ def analyze(
         reasons.append("당일 Hard Kill 상태입니다. 신규 진입을 차단합니다.")
     if calibration_samples < 30:
         reasons.append(f"보정확률 미표시: 동일 조건 실측 표본 {calibration_samples}건 / 30건")
-    if not live_data_fresh:
-        reasons.append("실시간 체결이 지연되어 새 신호를 대기 상태로 낮춥니다.")
-
     hard_block = regime == Regime.DOWN or not session_ok or risk.state in {"REAL_BREAKDOWN", "HARD_EXIT"} or hard_kill
     signal = Signal.BLOCK if hard_block else Signal.BUY if final_buy else Signal.WAIT
     diagnostics: dict[str, object] = {
@@ -315,12 +312,12 @@ def analyze(
         "strategy_ensemble": ensemble.to_dict(),
         "calibration_probability_pct": calibration_probability if calibration_samples >= 30 else None,
         "calibration_expectancy_pct": calibration_expectancy_pct if calibration_samples >= 30 else None,
-        "live_data_fresh": live_data_fresh,
     }
     strategy_label = f"{ensemble.calibration_key} · {strategy}"
     return _plan(
         quote, now, signal, strategy_label, regime,
-        entry=entry if structure_ok else None,
+        entry=entry,
+        entry_basis=entry_basis,
         target1=target1 if structure_ok else None,
         target2=target2 if structure_ok else None,
         stop=risk.hard_stop if structure_ok else None,
@@ -333,7 +330,7 @@ def analyze(
         repeat=box,
         verified=data_verified,
         diagnostics=diagnostics,
-        forecasts=forecast_path(completed, regime),
+        forecasts=forecast_path(completed, regime, reference_price=quote.price),
         soft_stop=risk.soft_stop,
         hard_stop=risk.hard_stop,
         risk_status=risk.state,

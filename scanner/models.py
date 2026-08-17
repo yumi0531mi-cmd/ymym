@@ -59,6 +59,7 @@ class ForecastPoint:
     base: float
     high: float
     direction: Regime
+    basis: str = ""
 
 
 @dataclass
@@ -75,6 +76,7 @@ class TradePlan:
     stop: float | None
     target_basis: str
     stop_basis: str
+    entry_basis: str = "진입 기준 미확인"
     forecasts: list[ForecastPoint] = field(default_factory=list)
     score: int = 0
     reasons: list[str] = field(default_factory=list)

@@ -9,7 +9,7 @@ import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from scanner.kis_client import KISClient
-from scanner.models import Market, Quote, Regime, Signal, TradePlan
+from scanner.models import ForecastPoint, Market, Quote, Regime, Signal, TradePlan
 
 
 APP_PATH = "/home/ubuntu/ymym_review/app.py"
@@ -37,7 +37,12 @@ def _plan(*_args, **_kwargs) -> TradePlan:
         signal=Signal.BUY, strategy="TREND_SWING", regime=Regime.UP, current_price=70000,
         entry=69900, target=71000, target2=72000, stop=69500, soft_stop=69600,
         hard_stop=69400, target_basis="완료 5분봉 스윙 저항", target2_basis="다음 완료 5분봉 저항",
-        stop_basis="1분봉 구조 무효화", score=87, reasons=["완료봉 확인"], risk_state="NORMAL",
+        stop_basis="1분봉 구조 무효화", entry_basis="완료봉 EMA9 지지", score=87, reasons=["완료봉 확인"], risk_state="NORMAL",
+        forecasts=[
+            ForecastPoint(5, 70000, 71000, 71500, Regime.UP, "EMA9·VWAP 위"),
+            ForecastPoint(15, 70500, 72000, 73000, Regime.UP, "EMA9·VWAP 위"),
+            ForecastPoint(30, 71000, 73500, 75000, Regime.UP, "EMA9·VWAP 위"),
+        ],
         persistence_score=78, diagnostics={"rvol": 2.4, "spread_pct": 0.14, "reward_risk_net": 1.8, "false_signal_flags": []},
     )
 
@@ -73,4 +78,4 @@ def test_automatic_candidate_renders_mobile_trade_card_without_user_selection():
     assert not app.exception
     assert not app.button
     assert any("005930" in str(item.value) for item in app.subheader)
-    assert {metric.label for metric in app.metric} >= {"현재가", "진입 기준가", "1차 목표 · 5분", "2차 목표 · 5분", "Hard Stop"}
+    assert {metric.label for metric in app.metric} >= {"현재가", "진입 기준가", "1차 목표 · 5분 예상", "2차 목표 · 15분 예상", "3차 목표 · 30분 예상", "Hard Stop"}

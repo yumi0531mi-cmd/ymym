@@ -90,6 +90,47 @@ def repeat_box(frame: pd.DataFrame, current: float) -> tuple[float, float] | Non
     return None
 
 
+def chart_entry_level(
+    frame: pd.DataFrame,
+    current_price: float,
+    regime: Regime,
+    box: tuple[float, float] | None = None,
+) -> tuple[float | None, str]:
+    """Return a chart-derived entry reference from confirmed support, never a made-up percent."""
+    df = enrich(frame)
+    if len(df) < 20 or current_price <= 0:
+        return None, "진입 기준 미확인"
+    completed = df.iloc[:-1].tail(120)
+    if len(completed) < 15:
+        return None, "완료 1분봉 부족"
+    if box:
+        low, high = box
+        if low < current_price < high:
+            return min(current_price, low * 1.002), "완료 5분봉 반복박스 하단 지지"
+
+    latest = completed.iloc[-1]
+    lows = completed.low[
+        (completed.low.shift(1) > completed.low)
+        & (completed.low.shift(-1) > completed.low)
+    ]
+    supports = [float(value) for value in lows if value <= current_price]
+    named_supports = [
+        (float(latest.ema9), "완료봉 EMA9 지지") if float(latest.ema9) <= current_price else None,
+        (float(latest.vwap), "완료봉 VWAP 지지") if float(latest.vwap) <= current_price else None,
+    ]
+    if supports:
+        named_supports.append((max(supports), "완료 1분봉 스윙 저점 지지"))
+    valid = [item for item in named_supports if item is not None and item[0] > 0]
+    if not valid:
+        return current_price, "현재가 기준 · 차트 지지 추가 확인"
+    level, basis = max(valid, key=lambda item: item[0])
+    # A very small buffer keeps the displayed reference at the confirmed support
+    # while preventing a false sense of exact tick precision.
+    entry = min(current_price, level * 1.001)
+    prefix = "상승 추세 " if regime == Regime.UP else "박스·전환 "
+    return entry, prefix + basis
+
+
 def trade_levels(
     frame: pd.DataFrame, entry: float, box: tuple[float, float] | None = None
 ) -> tuple[float | None, float | None, float | None, str, str, str]:

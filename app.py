@@ -224,19 +224,6 @@ def quote_with_live_tick(base: Quote) -> Quote:
     )
 
 
-def realtime_freshness(quote: Quote) -> tuple[bool, float | None, int]:
-    """Avoid new signals when a subscribed, liquid candidate stops receiving trades."""
-    hub = get_realtime_hub(CLIENT_CACHE_VERSION, current_secret_fingerprint())
-    max_age = 20 if quote.market == Market.KR or quote.session == "US_REGULAR" else 60
-    tick_age = hub.tick_age_seconds(quote.market, quote.symbol)
-    if tick_age is None:
-        # The first subscription can take a few seconds.  A newly fetched REST quote
-        # remains a safe temporary baseline; stale REST snapshots do not.
-        rest_age = max(0.0, (datetime.now(quote.timestamp.tzinfo) - quote.timestamp).total_seconds())
-        return rest_age <= max_age, None, max_age
-    return tick_age <= max_age, tick_age, max_age
-
-
 def price_ceiling(market: Market) -> float:
     return KR_PRICE_CEILING if market == Market.KR else US_PRICE_CEILING
 
@@ -394,6 +381,23 @@ def signal_class(signal: Signal) -> str:
     return "wait"
 
 
+def forecast_point_for(plan: Any, minutes: int) -> Any | None:
+    return next((point for point in plan.forecasts if point.minutes == minutes), None)
+
+
+def forecast_direction_text(point: Any | None) -> str:
+    if point is None:
+        return "예상 계산 대기"
+    mapping = {Regime.UP: "상승 예상", Regime.DOWN: "하방 예상", Regime.RANGE: "박스권 예상"}
+    return mapping.get(point.direction, "방향 확인 중")
+
+
+def forecast_range_text(point: Any | None) -> str:
+    if point is None:
+        return "완료봉 추가 확인 필요"
+    return f"{forecast_direction_text(point)} · 예상 범위 {price_text(point.low)} ~ {price_text(point.high)}"
+
+
 def strategy_signal_text(plan: Any) -> str:
     """Present strategy status without labelling an untested condition as 80% verified."""
     if plan.signal == Signal.BUY and plan.calibration_probability is not None and plan.calibration_probability >= 80.0:
@@ -415,7 +419,6 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
     """Fetch and analyze one automatic dashboard card from REST history plus live completed bars."""
     quote = quote_with_live_tick(load_dashboard_quote(symbol, market.value, exchange))
     bars = merge_live_completed_bars(load_bars(symbol, market.value, exchange), symbol, market)
-    live_data_fresh, tick_age_seconds, stale_after_seconds = realtime_freshness(quote)
     cycle = cycle_store.get(symbol, market, quote.timestamp)
     preliminary = analyze(
         quote, bars, orderbook_required=True, round_trip_cost_pct=cost_pct,
@@ -431,7 +434,6 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
         calibration_probability=getattr(calibration, "recent_probability_pct", calibration.probability_pct),
         calibration_samples=getattr(calibration, "recent_samples", calibration.samples),
         calibration_expectancy_pct=getattr(calibration, "recent_average_net_return_pct", calibration.average_net_return_pct if hasattr(calibration, "average_net_return_pct") else None),
-        live_data_fresh=live_data_fresh,
     )
     # Complete earlier same-symbol signals first, then record a new fully specified
     # entry/target/stop signal. This supplies the real target-before-stop outcomes
@@ -449,9 +451,6 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
         "calibration": calibration.to_dict() if hasattr(calibration, "to_dict") else {
             "samples": calibration.samples, "probability_pct": calibration.probability_pct,
         },
-        "live_data_fresh": live_data_fresh,
-        "tick_age_seconds": tick_age_seconds,
-        "stale_after_seconds": stale_after_seconds,
         "validation_recorded": recorded_case, "validation_scored": scored_cases,
     }
 
@@ -476,8 +475,7 @@ def render_realtime_price(symbol: str, market_value: str, base_price: float, pre
         source = "KIS 체결"
     change_pct = ((price / previous_close) - 1.0) * 100.0 if previous_close > 0 else 0.0
     st.metric("현재가", price_text(price), f"{change_pct:+.2f}%")
-    age_seconds = max(0, int((datetime.now(timestamp.tzinfo) - timestamp).total_seconds()))
-    st.caption(f"{source} · {timestamp.strftime('%H:%M:%S')} · 지연 {age_seconds}초")
+    st.caption(f"{source} · 마지막 체결 시각 {timestamp.strftime('%H:%M:%S')}")
 
 
 def trade_card_html(item: dict[str, Any], cost_pct: float) -> str:
@@ -555,6 +553,10 @@ def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
     quote: Quote = item["quote"]
     plan = item["plan"]
     hard_stop = plan.hard_stop or plan.invalidation or plan.stop
+    forecast_5 = forecast_point_for(plan, 5)
+    forecast_15 = forecast_point_for(plan, 15)
+    forecast_30 = forecast_point_for(plan, 30)
+    target_5 = plan.target if plan.target is not None else (forecast_5.base if forecast_5 else None)
     repeat_width = repeat_band_pct(plan)
     state = "상승 추세" if plan.regime == Regime.UP else ("박스권" if plan.regime == Regime.RANGE else "전환·관망")
     repeat_text = f"반복단타 가능 · 폭 {repeat_width:.2f}%" if repeat_width is not None else "추세 진입 관찰"
@@ -574,18 +576,21 @@ def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
             )
         top[1].metric("전략 신호", strategy_signal_text(plan), f"{state} · 점수 {plan.score}/100")
         st.caption(f"구조: {repeat_text} · 위험 상태: {plan.risk_state}")
-        if not item.get("live_data_fresh", True):
-            age = item.get("tick_age_seconds")
-            stale_after = item.get("stale_after_seconds")
-            age_text = f"{int(age)}초" if isinstance(age, (float, int)) else "최근 체결 미수신"
-            st.warning(f"데이터 지연: {age_text} · {stale_after}초 기준을 넘겨 새 신호를 대기 상태로 낮췄습니다.")
         ensemble = plan.diagnostics.get("strategy_ensemble") or {}
         active_strategies = ", ".join(ensemble.get("active_names") or [])
         st.caption(f"전략 조합: {ensemble.get('calibration_key') or '계산 대기'} · {active_strategies or '완료봉 확인 대기'}")
-        levels = st.columns(3)
+        levels = st.columns(2)
         levels[0].metric("진입 기준가", price_text(plan.entry))
-        levels[1].metric("1차 목표 · 5분", price_text(plan.target))
-        levels[2].metric("2차 목표 · 5분", price_text(plan.target2))
+        levels[1].metric("1차 목표 · 5분 예상", price_text(target_5))
+        st.caption(f"1차 근거: {plan.target_basis or '완료 5분봉 구조 확인 중'} · {forecast_range_text(forecast_5)}")
+        projected = st.columns(2)
+        projected[0].metric("2차 목표 · 15분 예상", price_text(forecast_15.base if forecast_15 else None))
+        projected[1].metric("3차 목표 · 30분 예상", price_text(forecast_30.base if forecast_30 else None))
+        st.caption(f"2차: {forecast_range_text(forecast_15)}")
+        st.caption(f"3차: {forecast_range_text(forecast_30)}")
+        if forecast_15 or forecast_30:
+            forecast_basis = (forecast_15 or forecast_30).basis
+            st.caption(f"예상 계산 근거: {forecast_basis}")
         stops = st.columns(3)
         stops[0].metric("Soft Stop", price_text(plan.soft_stop))
         stops[1].metric("Hard Stop", price_text(hard_stop))
@@ -593,8 +598,8 @@ def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
         reasons = " · ".join(str(reason) for reason in (plan.reasons or [])[:2]) or "특별 경고 없음"
         st.caption(f"판단 근거: {reasons}")
         basis = st.columns(3)
-        basis[0].caption(f"진입 기준: {plan.strategy}")
-        basis[1].caption(f"목표 근거: {plan.target_basis or '5분 구조 확인 대기'}")
+        basis[0].caption(f"진입 근거: {plan.entry_basis}")
+        basis[1].caption(f"1차 근거: {plan.target_basis or '5분 구조 확인 대기'}")
         basis[2].caption(f"손절 근거: {plan.stop_basis or '1분 구조 확인 대기'}")
         if plan.calibration_samples >= 30 and plan.calibration_probability is not None:
             status = "80% 목표 검증 통과" if plan.calibration_probability >= 80.0 else "80% 목표 검증 미통과 · 강한 신호 제외"
