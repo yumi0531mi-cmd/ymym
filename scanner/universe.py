@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from .models import Market, Quote
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class UniverseItem:
     symbol: str
     name: str
