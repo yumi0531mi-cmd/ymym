@@ -545,7 +545,7 @@ def render_realtime_price(symbol: str, market_value: str, base_price: float, pre
     until the first real-time trade arrives or while the stream reconnects.
     """
     market = Market(market_value)
-    tick = get_realtime_hub(CLIENT_CACHE_VERSION, current_secret_fingerprint()).tick(market, symbol)
+    tick = current_realtime_hub().tick(market, symbol)
     if tick is None:
         price = base_price
         timestamp = datetime.fromisoformat(initial_timestamp)
@@ -764,7 +764,7 @@ kis_connected = client.ready
 # KIS ticks are redrawn by each card's independent Streamlit fragment.  Do not
 # rerun the entire dashboard here: a full rerun causes visible white flashing.
 
-st.markdown("<div class='mobile-head'><h1>실시간 상승·반복단타 혼합 스캐너</h1><p>상승 추세 후보의 현재가 · 진입 기준가 · 5분 1차/2차 목표 · 구조 손절가를 바로 비교하고, 반복단타 구조는 별도로 구분합니다.</p></div>", unsafe_allow_html=True)
+st.markdown("<div class='mobile-head'><h1>실시간 상승·반복단타 혼합 스캐너</h1><p>현재가 · 추천 매수가 · 추천 매도가 · 차트 지지 · 손절가 · 구조 · 시간별 예상</p></div>", unsafe_allow_html=True)
 
 cards: list[dict[str, Any]] = []
 errors: list[str] = []
