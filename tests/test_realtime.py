@@ -48,3 +48,24 @@ def test_kis_realtime_subscription_uses_official_market_keys():
     assert KISRealtimeHub._us_tr_key("NAS", "NVDA") == "DNASNVDA"
     assert KISRealtimeHub._us_tr_key("NYS", "JPM") == "DNYSJPM"
     assert KISRealtimeHub._us_tr_key("AMS", "SPY") == "DAMSSPY"
+
+
+def test_kis_realtime_excludes_forming_minute_from_completed_bars():
+    from datetime import datetime, timedelta
+    from scanner.realtime import RealtimeTick
+    from scanner.sessions import KST
+
+    hub = KISRealtimeHub(ApprovalOnlyClient())
+    first = datetime(2026, 8, 17, 10, 0, 5, tzinfo=KST)
+    hub._accumulate_bar(RealtimeTick("005930", Market.KR, 70000, 0.0, first, volume=100))
+    hub._accumulate_bar(RealtimeTick("005930", Market.KR, 70100, 0.0, first + timedelta(seconds=35), volume=130))
+    assert hub.completed_bar_rows(Market.KR, "005930") == []
+
+    hub._accumulate_bar(RealtimeTick("005930", Market.KR, 70200, 0.0, first + timedelta(minutes=1), volume=150))
+    rows = hub.completed_bar_rows(Market.KR, "005930")
+    assert len(rows) == 1
+    assert rows[0]["open"] == 70000
+    assert rows[0]["high"] == 70100
+    assert rows[0]["low"] == 70000
+    assert rows[0]["close"] == 70100
+    assert rows[0]["volume"] == 30

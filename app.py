@@ -186,10 +186,41 @@ def load_dashboard_quote(symbol: str, market_value: str, exchange: str) -> Quote
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
-    # Completed 1-minute bars are refreshed every 15 minutes. Current price above
-    # remains separate so the card stays responsive without rebuilding structure on every refresh.
+    # Historical completed bars seed the analysis. Live KIS trades are merged below
+    # so the trailing structure does not wait for another REST refresh.
     return get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).intraday(
         symbol, Market(market_value), exchange
+    )
+
+
+def merge_live_completed_bars(base: pd.DataFrame, symbol: str, market: Market) -> pd.DataFrame:
+    """Overlay locally completed one-minute KIS trade bars onto cached REST history."""
+    rows = get_realtime_hub(CLIENT_CACHE_VERSION, current_secret_fingerprint()).completed_bar_rows(market, symbol)
+    if not rows:
+        return base
+    live = pd.DataFrame(rows).set_index("timestamp")
+    live.index = pd.to_datetime(live.index)
+    historical = base.copy()
+    historical.index = pd.to_datetime(historical.index)
+    if getattr(historical.index, "tz", None) is not None and getattr(live.index, "tz", None) is not None:
+        live.index = live.index.tz_convert(historical.index.tz)
+    elif getattr(historical.index, "tz", None) is not None:
+        live.index = live.index.tz_localize(historical.index.tz)
+    merged = pd.concat([historical, live], axis=0)
+    return merged[~merged.index.duplicated(keep="last")].sort_index()
+
+
+def quote_with_live_tick(base: Quote) -> Quote:
+    tick = get_realtime_hub(CLIENT_CACHE_VERSION, current_secret_fingerprint()).tick(base.market, base.symbol)
+    if tick is None:
+        return base
+    return Quote(
+        symbol=base.symbol, market=base.market, price=tick.price,
+        previous_close=base.previous_close, timestamp=tick.timestamp,
+        bid=tick.bid if tick.bid is not None else base.bid,
+        ask=tick.ask if tick.ask is not None else base.ask,
+        volume=tick.volume if tick.volume is not None else base.volume,
+        turnover=base.turnover, session=base.session, source=tick.source,
     )
 
 
@@ -368,9 +399,9 @@ def strategy_signal_text(plan: Any) -> str:
 
 
 def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
-    """Fetch and analyze one automatic dashboard card (maximum three)."""
-    quote = load_dashboard_quote(symbol, market.value, exchange)
-    bars = load_bars(symbol, market.value, exchange)
+    """Fetch and analyze one automatic dashboard card from REST history plus live completed bars."""
+    quote = quote_with_live_tick(load_dashboard_quote(symbol, market.value, exchange))
+    bars = merge_live_completed_bars(load_bars(symbol, market.value, exchange), symbol, market)
     cycle = cycle_store.get(symbol, market, quote.timestamp)
     preliminary = analyze(
         quote, bars, orderbook_required=True, round_trip_cost_pct=cost_pct,

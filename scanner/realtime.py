@@ -4,6 +4,7 @@ import asyncio
 import json
 import threading
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable
@@ -53,6 +54,8 @@ class KISRealtimeHub:
         self._thread: threading.Thread | None = None
         self._desired: dict[tuple[Market, str], str] = {}
         self._ticks: dict[tuple[Market, str], RealtimeTick] = {}
+        self._forming_bars: dict[tuple[Market, str], dict[str, object]] = {}
+        self._completed_bars: dict[tuple[Market, str], deque[dict[str, object]]] = defaultdict(lambda: deque(maxlen=360))
         self._connected = False
         self._last_error = ""
         self._last_message_at: datetime | None = None
@@ -107,6 +110,47 @@ class KISRealtimeHub:
     def tick(self, market: Market, symbol: str) -> RealtimeTick | None:
         with self._lock:
             return self._ticks.get((market, str(symbol).strip().upper()))
+
+    def completed_bar_rows(self, market: Market, symbol: str) -> list[dict[str, object]]:
+        """Return locally completed one-minute bars derived from live KIS trades.
+
+        The still-forming minute is deliberately excluded so entry and target logic
+        never treats an unfinished candle as confirmed structure.
+        """
+        with self._lock:
+            return list(self._completed_bars.get((market, str(symbol).strip().upper()), ()))
+
+    def _accumulate_bar(self, tick: RealtimeTick) -> None:
+        key = (tick.market, tick.symbol)
+        minute = tick.timestamp.replace(second=0, microsecond=0)
+        cumulative_volume = float(tick.volume or 0.0)
+        current = self._forming_bars.get(key)
+        if current is None or current["minute"] != minute:
+            if current is not None:
+                self._completed_bars[key].append(
+                    {
+                        "timestamp": current["minute"],
+                        "open": current["open"],
+                        "high": current["high"],
+                        "low": current["low"],
+                        "close": current["close"],
+                        "volume": max(float(current["last_volume"]) - float(current["start_volume"]), 0.0),
+                    }
+                )
+            self._forming_bars[key] = {
+                "minute": minute,
+                "open": tick.price,
+                "high": tick.price,
+                "low": tick.price,
+                "close": tick.price,
+                "start_volume": cumulative_volume,
+                "last_volume": cumulative_volume,
+            }
+            return
+        current["high"] = max(float(current["high"]), tick.price)
+        current["low"] = min(float(current["low"]), tick.price)
+        current["close"] = tick.price
+        current["last_volume"] = max(float(current["last_volume"]), cumulative_volume)
 
     def stop(self) -> None:
         self._stop.set()
@@ -248,4 +292,5 @@ class KISRealtimeHub:
         )
         with self._lock:
             self._ticks[(market, symbol)] = tick
+            self._accumulate_bar(tick)
             self._last_message_at = tick.timestamp
