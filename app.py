@@ -454,6 +454,8 @@ def dashboard_structure(item: dict[str, Any]) -> dict[str, str]:
         "REAL_BREAKDOWN": "구조 이탈",
         "HARD_EXIT": "손절 구조",
     }.get(plan.risk_state, "구조 확인 중")
+    if not item.get("chart_aligned", True):
+        current_state = str(item.get("chart_alignment_reason") or "완료 분봉 확인 중")
     return {
         "유형": kind,
         "큰 추세": trend_label,
@@ -499,12 +501,34 @@ def strategy_signal_text(plan: Any) -> str:
     return mapping.get(plan.signal, str(plan.signal.value))
 
 
+def completed_bar_alignment(quote: Quote, bars: pd.DataFrame) -> tuple[bool, str]:
+    """Allow structural prices only when a recent completed bar agrees with current price."""
+    if len(bars) < 2:
+        return False, "완료 분봉 수집 중"
+    completed = bars.iloc[-2]
+    try:
+        completed_at = pd.Timestamp(bars.index[-2]).to_pydatetime()
+        if completed_at.tzinfo is None:
+            completed_at = completed_at.replace(tzinfo=quote.timestamp.tzinfo)
+        age_minutes = abs((quote.timestamp - completed_at).total_seconds()) / 60.0
+        close = float(completed.close)
+    except (AttributeError, TypeError, ValueError):
+        return False, "완료 분봉 확인 중"
+    if close <= 0 or age_minutes > 30.0:
+        return False, "완료 분봉 재구성 중"
+    gap_pct = abs(quote.price / close - 1.0) * 100.0 if quote.price > 0 else 100.0
+    if gap_pct > 12.0:
+        return False, "현재가·완료 분봉 불일치"
+    return True, "일치"
+
+
 def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
     """Fetch and analyze one automatic dashboard card from REST history plus live completed bars."""
     rest_quote = load_rest_dashboard_quote(symbol, market.value, exchange)
     live_tick = current_realtime_hub().tick(market, symbol)
     quote = quote_with_live_tick(rest_quote)
     bars = merge_live_completed_bars(load_bars(symbol, market.value, exchange), symbol, market)
+    chart_aligned, chart_alignment_reason = completed_bar_alignment(quote, bars)
     cycle = cycle_store.get(symbol, market, quote.timestamp)
     preliminary = analyze(
         quote, bars, orderbook_required=True, round_trip_cost_pct=cost_pct,
@@ -526,7 +550,7 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
     # used by the strategy-specific 80% calibration; no synthetic history is created.
     scored_cases = store.score_ready(symbol, market.value, bars, float(cost_pct))
     recorded_case = False
-    if plan.entry and plan.target and plan.hard_stop:
+    if chart_aligned and plan.entry and plan.target and plan.hard_stop:
         case = ValidationCase.from_plan(
             plan,
             live_tick.price if live_tick is not None else None,
@@ -544,6 +568,7 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
             "samples": calibration.samples, "probability_pct": calibration.probability_pct,
         },
         "validation_recorded": recorded_case, "validation_scored": scored_cases,
+        "chart_aligned": chart_aligned, "chart_alignment_reason": chart_alignment_reason,
     }
 
 
@@ -645,10 +670,13 @@ def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
     quote: Quote = item["quote"]
     plan = item["plan"]
     structure = dashboard_structure(item)
+    chart_aligned = bool(item.get("chart_aligned", True))
     target_1 = plan.target or (forecast_point_for(plan, 5).base if forecast_point_for(plan, 5) else None)
     target_2 = plan.target2 or (forecast_point_for(plan, 15).base if forecast_point_for(plan, 15) else None)
     support = plan.soft_stop
     stop = plan.hard_stop or plan.invalidation or plan.stop
+    if not chart_aligned:
+        target_1 = target_2 = support = stop = None
     title = f"{quote.symbol} · {item.get('name') or quote.market.value}"
 
     with st.container(border=True):
@@ -663,14 +691,14 @@ def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
         )
         forecast_columns = st.columns(4)
         for column, minutes in zip(forecast_columns, (5, 10, 15, 30)):
-            point = forecast_point_for(plan, minutes)
+            point = forecast_point_for(plan, minutes) if chart_aligned else None
             column.metric(
                 f"{minutes}분 예상",
                 price_text(point.base if point else None),
                 forecast_direction_text(point),
             )
         prices = st.columns(2)
-        prices[0].metric("추천 매수가", buy_range_text(plan, quote))
+        prices[0].metric("추천 매수가", buy_range_text(plan, quote) if chart_aligned else "완료 분봉 확인 중")
         prices[1].metric("추천 매도가 1차", price_text(target_1))
         exits = st.columns(3)
         exits[0].metric("추천 매도가 2차", price_text(target_2))
