@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from scanner.kis_client import KISClient, KISError
+from scanner.kis_client import KISClient, KISError, secrets_fingerprint
 from scanner.models import Market
 
 
@@ -57,6 +57,19 @@ def test_manual_streamlit_token_never_issues_a_new_token(tmp_path):
     client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
     assert client.token_mode == "수동 토큰"
     assert client._token() == "daily-token"
+
+
+def test_nested_streamlit_secret_section_is_supported(tmp_path):
+    client = KISClient({"kis": {"KIS_ACCESS_TOKEN": "nested-daily-token"}}, cache_dir=tmp_path)
+    assert client.token_mode == "수동 토큰"
+    assert client._token() == "nested-daily-token"
+
+
+def test_secrets_fingerprint_changes_without_exposing_secret_value():
+    before = secrets_fingerprint({"KIS_ACCESS_TOKEN": "token-a"})
+    after = secrets_fingerprint({"KIS_ACCESS_TOKEN": "token-b"})
+    assert before != after
+    assert "token-a" not in before and "token-b" not in after
 
 
 def test_token_issuance_is_disabled_without_explicit_local_opt_in(tmp_path):

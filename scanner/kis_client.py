@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -22,6 +23,11 @@ class KISError(RuntimeError):
 
 
 def _secret(names: tuple[str, ...], secrets: Any | None = None, default: str = "") -> str:
+    """Read a KIS value from top-level or common nested Streamlit Secrets.
+
+    Values are never logged. Nested support makes `[kis]` / `[KIS]` TOML
+    sections work alongside the documented top-level Secrets format.
+    """
     for name in names:
         if secrets is not None:
             try:
@@ -30,9 +36,29 @@ def _secret(names: tuple[str, ...], secrets: Any | None = None, default: str = "
                     return str(value)
             except Exception:
                 pass
+            for section_name in ("kis", "KIS"):
+                try:
+                    section = secrets[section_name]
+                    value = section[name]
+                    if value:
+                        return str(value)
+                except Exception:
+                    pass
         if os.getenv(name):
             return str(os.getenv(name))
     return default
+
+
+def secrets_fingerprint(secrets: Any | None = None) -> str:
+    """Return an opaque fingerprint to invalidate cached clients after a secret edit."""
+    fields = (
+        _secret(("KIS_APP_KEY", "APP_KEY", "app_key"), secrets),
+        _secret(("KIS_APP_SECRET", "APP_SECRET", "app_secret"), secrets),
+        _secret(("KIS_ACCESS_TOKEN", "ACCESS_TOKEN"), secrets),
+        _secret(("KIS_BASE_URL", "BASE_URL"), secrets),
+        _secret(("KIS_ALLOW_TOKEN_ISSUE",), secrets, "false"),
+    )
+    return hashlib.sha256("\x1f".join(fields).encode("utf-8")).hexdigest()
 
 
 def _as_bool(value: str) -> bool:
