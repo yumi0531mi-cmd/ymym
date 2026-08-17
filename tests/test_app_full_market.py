@@ -95,8 +95,9 @@ def test_connected_app_automatically_renders_live_candidate_card_without_user_se
 
     assert not app.exception
     assert not app.button
-    assert any("실시간 반복단타 후보" in str(item.value) for item in app.markdown)
-    assert any("trade-card" in str(item.value) and "1차 목표" in str(item.value) for item in app.markdown)
+    assert any("실시간 상승·반복단타 혼합 스캐너" in str(item.value) for item in app.markdown)
+    assert any("005930" in str(item.value) for item in app.subheader)
+    assert {metric.label for metric in app.metric} >= {"현재가", "진입 기준가", "1차 목표 · 5분", "2차 목표 · 5분", "Hard Stop"}
     assert any("실시간 현재가 기준" in str(item.value) for item in app.markdown)
 
 
@@ -126,4 +127,36 @@ def test_ranking_error_falls_back_to_liquid_candidates_and_still_renders_cards()
 
     assert not app.exception
     assert any("유동성 시작목록 자동 대체" in str(item.value) for item in app.markdown)
-    assert any("trade-card" in str(item.value) for item in app.markdown)
+    assert any("005930" in str(item.value) for item in app.subheader)
+    assert any("유동성 시작목록 자동 대체" in str(item.value) for item in app.caption)
+
+
+def test_korean_name_direct_search_adds_requested_stock_card():
+    original_init = KISClient.__init__
+
+    def init_with_mock_token(self, secrets=None, cache_dir=".scanner_cache"):
+        original_init(
+            self,
+            {"KIS_APP_KEY": "test-key", "KIS_APP_SECRET": "test-secret", "KIS_ACCESS_TOKEN": "test-token"},
+            cache_dir=cache_dir,
+        )
+
+    st.cache_resource.clear()
+    st.cache_data.clear()
+    with (
+        patch.object(KISClient, "__init__", init_with_mock_token),
+        patch.object(KISClient, "market_rankings", return_value=MOCK_RANKINGS),
+        patch.object(KISClient, "quote", side_effect=_quote_for_symbol),
+        patch.object(KISClient, "orderbook", return_value=(69900, 70000)),
+        patch.object(KISClient, "intraday", side_effect=_bars),
+        patch("scanner.engine.analyze", side_effect=_plan),
+        patch("scanner.calibration.calibration_for", return_value=SimpleNamespace(probability_pct=None, samples=0)),
+    ):
+        app = AppTest.from_file(APP_PATH)
+        app.run(timeout=30)
+        next(widget for widget in app.text_input if widget.label == "관심 종목 바로 보기").set_value("현대차")
+        app.run(timeout=30)
+
+    assert not app.exception
+    assert any("005380" in str(item.value) and "현대차" in str(item.value) for item in app.subheader)
+    assert any("관심 종목 직접 검색" in str(item.value) for item in app.caption)

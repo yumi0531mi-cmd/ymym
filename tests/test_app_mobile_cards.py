@@ -72,6 +72,5 @@ def test_automatic_candidate_renders_mobile_trade_card_without_user_selection():
 
     assert not app.exception
     assert not app.button
-    card_html = "\n".join(str(item.value) for item in app.markdown if "trade-card" in str(item.value))
-    assert "005930" in card_html
-    assert "1차 목표" in card_html and "2차 목표" in card_html and "Hard Stop" in card_html
+    assert any("005930" in str(item.value) for item in app.subheader)
+    assert {metric.label for metric in app.metric} >= {"현재가", "진입 기준가", "1차 목표 · 5분", "2차 목표 · 5분", "Hard Stop"}

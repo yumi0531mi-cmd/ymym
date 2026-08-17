@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,21 +16,22 @@ from scanner.cycle import CycleStore
 from scanner.engine import analyze
 from scanner.kis_client import KISClient, KISError, secrets_fingerprint
 from scanner.market_screener import merge_rankings
-from scanner.models import Market, Quote, Signal
+from scanner.models import Market, Quote, Regime, Signal
 from scanner.persistence import EventStore
 from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationStore
 
-APP_VERSION = "5.3-live-dashboard"
+APP_VERSION = "5.4-mixed-live-scanner"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
-CLIENT_CACHE_VERSION = "client-contract-v4-live-dashboard"
+CLIENT_CACHE_VERSION = "client-contract-v5-mixed-search"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 MAX_CARD_CANDIDATES = 3
+KR_SEARCH_INDEX_PATH = Path("data/kr_stock_index.json")
 
 st.set_page_config(
-    page_title="반복단타 후보 카드",
+    page_title="상승·반복단타 혼합 스캐너",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="auto",
@@ -233,6 +235,48 @@ def scan_starter_universe(market_value: str) -> tuple[list[tuple[str, float]], l
     return [(quote.symbol, float(quote.change_pct)) for quote in ranked], errors
 
 
+@st.cache_data(show_spinner=False)
+def load_kr_search_index() -> list[dict[str, str]]:
+    """Load the bundled KRX name/code index without making a KIS request."""
+    try:
+        payload = json.loads(KR_SEARCH_INDEX_PATH.read_text(encoding="utf-8"))
+        return [dict(item) for item in payload.get("items", []) if isinstance(item, dict)]
+    except (OSError, ValueError, TypeError):
+        return [
+            {"symbol": item.symbol, "name": item.name, "market": ""}
+            for item in KR_LIQUID
+        ]
+
+
+def search_kr_stock(query: str, limit: int = 6) -> list[dict[str, str]]:
+    needle = query.strip().replace(" ", "")
+    if not needle:
+        return []
+    items = load_kr_search_index()
+    if needle.isdigit():
+        padded = needle.zfill(6)
+        return [item for item in items if item.get("symbol") == padded][:limit]
+    exact = [item for item in items if str(item.get("name") or "").replace(" ", "") == needle]
+    partial = [item for item in items if needle in str(item.get("name") or "").replace(" ", "")]
+    return (exact + [item for item in partial if item not in exact])[:limit]
+
+
+def us_exchange_for(symbol: str) -> str:
+    normalized = symbol.strip().upper()
+    for item in US_LIQUID:
+        if item.symbol == normalized:
+            return item.exchange
+    return "NAS"
+
+
+def repeat_band_pct(plan: Any) -> float | None:
+    if not plan.repeat_box or plan.current_price <= 0:
+        return None
+    low, high = plan.repeat_box
+    width = (float(high) - float(low)) / float(plan.current_price) * 100
+    return width if 0.5 <= width <= 5.0 else None
+
+
 def money(value: float | None) -> str:
     if value is None:
         return "미확인"
@@ -306,6 +350,13 @@ def trade_card_html(item: dict[str, Any], cost_pct: float) -> str:
     turnover = quote.turnover
     hard_stop = plan.hard_stop or plan.invalidation or plan.stop
     persistence = plan.persistence_score
+    repeat_width = repeat_band_pct(plan)
+    regime_badge = "상승 추세" if plan.regime == Regime.UP else ("박스권" if plan.regime == Regime.RANGE else "전환·관망")
+    repeat_badge = (
+        f"<span class='badge repeat'>반복단타 가능 {repeat_width:.2f}%</span>"
+        if repeat_width is not None
+        else "<span class='badge'>추세 진입 관찰</span>"
+    )
     card = f"""
 <section class="trade-card">
       <div class="card-top">
@@ -315,6 +366,8 @@ def trade_card_html(item: dict[str, Any], cost_pct: float) -> str:
   </div>
   <div class="badges">
     <span class="badge {signal_class(plan.signal)}">{html.escape(plan.signal.value)}</span>
+    <span class="badge trend">{regime_badge}</span>
+    {repeat_badge}
     <span class="badge risk">위험: {html.escape(plan.risk_state)}</span>
     <span class="badge">점수 {plan.score}/100</span>
     <span class="badge">지속성 {persistence if persistence is not None else '미확인'}</span>
@@ -339,6 +392,44 @@ def trade_card_html(item: dict[str, Any], cost_pct: float) -> str:
 </section>
 """
     return card
+
+
+def mixed_card_priority(item: dict[str, Any]) -> tuple[int, int, int]:
+    plan = item["plan"]
+    trend_rank = 2 if plan.regime == Regime.UP else (1 if plan.regime == Regime.RANGE else 0)
+    repeat_rank = 1 if repeat_band_pct(plan) is not None else 0
+    return (trend_rank, repeat_rank, plan.score)
+
+
+def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
+    """Render a safe native Streamlit card so live values never appear as HTML text."""
+    quote: Quote = item["quote"]
+    plan = item["plan"]
+    hard_stop = plan.hard_stop or plan.invalidation or plan.stop
+    repeat_width = repeat_band_pct(plan)
+    state = "상승 추세" if plan.regime == Regime.UP else ("박스권" if plan.regime == Regime.RANGE else "전환·관망")
+    repeat_text = f"반복단타 가능 · 폭 {repeat_width:.2f}%" if repeat_width is not None else "추세 진입 관찰"
+    title = f"{quote.symbol} · {item.get('name') or quote.market.value}"
+
+    with st.container(border=True):
+        st.subheader(title)
+        st.caption(f"{item.get('candidate_source') or '시장 실시간 순위'} · {quote.session} · {plan.strategy}")
+        top = st.columns(2)
+        top[0].metric("현재가", price_text(quote.price), f"{quote.change_pct:+.2f}%")
+        top[1].metric("신호", plan.signal.value, f"{state} · 점수 {plan.score}/100")
+        st.caption(f"구조: {repeat_text} · 위험 상태: {plan.risk_state}")
+        levels = st.columns(3)
+        levels[0].metric("진입 기준가", price_text(plan.entry))
+        levels[1].metric("1차 목표 · 5분", price_text(plan.target))
+        levels[2].metric("2차 목표 · 5분", price_text(plan.target2))
+        stops = st.columns(3)
+        stops[0].metric("Soft Stop", price_text(plan.soft_stop))
+        stops[1].metric("Hard Stop", price_text(hard_stop))
+        stops[2].metric("비용 반영 손익비", number_text(plan.diagnostics.get("reward_risk_net")))
+        reasons = " · ".join(str(reason) for reason in (plan.reasons or [])[:2]) or "특별 경고 없음"
+        st.caption(f"판단 근거: {reasons}")
+        st.caption(f"현재가 60초 갱신 · 구조 10분 · 호가 15분 · 왕복비용 가정 {cost_pct:.2f}% · 주문 기능 없음")
+        render_card_detail(item)
 
 
 def render_card_detail(item: dict[str, Any]) -> None:
@@ -384,6 +475,10 @@ with st.sidebar:
     st.title("실시간 설정")
     market_label = st.radio("시장", ["국내", "미국"], horizontal=True)
     market = Market.KR if market_label == "국내" else Market.US
+    search_query = st.text_input(
+        "관심 종목 바로 보기",
+        placeholder="국내: 현대차 또는 005380 · 미국: NVDA",
+    ).strip()
     cost_default = 0.05 if market == Market.KR else 0.10
     cost_pct = st.number_input("왕복비용 가정(%)", min_value=0.0, max_value=5.0, value=cost_default, step=0.01)
     min_score = st.slider("최소 신호 점수", min_value=60, max_value=100, value=80, step=5)
@@ -402,10 +497,29 @@ if kis_connected:
     # permitted minimum cadence and refreshes all visible card prices automatically.
     st_autorefresh(interval=60_000, key=f"live_dashboard_{market.value}")
 
-st.markdown("<div class='mobile-head'><h1>실시간 반복단타 후보</h1><p>현재가 · 진입 기준가 · 5분 1차/2차 목표 · 구조 손절가를 열자마자 비교합니다.</p></div>", unsafe_allow_html=True)
+st.markdown("<div class='mobile-head'><h1>실시간 상승·반복단타 혼합 스캐너</h1><p>상승 추세 후보의 현재가 · 진입 기준가 · 5분 1차/2차 목표 · 구조 손절가를 바로 비교하고, 반복단타 구조는 별도로 구분합니다.</p></div>", unsafe_allow_html=True)
 
 cards: list[dict[str, Any]] = []
 errors: list[str] = []
+direct_request: dict[str, str] | None = None
+if search_query:
+    if market == Market.KR:
+        matches = search_kr_stock(search_query)
+        if len(matches) == 1:
+            direct_request = {"symbol": matches[0]["symbol"], "name": matches[0]["name"], "exchange": ""}
+        elif len(matches) > 1:
+            labels = [f"{match['name']} · {match['symbol']}" for match in matches]
+            chosen = st.selectbox("국내 검색 결과", labels)
+            chosen_match = matches[labels.index(chosen)]
+            direct_request = {"symbol": chosen_match["symbol"], "name": chosen_match["name"], "exchange": ""}
+        else:
+            st.warning("국내 종목명을 찾지 못했습니다. 예: 현대차, 삼성전자, 005380")
+    else:
+        ticker = search_query.upper().replace(" ", "")
+        if ticker.replace(".", "").replace("-", "").isalnum():
+            direct_request = {"symbol": ticker, "name": ticker, "exchange": us_exchange_for(ticker)}
+        else:
+            st.warning("미국 종목은 티커로 입력해 주세요. 예: NVDA, AAPL, SOXL")
 if not kis_connected:
     st.markdown("<div class='connection wait'>한국투자증권 연결을 기다리고 있습니다. 실제 가격과 매매 레벨은 연결된 데이터가 있을 때만 표시합니다.</div>", unsafe_allow_html=True)
     st.info("연결 확인 — " + " · ".join(f"{name}: {value}" for name, value in client.connection_diagnostics.items()))
@@ -413,7 +527,14 @@ else:
     try:
         with st.spinner("시장 전체에서 실시간 반복단타 후보를 자동으로 찾는 중…"):
             candidates = load_dashboard_candidates(market.value)
+            requests: list[dict[str, Any]] = []
+            if direct_request is not None:
+                requests.append({**direct_request, "candidate_source": "관심 종목 직접 검색"})
             for candidate in candidates[:MAX_CARD_CANDIDATES]:
+                if direct_request is not None and str(candidate["symbol"]) == direct_request["symbol"]:
+                    continue
+                requests.append(candidate)
+            for candidate in requests[:MAX_CARD_CANDIDATES + 1]:
                 symbol = str(candidate["symbol"])
                 exchange = str(candidate.get("exchange") or ("NAS" if market == Market.US else ""))
                 try:
@@ -429,15 +550,15 @@ else:
         st.error("실시간 후보를 가져오지 못했습니다. 잠시 뒤 화면이 자동으로 다시 확인합니다.")
 
 if cards:
+    cards.sort(key=mixed_card_priority, reverse=True)
     updated_at = max(card["quote"].timestamp for card in cards)
     source_labels = {str(card.get("candidate_source") or "시장 실시간 순위") for card in cards}
     source_text = " · ".join(sorted(source_labels))
-    st.markdown(f"<div class='connection ok'>실시간 현재가 기준 {updated_at.strftime('%H:%M:%S')} · {source_text} · 상위 {len(cards)}개 후보를 자동 분석했습니다. 초록색 목표가와 빨간색 손절가는 수동매매 참고선입니다.</div>", unsafe_allow_html=True)
-    st.markdown("<div class='cards-grid'>" + "".join(trade_card_html(card_item, float(cost_pct)) for card_item in cards) + "</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='connection ok'>실시간 현재가 기준 {updated_at.strftime('%H:%M:%S')} · {source_text} · 상승 추세를 우선으로 {len(cards)}개를 분석했습니다. `반복단타 가능`은 추가 구조 표시이며, 초록색 목표가와 빨간색 손절가는 수동매매 참고선입니다.</div>", unsafe_allow_html=True)
     for card_item in cards:
-        render_card_detail(card_item)
+        render_live_card(card_item, float(cost_pct))
 elif kis_connected and not errors:
-    st.info("현재 0.5~5% 반복폭과 필수 조건을 함께 통과한 후보가 없습니다. 화면은 60초마다 자동으로 다시 확인합니다.")
+    st.info("현재 분석할 상승 추세 후보가 없습니다. 화면은 60초마다 자동으로 다시 확인합니다. 관심 종목은 왼쪽 검색칸에 바로 입력할 수 있습니다.")
 
 for error in errors:
     st.warning(f"일부 후보는 분석 데이터를 만들지 못했습니다: {error}")
