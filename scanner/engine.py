@@ -13,7 +13,7 @@ from .strategy import confirmed_levels, fake_signal_flags, multi_timeframe, pric
 from .strategy_ensemble import evaluate_ensemble
 
 
-ACTIVE_SESSIONS = {"KR_REGULAR", "US_PRE", "US_REGULAR", "US_AFTER"}
+ACTIVE_SESSIONS = {"KR_REGULAR", "US_DAY", "US_PRE", "US_REGULAR", "US_AFTER"}
 
 
 def _max_spread(quote: Quote) -> float:

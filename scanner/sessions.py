@@ -16,6 +16,12 @@ def market_session(market: Market, now: datetime | None = None) -> str:
         if local.weekday() < 5 and time(9, 0) <= local.time() <= time(15, 30):
             return "KR_REGULAR"
         return "KR_CLOSED"
+    # 한국투자증권의 미국 주간거래는 한국시간 기준으로 운영된다.
+    # 미국 서머타임 동안에는 10:00~17:00, 그 외에는 10:00~18:00이다.
+    kr_local = now.astimezone(KST)
+    day_end = time(17, 0) if bool(now.astimezone(ET).dst()) else time(18, 0)
+    if kr_local.weekday() < 5 and time(10, 0) <= kr_local.time() < day_end:
+        return "US_DAY"
     local = now.astimezone(ET)
     if local.weekday() >= 5:
         return "US_CLOSED"
@@ -37,6 +43,10 @@ def session_end(market: Market, now: datetime | None = None) -> datetime | None:
         if market_session(market, local) != "KR_REGULAR":
             return None
         return datetime.combine(local.date(), time(15, 30), tzinfo=KST)
+    if market_session(market, now) == "US_DAY":
+        kr_local = now.astimezone(KST)
+        day_end = time(17, 0) if bool(now.astimezone(ET).dst()) else time(18, 0)
+        return datetime.combine(kr_local.date(), day_end, tzinfo=KST)
     local = now.astimezone(ET)
     current = market_session(market, local)
     ends = {

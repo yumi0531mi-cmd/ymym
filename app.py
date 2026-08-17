@@ -641,6 +641,10 @@ with st.sidebar:
     budget = client.budget_status
     st.caption(f"호출 보호: 1분 {budget.minute_used}/{budget.minute_limit} · 5시간 {budget.five_hour_used}/{budget.five_hour_limit}")
     st.caption(realtime_hub.status_label())
+    if event_store.configured:
+        st.caption("검증 성과 저장: 영구 보관 연결됨")
+    else:
+        st.caption("검증 성과 저장: 앱 재시작 시 초기화될 수 있음 · [한 번만 설정하는 안내](https://github.com/yumi0531mi-cmd/ymym/blob/main/docs/supabase_persistent_validation_setup.md)")
     st.caption("상승 후보 목록 30분 · KIS 체결 현재가 1초 · 완료봉 구조 1~5분 · 호가 재확인 15분")
 
 kis_connected = client.ready
@@ -744,4 +748,4 @@ for error in errors:
     st.warning(f"일부 후보는 분석 데이터를 만들지 못했습니다: {error}")
 
 with st.expander("숫자와 전략 신호 읽는 법"):
-    st.markdown("**현재가** 영역만 KIS 공식 실시간 체결가로 1초마다 갱신되며, 나머지 후보 목록·카드·차트는 다시 로딩하지 않습니다. 재연결 중에는 REST 현재가를 임시 표시합니다. **진입 기준가·1차/2차 목표가·손절가**는 완료된 1분봉과 5분봉 구조, 거래량·거래대금·호가 상태에 따라 계산합니다. `강한 매수 검토 · 실측 80% 이상`은 동일 전략·세션·점수 구간의 사후 표본이 30건 이상이고 1차 목표가가 Hard Stop보다 먼저 도달한 비율이 80% 이상일 때만 표시합니다. 표본 부족 구간은 80%라고 표시하지 않고 누적 상태로 남깁니다.")
+    st.markdown("**현재가** 영역만 KIS 공식 실시간 체결가로 1초마다 갱신되며, 나머지 후보 목록·카드·차트는 다시 로딩하지 않습니다. 재연결 중에는 REST 현재가를 임시 표시합니다. **진입 기준가·1차/2차 목표가·손절가**는 완료된 1분봉과 5분봉 구조, 거래량·거래대금·호가 상태에 따라 계산합니다. `강한 매수 검토 · 실측 80% 이상`은 동일 전략·세션·점수 구간의 사후 표본이 30건 이상이고, 최근 30건에서도 1차 목표가가 Hard Stop보다 먼저 도달한 비율이 80% 이상이며, 왕복비용을 뺀 평균 결과가 양수일 때만 표시합니다. 표본 부족 구간은 80%라고 표시하지 않고 누적 상태로 남깁니다.")
