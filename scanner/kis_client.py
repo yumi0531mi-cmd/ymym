@@ -105,7 +105,8 @@ class KISClient:
 
     Community Cloud deployments can use a daily KIS_ACCESS_TOKEN when supplied, or
     issue one only on the first protected KIS request when no valid token is cached.
-    Token issuance never occurs while the app's initial screen is rendered.
+    The live dashboard's initial candidate scan is a protected request, so it may
+    issue the daily token once when the user opens the app.
     """
 
     def __init__(self, secrets: Any | None = None, cache_dir: str | Path = ".scanner_cache"):
@@ -328,6 +329,14 @@ class KISClient:
             bid = self._number(out, "pbid1", "bidp1", "bid")
             ask = self._number(out, "pask1", "askp1", "ask")
         return (bid or None, ask or None)
+
+    def orderbook(self, symbol: str, market: Market, exchange: str = "NAS") -> tuple[float | None, float | None]:
+        """Return best bid/ask for a cached execution-safety check.
+
+        The dashboard refreshes last price more frequently than this method so it
+        can stay inside the five-hour KIS request budget.
+        """
+        return self._orderbook(symbol.strip().upper(), market, exchange)
 
     def quote(self, symbol: str, market: Market, exchange: str = "NAS", include_orderbook: bool = True) -> Quote:
         symbol = symbol.strip().upper()

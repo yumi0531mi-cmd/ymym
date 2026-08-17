@@ -21,10 +21,10 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationStore
 
-APP_VERSION = "5.2.1-mobile-cards"
+APP_VERSION = "5.3-live-dashboard"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
-CLIENT_CACHE_VERSION = "client-contract-v3-auto-token"
+CLIENT_CACHE_VERSION = "client-contract-v4-live-dashboard"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 MAX_CARD_CANDIDATES = 3
 
@@ -133,23 +133,50 @@ def _quote_from_cache_record(record: dict[str, object]) -> Quote:
     )
 
 
-@st.cache_data(ttl=10, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def _load_quote_record(symbol: str, market_value: str, exchange: str) -> dict[str, object]:
+    # Last price is the only per-card request made every minute.
     quote = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).quote(
-        symbol, Market(market_value), exchange, include_orderbook=True
+        symbol, Market(market_value), exchange, include_orderbook=False
     )
     return _quote_to_cache_record(quote)
 
 
-def load_quote(symbol: str, market_value: str, exchange: str) -> Quote:
-    return _quote_from_cache_record(_load_quote_record(symbol, market_value, exchange))
+@st.cache_data(ttl=900, show_spinner=False)
+def _load_orderbook(symbol: str, market_value: str, exchange: str) -> tuple[float | None, float | None]:
+    # Execution safety is refreshed every 15 minutes; it is not falsely presented
+    # as tick-by-tick orderbook data.
+    return get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).orderbook(
+        symbol, Market(market_value), exchange
+    )
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+def load_dashboard_quote(symbol: str, market_value: str, exchange: str) -> Quote:
+    quote = _quote_from_cache_record(_load_quote_record(symbol, market_value, exchange))
+    bid, ask = _load_orderbook(symbol, market_value, exchange)
+    return Quote(
+        symbol=quote.symbol, market=quote.market, price=quote.price,
+        previous_close=quote.previous_close, timestamp=quote.timestamp,
+        bid=bid, ask=ask, volume=quote.volume, turnover=quote.turnover,
+        session=quote.session, source=quote.source,
+    )
+
+
+@st.cache_data(ttl=600, show_spinner=False)
 def load_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
+    # Completed 1-minute bars are refreshed every 10 minutes. Current price above
+    # remains live every minute, while 5-minute structure stays stable and explainable.
     return get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).intraday(
         symbol, Market(market_value), exchange
     )
+
+
+@st.cache_data(ttl=7200, show_spinner=False)
+def load_dashboard_candidates(market_value: str) -> list[dict[str, Any]]:
+    """Return the best automatic card candidates without asking the user to choose."""
+    market = Market(market_value)
+    rankings = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).market_rankings(market)
+    return [candidate.to_dict() for candidate in merge_rankings(market, rankings, limit=MAX_CARD_CANDIDATES)]
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -202,8 +229,8 @@ def signal_class(signal: Signal) -> str:
 
 
 def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
-    """Fetch and analyze one explicitly selected card candidate (max three per run)."""
-    quote = load_quote(symbol, market.value, exchange)
+    """Fetch and analyze one automatic dashboard card (maximum three)."""
+    quote = load_dashboard_quote(symbol, market.value, exchange)
     bars = load_bars(symbol, market.value, exchange)
     cycle = cycle_store.get(symbol, market, quote.timestamp)
     preliminary = analyze(
@@ -246,8 +273,9 @@ def trade_card_html(item: dict[str, Any], cost_pct: float) -> str:
     persistence = plan.persistence_score
     card = f"""
 <section class="trade-card">
-  <div class="card-top">
-    <div><div class="ticker">{html.escape(quote.symbol)}</div><div class="name">{html.escape(quote.market.value)} · {html.escape(quote.session)} · {html.escape(plan.strategy)}</div></div>
+      <div class="card-top">
+    <div><div class="ticker">{html.escape(quote.symbol)}</div><div class="name">{html.escape(str(item.get('name') or quote.market.value))} · {html.escape(quote.session)} · {html.escape(plan.strategy)}</div></div>
+
     <div><div class="price">{price_text(quote.price)}</div><div class="change {change_class}">{change:+.2f}%</div></div>
   </div>
   <div class="badges">
@@ -318,108 +346,63 @@ cycle_store = get_cycle_store()
 store = ValidationStore(VALIDATION_ROOT, event_store=event_store)
 
 with st.sidebar:
-    st.title("📈 카드 설정")
-    market_label = st.radio("시장", ["국내 정규장", "미국 전 세션"], horizontal=True)
-    market = Market.KR if market_label.startswith("국내") else Market.US
-    symbol = st.text_input("직접 볼 종목", placeholder="005930 또는 SOXL").strip().upper()
-    exchange = st.selectbox("미국 거래소", ["NAS", "NYS", "AMS"], disabled=market == Market.KR)
-    kis_connected = client.ready
-    auto_token_pending = client.token_mode == "필요 시 1회 자동 발급"
-    if kis_connected and auto_token_pending:
-        st.info("한국투자증권 연결 준비됨\n\n첫 검색을 누를 때 오늘 토큰을 1회 자동 발급합니다.")
-    elif kis_connected:
-        st.success("한국투자증권 연결됨")
-    else:
-        st.warning("한국투자증권 연결 대기 중\n\n연결되면 아래 검색 버튼이 켜집니다.")
-        status = client.connection_diagnostics
-        st.caption(" · ".join(f"{name}: {value}" for name, value in status.items()))
-    full_market_scan_now = st.button("전종목 후보 찾기", use_container_width=True, disabled=not kis_connected)
-    direct_card_now = st.button("입력 종목 카드 만들기", type="primary", use_container_width=True, disabled=not kis_connected or not symbol)
-    live = st.toggle("60초 카드 새로고침", False, disabled=not kis_connected)
+    st.title("실시간 설정")
+    market_label = st.radio("시장", ["국내", "미국"], horizontal=True)
+    market = Market.KR if market_label == "국내" else Market.US
     cost_default = 0.05 if market == Market.KR else 0.10
     cost_pct = st.number_input("왕복비용 가정(%)", min_value=0.0, max_value=5.0, value=cost_default, step=0.01)
     min_score = st.slider("최소 신호 점수", min_value=60, max_value=100, value=80, step=5)
+    if client.ready:
+        st.success("실시간 후보 자동 분석 중")
+    else:
+        st.warning("한국투자증권 연결 대기 중")
+        st.caption(" · ".join(f"{name}: {value}" for name, value in client.connection_diagnostics.items()))
     budget = client.budget_status
     st.caption(f"호출 보호: 1분 {budget.minute_used}/{budget.minute_limit} · 5시간 {budget.five_hour_used}/{budget.five_hour_limit}")
-    st.caption("카드는 최대 3개만 정밀 분석합니다. 자동 주문은 없습니다.")
+    st.caption("현재가 60초 · 구조/호가 10~15분 갱신 · 자동 주문 없음")
 
-if live and symbol and kis_connected:
-    st_autorefresh(interval=60_000, key="mobile_card_refresh")
+kis_connected = client.ready
+if kis_connected:
+    # This is a dashboard, not a button-driven analysis form. It reruns at the
+    # permitted minimum cadence and refreshes all visible card prices automatically.
+    st_autorefresh(interval=60_000, key=f"live_dashboard_{market.value}")
 
-st.markdown("<div class='mobile-head'><h1>반복단타 후보 카드</h1><p>여러 후보의 진입 기준가 · 5분 목표가 · 구조 손절가를 휴대전화에서 비교합니다.</p></div>", unsafe_allow_html=True)
-if kis_connected and auto_token_pending:
-    st.markdown("<div class='connection ok'>한국투자증권 연결 준비가 끝났습니다. <b>전종목 후보 찾기</b> 또는 <b>입력 종목 카드 만들기</b>를 처음 누를 때에만 오늘 토큰을 1회 자동 발급합니다. 이후에는 임시 보관 토큰을 재사용합니다.</div>", unsafe_allow_html=True)
-elif kis_connected:
-    st.markdown("<div class='connection ok'>한국투자증권 연결이 준비되었습니다. 전종목 후보를 찾거나 종목코드를 입력해 카드로 확인하세요.</div>", unsafe_allow_html=True)
+st.markdown("<div class='mobile-head'><h1>실시간 반복단타 후보</h1><p>현재가 · 진입 기준가 · 5분 1차/2차 목표 · 구조 손절가를 열자마자 비교합니다.</p></div>", unsafe_allow_html=True)
+
+cards: list[dict[str, Any]] = []
+errors: list[str] = []
+if not kis_connected:
+    st.markdown("<div class='connection wait'>한국투자증권 연결을 기다리고 있습니다. 실제 가격과 매매 레벨은 연결된 데이터가 있을 때만 표시합니다.</div>", unsafe_allow_html=True)
+    st.info("연결 확인 — " + " · ".join(f"{name}: {value}" for name, value in client.connection_diagnostics.items()))
 else:
-    status = client.connection_diagnostics
-    st.markdown("<div class='connection wait'>한국투자증권 연결을 기다리고 있습니다. 연결되기 전에는 가격을 임의로 보여 주지 않으며, 검색 버튼도 자동으로 막습니다.</div>", unsafe_allow_html=True)
-    st.info("연결 확인 — " + " · ".join(f"{name}: {value}" for name, value in status.items()))
-
-if full_market_scan_now:
     try:
-        with st.spinner("시장 전체 순위에서 1차 후보를 찾는 중…"):
-            full_rankings = client.market_rankings(market)
-            full_candidates = merge_rankings(market, full_rankings, limit=20)
-        st.session_state["full_market"] = market.value
-        st.session_state["full_candidates"] = [candidate.to_dict() for candidate in full_candidates]
-        st.session_state["mobile_cards"] = []
-    except KISError as exc:
-        st.error("후보를 가져오지 못했습니다. 잠시 뒤 다시 시도해 주세요." if "KIS_ACCESS_TOKEN" not in str(exc) else "한국투자증권 연결이 아직 준비되지 않았습니다.")
+        with st.spinner("시장 전체에서 실시간 반복단타 후보를 자동으로 찾는 중…"):
+            candidates = load_dashboard_candidates(market.value)
+            for candidate in candidates[:MAX_CARD_CANDIDATES]:
+                symbol = str(candidate["symbol"])
+                exchange = str(candidate.get("exchange") or ("NAS" if market == Market.US else ""))
+                try:
+                    card = analyze_card(symbol, market, exchange, float(cost_pct), int(min_score), store)
+                    card["name"] = str(candidate.get("name") or symbol)
+                    cards.append(card)
+                except (KISError, ValueError, KeyError, OSError) as exc:
+                    errors.append(f"{symbol}: {type(exc).__name__}")
+                except Exception:
+                    errors.append(f"{symbol}: 분석 준비 오류")
+    except KISError:
+        st.error("실시간 후보를 가져오지 못했습니다. 잠시 뒤 화면이 자동으로 다시 확인합니다.")
 
-selected_requests: list[dict[str, str]] = []
-if st.session_state.get("full_market") == market.value and st.session_state.get("full_candidates"):
-    candidates = list(st.session_state["full_candidates"])
-    st.subheader("전종목 1차 후보")
-    st.caption("거래대금·거래량·상승률 순위를 먼저 걸러 낸 후보입니다. 아래에서 최대 3개만 골라 카드로 정밀 분석하세요.")
-    labels = [f"{candidate['symbol']} · {candidate.get('name') or '종목명 미확인'}" for candidate in candidates]
-    label_map = {label: candidate for label, candidate in zip(labels, candidates)}
-    for candidate in candidates[:8]:
-        change = candidate.get("change_pct")
-        change_text = f"{float(change):+.2f}%" if isinstance(change, (int, float)) else "등락률 미확인"
-        st.markdown(f"<div class='candidate-row'><span><b>{html.escape(str(candidate['symbol']))}</b> <small>{html.escape(str(candidate.get('name') or ''))}</small></span><span>{change_text} · 점수 {candidate.get('screen_score', '-')}</span></div>", unsafe_allow_html=True)
-    chosen_labels = st.multiselect("카드로 자세히 볼 후보 (최대 3개)", labels, max_selections=MAX_CARD_CANDIDATES)
-    if st.button("선택 후보 카드 만들기", type="primary", use_container_width=True, disabled=not kis_connected or not chosen_labels):
-        selected_requests = [
-            {"symbol": str(label_map[label]["symbol"]), "exchange": str(label_map[label].get("exchange") or exchange)}
-            for label in chosen_labels
-        ]
-
-if direct_card_now and symbol:
-    selected_requests = [{"symbol": symbol, "exchange": exchange}]
-
-if selected_requests or (live and symbol and kis_connected):
-    requests = selected_requests or [{"symbol": symbol, "exchange": exchange}]
-    cards: list[dict[str, Any]] = []
-    errors: list[str] = []
-    with st.spinner("선택 종목의 현재가·호가·1분봉을 확인해 카드를 만드는 중…"):
-        for request in requests[:MAX_CARD_CANDIDATES]:
-            try:
-                cards.append(analyze_card(request["symbol"], market, request["exchange"], float(cost_pct), int(min_score), store))
-            except (KISError, ValueError, KeyError, OSError) as exc:
-                errors.append(f"{request['symbol']}: {type(exc).__name__}")
-            except Exception:
-                errors.append(f"{request['symbol']}: 분석 준비 오류")
-    st.session_state["mobile_cards"] = cards
-    st.session_state["mobile_card_errors"] = errors
-
-cards = st.session_state.get("mobile_cards") or []
 if cards:
-    st.subheader(f"정밀 분석 카드 · {len(cards)}개")
-    st.markdown(
-        "<div class='cards-grid'>" + "".join(trade_card_html(card_item, float(cost_pct)) for card_item in cards) + "</div>",
-        unsafe_allow_html=True,
-    )
+    updated_at = max(card["quote"].timestamp for card in cards)
+    st.markdown(f"<div class='connection ok'>실시간 현재가 기준 {updated_at.strftime('%H:%M:%S')} · 상위 {len(cards)}개 후보를 자동 분석했습니다. 초록색 목표가와 빨간색 손절가는 수동매매 참고선입니다.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='cards-grid'>" + "".join(trade_card_html(card_item, float(cost_pct)) for card_item in cards) + "</div>", unsafe_allow_html=True)
     for card_item in cards:
         render_card_detail(card_item)
-elif kis_connected:
-    st.info("왼쪽에서 **전종목 후보 찾기**를 누른 뒤 최대 3개를 고르거나, 종목코드를 입력해 카드로 확인하세요.")
+elif kis_connected and not errors:
+    st.info("현재 0.5~5% 반복폭과 필수 조건을 함께 통과한 후보가 없습니다. 화면은 60초마다 자동으로 다시 확인합니다.")
 
-for error in st.session_state.get("mobile_card_errors") or []:
-    st.warning(f"일부 카드를 만들지 못했습니다: {error}")
+for error in errors:
+    st.warning(f"일부 후보는 분석 데이터를 만들지 못했습니다: {error}")
 
-with st.expander("이 카드가 보여 주는 것"):
-    st.markdown("**초록색 목표가**는 완료된 5분봉 구조를 기준으로 계산합니다. **빨간색 손절가**는 구조가 무효가 되는 참고선입니다. 신호가 `대기` 또는 `차단`이면 가격이 보이더라도 매수 권유가 아닙니다. 화면을 여는 것만으로는 KIS 시세를 요청하지 않습니다.")
-
-with st.expander("연결이 계속 안 될 때"):
-    st.markdown("앱의 노란 안내가 계속 보이면, 저장된 한국투자증권 연결 정보가 새 앱에 전달되지 않은 상태입니다. 종목 검색 버튼이 회색일 때는 버튼을 반복해서 누르지 마세요. 앱 관리 화면의 Settings에서 연결 정보를 다시 저장한 뒤 앱을 재시작하면 됩니다. 실제 토큰·앱키 값은 누구에게도 보내지 마세요.")
+with st.expander("숫자 읽는 법"):
+    st.markdown("**현재가**는 60초마다 갱신합니다. **진입 기준가·1차/2차 목표가·손절가**는 완료된 1분봉과 5분봉 구조, 거래량·거래대금·호가 안전성에 따라 계산합니다. 신호가 `대기` 또는 `진입 금지`이면 가격이 표시돼도 매수 권유가 아닙니다. 자동 주문 기능은 없습니다.")
