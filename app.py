@@ -11,7 +11,7 @@ from streamlit_autorefresh import st_autorefresh
 
 from scanner.engine import analyze
 from scanner.kis_client import KISClient, KISError
-from scanner.models import Market, Signal
+from scanner.models import Market, Quote, Signal
 from scanner.persistence import EventStore, ManualTrade, PersistenceError, save_manual_trade
 from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
@@ -44,9 +44,47 @@ def get_event_store() -> EventStore:
     return EventStore(st.secrets)
 
 
+def _quote_to_cache_record(quote: Quote) -> dict[str, object]:
+    """Convert a slots dataclass to basic types before using st.cache_data."""
+    return {
+        "symbol": quote.symbol,
+        "market": quote.market.value,
+        "price": quote.price,
+        "previous_close": quote.previous_close,
+        "timestamp": quote.timestamp.isoformat(),
+        "bid": quote.bid,
+        "ask": quote.ask,
+        "volume": quote.volume,
+        "turnover": quote.turnover,
+        "session": quote.session,
+        "source": quote.source,
+    }
+
+
+def _quote_from_cache_record(record: dict[str, object]) -> Quote:
+    return Quote(
+        symbol=str(record["symbol"]),
+        market=Market(str(record["market"])),
+        price=float(record["price"]),
+        previous_close=float(record["previous_close"]),
+        timestamp=datetime.fromisoformat(str(record["timestamp"])),
+        bid=float(record["bid"]) if record.get("bid") is not None else None,
+        ask=float(record["ask"]) if record.get("ask") is not None else None,
+        volume=float(record["volume"]) if record.get("volume") is not None else None,
+        turnover=float(record["turnover"]) if record.get("turnover") is not None else None,
+        session=str(record.get("session") or "UNKNOWN"),
+        source=str(record.get("source") or "KIS"),
+    )
+
+
 @st.cache_data(ttl=10, show_spinner=False)
-def load_quote(symbol: str, market_value: str, exchange: str):
-    return get_client().quote(symbol, Market(market_value), exchange, include_orderbook=True)
+def _load_quote_record(symbol: str, market_value: str, exchange: str) -> dict[str, object]:
+    quote = get_client().quote(symbol, Market(market_value), exchange, include_orderbook=True)
+    return _quote_to_cache_record(quote)
+
+
+def load_quote(symbol: str, market_value: str, exchange: str) -> Quote:
+    return _quote_from_cache_record(_load_quote_record(symbol, market_value, exchange))
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -55,7 +93,8 @@ def load_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def scan_starter_universe(market_value: str):
+def scan_starter_universe(market_value: str) -> tuple[list[tuple[str, float]], list[str]]:
+    """Cache only strings and numbers; Quote uses slots and is not cache-pickleable."""
     scan_market = Market(market_value)
     items = KR_LIQUID if scan_market == Market.KR else US_LIQUID
     quotes, errors = [], []
@@ -64,7 +103,8 @@ def scan_starter_universe(market_value: str):
             quotes.append(get_client().quote(item.symbol, scan_market, item.exchange, include_orderbook=False))
         except Exception as exc:
             errors.append(f"{item.symbol}: {type(exc).__name__}")
-    return rank_quotes(quotes, scan_market), errors
+    ranked = rank_quotes(quotes, scan_market)
+    return [(quote.symbol, float(quote.change_pct)) for quote in ranked], errors
 
 
 def secret_value(name: str) -> str:
@@ -141,7 +181,7 @@ if scan_now:
     with st.spinner("시작목록의 현재가 1차 필터 확인 중…"):
         ranked, scan_errors = scan_starter_universe(market.value)
     st.session_state["ranked_market"] = market.value
-    st.session_state["ranked_candidates"] = [(quote.symbol, quote.change_pct) for quote in ranked[:10]]
+    st.session_state["ranked_candidates"] = ranked[:10]
     st.session_state["scan_errors"] = scan_errors
 
 if st.session_state.get("ranked_market") == market.value and st.session_state.get("ranked_candidates"):
