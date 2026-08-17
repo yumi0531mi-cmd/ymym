@@ -102,11 +102,8 @@ def test_connected_app_automatically_renders_live_candidate_card_without_user_se
     assert not app.button
     assert any("실시간 상승·반복단타 혼합 스캐너" in str(item.value) for item in app.markdown)
     assert any("005930" in str(item.value) for item in app.subheader)
-    assert {metric.label for metric in app.metric} >= {"현재가", "전략 신호", "진입 기준가", "1차 목표 · 5분 예상", "2차 목표 · 15분 예상", "3차 목표 · 30분 예상", "Hard Stop"}
-    assert any("매수 검토 신호 · 진입 조건 충족" in str(metric.value) for metric in app.metric)
-    assert any("1차 근거: 완료 5분봉 스윙 저항" in str(item.value) for item in app.caption)
-    assert any("예상 계산 근거: EMA9·VWAP 위 · 거래량 강화" in str(item.value) for item in app.caption)
-    assert any("손절 근거: 1분봉 구조 무효화" in str(item.value) for item in app.caption)
+    assert {metric.label for metric in app.metric} >= {"현재가", "추천 매수가", "추천 매도가 1차", "추천 매도가 2차", "손절가"}
+    assert any("방향  5분 + · 10분 ? · 15분 + · 30분 +" in str(item.value) for item in app.caption)
     assert any("실시간 현재가 기준" in str(item.value) for item in app.markdown)
 
 
@@ -135,9 +132,8 @@ def test_ranking_error_falls_back_to_liquid_candidates_and_still_renders_cards()
         app.run(timeout=30)
 
     assert not app.exception
-    assert any("유동성 시작목록 자동 대체" in str(item.value) for item in app.markdown)
     assert any("005930" in str(item.value) for item in app.subheader)
-    assert any("유동성 시작목록 자동 대체" in str(item.value) for item in app.caption)
+    assert {metric.label for metric in app.metric} >= {"현재가", "추천 매수가", "추천 매도가 1차", "추천 매도가 2차", "손절가"}
 
 
 def test_korean_name_direct_search_adds_requested_stock_card():
@@ -168,4 +164,4 @@ def test_korean_name_direct_search_adds_requested_stock_card():
 
     assert not app.exception
     assert any("005380" in str(item.value) and "현대차" in str(item.value) for item in app.subheader)
-    assert any("관심 종목 직접 검색" in str(item.value) for item in app.caption)
+    assert {metric.label for metric in app.metric} >= {"현재가", "추천 매수가", "추천 매도가 1차", "추천 매도가 2차", "손절가"}

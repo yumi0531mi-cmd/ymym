@@ -168,10 +168,20 @@ def analyze(
     entry, entry_basis = chart_entry_level(df, quote.price, regime, box)
     entry = entry or quote.price
     target1, target2, support, target1_basis, target2_basis, support_basis = trade_levels(df, entry, box)
+    forecast_points = forecast_path(completed, regime, reference_price=quote.price)
+    forecast_by_minutes = {point.minutes: point for point in forecast_points}
+    if target1 is None and forecast_by_minutes.get(5) is not None:
+        target1 = float(forecast_by_minutes[5].base)
+        target1_basis = "5분 완료봉 모멘텀·VWAP·EMA·거래량·거래대금·ATR 계산"
+    if target2 is None and forecast_by_minutes.get(15) is not None:
+        target2 = float(forecast_by_minutes[15].base)
+        target2_basis = "15분 완료봉 모멘텀·VWAP·EMA·거래량·거래대금·ATR 계산"
     entry_resistance_1m, _, _, _ = confirmed_levels(df, entry)
     flags = fake_signal_flags(completed, support, entry_resistance_1m)
     risk = risk_state(df, current_price=quote.price, support=support, fake_breakdown=flags["fake_breakdown"])
-    stop_basis = f"{support_basis} 기반 Hard Stop" if risk.hard_stop else "구조 무효화 기준 미확인"
+    fallback_stop = max(0.0, entry - max(float(latest.atr) * 1.20, 0.01))
+    displayed_stop = risk.hard_stop or fallback_stop
+    stop_basis = f"{support_basis} 기반 Hard Stop" if risk.hard_stop else "완료봉 ATR 기반 구조 손절"
     spread = quote.spread_pct
     max_spread = _max_spread(quote)
     spread_ok = spread is not None and spread <= max_spread
@@ -318,9 +328,9 @@ def analyze(
         quote, now, signal, strategy_label, regime,
         entry=entry,
         entry_basis=entry_basis,
-        target1=target1 if structure_ok else None,
-        target2=target2 if structure_ok else None,
-        stop=risk.hard_stop if structure_ok else None,
+        target1=target1,
+        target2=target2,
+        stop=displayed_stop,
         target1_basis=target1_basis,
         target2_basis=target2_basis,
         stop_basis=stop_basis,
@@ -330,9 +340,9 @@ def analyze(
         repeat=box,
         verified=data_verified,
         diagnostics=diagnostics,
-        forecasts=forecast_path(completed, regime, reference_price=quote.price),
-        soft_stop=risk.soft_stop,
-        hard_stop=risk.hard_stop,
+        forecasts=forecast_points,
+        soft_stop=risk.soft_stop or displayed_stop,
+        hard_stop=displayed_stop,
         risk_status=risk.state,
         persistence=persistence,
         calibration_probability=calibration_probability if calibration_samples >= 30 else None,

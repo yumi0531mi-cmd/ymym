@@ -25,7 +25,7 @@ from scanner.validation import ValidationCase, ValidationStore
 APP_VERSION = "5.6-kis-realtime"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
-CLIENT_CACHE_VERSION = "client-contract-v7-kis-realtime"
+CLIENT_CACHE_VERSION = "client-contract-v8-live-card-targets"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 MAX_LIVE_CARDS = 5
 MAX_CANDIDATE_LIST = 20
@@ -101,6 +101,16 @@ def get_realtime_hub(cache_version: str, secret_fingerprint: str) -> KISRealtime
     return KISRealtimeHub(get_client(cache_version, secret_fingerprint))
 
 
+def current_realtime_hub() -> KISRealtimeHub:
+    """Return a current live hub even if Streamlit retained an older resource."""
+    fingerprint = current_secret_fingerprint()
+    hub = get_realtime_hub(CLIENT_CACHE_VERSION, fingerprint)
+    if not isinstance(hub, KISRealtimeHub) or not callable(getattr(hub, "completed_bar_rows", None)):
+        get_realtime_hub.clear()
+        hub = get_realtime_hub(CLIENT_CACHE_VERSION, fingerprint)
+    return hub
+
+
 @st.cache_resource
 def get_event_store() -> EventStore:
     return EventStore(st.secrets)
@@ -164,7 +174,7 @@ def _load_orderbook(symbol: str, market_value: str, exchange: str) -> tuple[floa
 def load_dashboard_quote(symbol: str, market_value: str, exchange: str) -> Quote:
     quote = _quote_from_cache_record(_load_quote_record(symbol, market_value, exchange))
     bid, ask = _load_orderbook(symbol, market_value, exchange)
-    tick = get_realtime_hub(CLIENT_CACHE_VERSION, current_secret_fingerprint()).tick(
+    tick = current_realtime_hub().tick(
         Market(market_value), symbol
     )
     if tick is None:
@@ -195,7 +205,7 @@ def load_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
 
 def merge_live_completed_bars(base: pd.DataFrame, symbol: str, market: Market) -> pd.DataFrame:
     """Overlay locally completed one-minute KIS trade bars onto cached REST history."""
-    rows = get_realtime_hub(CLIENT_CACHE_VERSION, current_secret_fingerprint()).completed_bar_rows(market, symbol)
+    rows = current_realtime_hub().completed_bar_rows(market, symbol)
     if not rows:
         return base
     live = pd.DataFrame(rows).set_index("timestamp")
@@ -398,6 +408,29 @@ def forecast_range_text(point: Any | None) -> str:
     return f"{forecast_direction_text(point)} · 예상 범위 {price_text(point.low)} ~ {price_text(point.high)}"
 
 
+def buy_range_text(plan: Any, quote: Quote) -> str:
+    """Format a buy zone from chart levels rather than an arbitrary percentage."""
+    entry = plan.entry
+    if entry is None or entry <= 0:
+        return "계산 대기"
+    candidates = [float(entry)]
+    for key in ("vwap", "ema9"):
+        value = plan.diagnostics.get(key)
+        if isinstance(value, (int, float)) and 0 < float(value) <= quote.price * 1.002:
+            candidates.append(float(value))
+    low, high = min(candidates), max(candidates)
+    return price_text(low) if abs(high - low) < 0.01 else f"{price_text(low)} ~ {price_text(high)}"
+
+
+def compact_directions(plan: Any) -> str:
+    signs = {Regime.UP: "+", Regime.DOWN: "-", Regime.RANGE: "0"}
+    values = []
+    for minutes in (5, 10, 15, 30):
+        point = forecast_point_for(plan, minutes)
+        values.append(f"{minutes}분 {signs.get(point.direction, '?') if point else '?'}")
+    return " · ".join(values)
+
+
 def strategy_signal_text(plan: Any) -> str:
     """Present strategy status without labelling an untested condition as 80% verified."""
     if plan.signal == Signal.BUY and plan.calibration_probability is not None and plan.calibration_probability >= 80.0:
@@ -549,65 +582,33 @@ def mixed_card_priority(item: dict[str, Any]) -> tuple[int, int, int]:
 
 
 def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
-    """Render a safe native Streamlit card so live values never appear as HTML text."""
+    """Render the compact price card; detailed calculations remain inside the engine."""
     quote: Quote = item["quote"]
     plan = item["plan"]
-    hard_stop = plan.hard_stop or plan.invalidation or plan.stop
     forecast_5 = forecast_point_for(plan, 5)
     forecast_15 = forecast_point_for(plan, 15)
     forecast_30 = forecast_point_for(plan, 30)
-    target_5 = plan.target if plan.target is not None else (forecast_5.base if forecast_5 else None)
-    repeat_width = repeat_band_pct(plan)
-    state = "상승 추세" if plan.regime == Regime.UP else ("박스권" if plan.regime == Regime.RANGE else "전환·관망")
-    repeat_text = f"반복단타 가능 · 폭 {repeat_width:.2f}%" if repeat_width is not None else "추세 진입 관찰"
+    target_1 = plan.target if plan.target is not None else (forecast_5.base if forecast_5 else None)
+    target_2 = plan.target2 if plan.target2 is not None else (forecast_15.base if forecast_15 else None)
+    stop = plan.hard_stop or plan.invalidation or plan.stop
     title = f"{quote.symbol} · {item.get('name') or quote.market.value}"
 
     with st.container(border=True):
         st.subheader(title)
-        st.caption(f"{item.get('candidate_source') or '시장 실시간 순위'} · {quote.session} · {plan.strategy}")
-        top = st.columns(2)
-        with top[0]:
-            render_realtime_price(
-                quote.symbol,
-                quote.market.value,
-                quote.price,
-                quote.previous_close,
-                quote.timestamp.isoformat(),
-            )
-        top[1].metric("전략 신호", strategy_signal_text(plan), f"{state} · 점수 {plan.score}/100")
-        st.caption(f"구조: {repeat_text} · 위험 상태: {plan.risk_state}")
-        ensemble = plan.diagnostics.get("strategy_ensemble") or {}
-        active_strategies = ", ".join(ensemble.get("active_names") or [])
-        st.caption(f"전략 조합: {ensemble.get('calibration_key') or '계산 대기'} · {active_strategies or '완료봉 확인 대기'}")
-        levels = st.columns(2)
-        levels[0].metric("진입 기준가", price_text(plan.entry))
-        levels[1].metric("1차 목표 · 5분 예상", price_text(target_5))
-        st.caption(f"1차 근거: {plan.target_basis or '완료 5분봉 구조 확인 중'} · {forecast_range_text(forecast_5)}")
-        projected = st.columns(2)
-        projected[0].metric("2차 목표 · 15분 예상", price_text(forecast_15.base if forecast_15 else None))
-        projected[1].metric("3차 목표 · 30분 예상", price_text(forecast_30.base if forecast_30 else None))
-        st.caption(f"2차: {forecast_range_text(forecast_15)}")
-        st.caption(f"3차: {forecast_range_text(forecast_30)}")
-        if forecast_15 or forecast_30:
-            forecast_basis = (forecast_15 or forecast_30).basis
-            st.caption(f"예상 계산 근거: {forecast_basis}")
-        stops = st.columns(3)
-        stops[0].metric("Soft Stop", price_text(plan.soft_stop))
-        stops[1].metric("Hard Stop", price_text(hard_stop))
-        stops[2].metric("비용 반영 손익비", number_text(plan.diagnostics.get("reward_risk_net")))
-        reasons = " · ".join(str(reason) for reason in (plan.reasons or [])[:2]) or "특별 경고 없음"
-        st.caption(f"판단 근거: {reasons}")
-        basis = st.columns(3)
-        basis[0].caption(f"진입 근거: {plan.entry_basis}")
-        basis[1].caption(f"1차 근거: {plan.target_basis or '5분 구조 확인 대기'}")
-        basis[2].caption(f"손절 근거: {plan.stop_basis or '1분 구조 확인 대기'}")
-        if plan.calibration_samples >= 30 and plan.calibration_probability is not None:
-            status = "80% 목표 검증 통과" if plan.calibration_probability >= 80.0 else "80% 목표 검증 미통과 · 강한 신호 제외"
-            st.caption(f"동일 전략 실측: {plan.calibration_probability:.1f}% · 표본 {plan.calibration_samples}건 · {status}")
-        else:
-            st.caption(f"동일 전략 실측 표본 누적 중: {plan.calibration_samples}/30건 · 80% 검증 수치를 아직 표시하지 않습니다.")
-        st.caption(f"현재가 숫자만 1초 갱신 · 완료봉 구조 1~5분 확정 · 호가 재확인 15분 · 왕복비용 가정 {cost_pct:.2f}%")
-        render_card_detail(item)
+        render_realtime_price(
+            quote.symbol,
+            quote.market.value,
+            quote.price,
+            quote.previous_close,
+            quote.timestamp.isoformat(),
+        )
+        prices = st.columns(2)
+        prices[0].metric("추천 매수가", buy_range_text(plan, quote))
+        prices[1].metric("추천 매도가 1차", price_text(target_1))
+        exits = st.columns(2)
+        exits[0].metric("추천 매도가 2차", price_text(target_2))
+        exits[1].metric("손절가", price_text(stop))
+        st.caption(f"방향  {compact_directions(plan)}")
 
 
 def render_card_detail(item: dict[str, Any]) -> None:
@@ -673,7 +674,7 @@ def render_chart(bars: pd.DataFrame, plan: Any, key: str) -> None:
 
 
 client = current_client()
-realtime_hub = get_realtime_hub(CLIENT_CACHE_VERSION, current_secret_fingerprint())
+realtime_hub = current_realtime_hub()
 event_store = get_event_store()
 cycle_store = get_cycle_store()
 store = ValidationStore(VALIDATION_ROOT, event_store=event_store)
