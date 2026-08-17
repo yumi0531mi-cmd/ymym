@@ -6,7 +6,7 @@ from typing import Any, Iterable
 from .models import Market
 
 
-@dataclass(slots=True)
+@dataclass
 class MarketCandidate:
     symbol: str
     name: str
