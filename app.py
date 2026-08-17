@@ -21,6 +21,7 @@ from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
 APP_VERSION = "5.1.1-five-minute-target"
+CLIENT_CACHE_VERSION = "full-market-rankings-v1"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 
 st.set_page_config(page_title="한투 혼합형 주식 스캐너", page_icon="📡", layout="wide")
@@ -38,7 +39,12 @@ st.markdown(
 
 
 @st.cache_resource
-def get_client() -> KISClient:
+def get_client(cache_version: str) -> KISClient:
+    """Create one KIS client per explicit capability version.
+
+    Passing the version at every call prevents a stale cached client from an
+    earlier deployment missing newly added methods.
+    """
     return KISClient(st.secrets)
 
 
@@ -87,7 +93,7 @@ def _quote_from_cache_record(record: dict[str, object]) -> Quote:
 
 @st.cache_data(ttl=10, show_spinner=False)
 def _load_quote_record(symbol: str, market_value: str, exchange: str) -> dict[str, object]:
-    quote = get_client().quote(symbol, Market(market_value), exchange, include_orderbook=True)
+    quote = get_client(CLIENT_CACHE_VERSION).quote(symbol, Market(market_value), exchange, include_orderbook=True)
     return _quote_to_cache_record(quote)
 
 
@@ -97,7 +103,7 @@ def load_quote(symbol: str, market_value: str, exchange: str) -> Quote:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
-    return get_client().intraday(symbol, Market(market_value), exchange)
+    return get_client(CLIENT_CACHE_VERSION).intraday(symbol, Market(market_value), exchange)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -108,7 +114,7 @@ def scan_starter_universe(market_value: str) -> tuple[list[tuple[str, float]], l
     quotes, errors = [], []
     for item in items:
         try:
-            quotes.append(get_client().quote(item.symbol, scan_market, item.exchange, include_orderbook=False))
+            quotes.append(get_client(CLIENT_CACHE_VERSION).quote(item.symbol, scan_market, item.exchange, include_orderbook=False))
         except Exception as exc:
             errors.append(f"{item.symbol}: {type(exc).__name__}")
     ranked = rank_quotes(quotes, scan_market)
@@ -162,7 +168,7 @@ def render_chart(bars: pd.DataFrame, plan) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
-client = get_client()
+client = get_client(CLIENT_CACHE_VERSION)
 event_store = get_event_store()
 cycle_store = get_cycle_store()
 
