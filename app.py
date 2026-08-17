@@ -707,6 +707,7 @@ st.markdown("<div class='mobile-head'><h1>실시간 상승·반복단타 혼합 
 cards: list[dict[str, Any]] = []
 errors: list[str] = []
 candidates: list[dict[str, Any]] = []
+visible_requests: list[dict[str, Any]] = []
 direct_request: dict[str, str] | None = None
 if search_query:
     if market == Market.KR:
@@ -780,9 +781,12 @@ if candidates:
     st.subheader(f"가격 조건 통과 상승 후보 · {len(candidates)}개")
     st.caption(f"{limit_text} · 상승률·거래대금·거래량 순위를 바탕으로 넓게 선별한 목록입니다. 아래 정밀 카드는 상위 {MAX_LIVE_CARDS}개를 계산합니다.")
     st.dataframe(pd.DataFrame(list_rows), hide_index=True, use_container_width=True)
-    fixed_symbols = tuple(str(card["quote"].symbol) for card in cards)
-    if direct_request is not None:
-        fixed_symbols = tuple(dict.fromkeys((*fixed_symbols, str(direct_request["symbol"]))))
+    fixed_symbols = tuple(
+        dict.fromkeys(
+            [str(request.get("symbol", "")) for request in visible_requests]
+            + [str(card["quote"].symbol) for card in cards]
+        )
+    )
     render_new_candidate_watchlist(market.value, fixed_symbols)
 elif kis_connected:
     limit_text = "30만 원 미만" if market == Market.KR else "170달러 미만"
