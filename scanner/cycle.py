@@ -6,7 +6,7 @@ from typing import Any
 
 from .models import Market
 from .persistence import EventStore, PersistenceError
-from .sessions import trading_date
+from .sessions import ET, KST
 
 
 @dataclass(slots=True)
@@ -36,6 +36,11 @@ class CycleState:
         return payload
 
 
+def _trade_date(market: Market, now: datetime) -> str:
+    local = now.astimezone(KST if market == Market.KR else ET)
+    return local.strftime("%Y-%m-%d")
+
+
 class CycleStore:
     """Optional durable state for v5.1 re-entry control.
 
@@ -53,7 +58,7 @@ class CycleStore:
 
     def get(self, symbol: str, market: Market, now: datetime | None = None) -> CycleState:
         now = now or datetime.now().astimezone()
-        date = trading_date(market, now)
+        date = _trade_date(market, now)
         key = self._id(market.value, symbol, date)
         if key in self._local:
             return self._local[key]
