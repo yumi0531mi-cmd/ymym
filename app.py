@@ -307,6 +307,18 @@ def signal_class(signal: Signal) -> str:
     return "wait"
 
 
+def strategy_signal_text(signal: Signal) -> str:
+    """Present the user's own strategy decision language in the live cards."""
+    mapping = {
+        Signal.BUY: "매수 검토 신호 · 진입 조건 충족",
+        Signal.WAIT: "진입 대기",
+        Signal.BLOCK: "진입 차단",
+        Signal.SELL: "청산 검토",
+        Signal.UNVERIFIED: "데이터 확인 대기",
+    }
+    return mapping.get(signal, str(signal.value))
+
+
 def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
     """Fetch and analyze one automatic dashboard card (maximum three)."""
     quote = load_dashboard_quote(symbol, market.value, exchange)
@@ -416,7 +428,7 @@ def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
         st.caption(f"{item.get('candidate_source') or '시장 실시간 순위'} · {quote.session} · {plan.strategy}")
         top = st.columns(2)
         top[0].metric("현재가", price_text(quote.price), f"{quote.change_pct:+.2f}%")
-        top[1].metric("신호", plan.signal.value, f"{state} · 점수 {plan.score}/100")
+        top[1].metric("전략 신호", strategy_signal_text(plan.signal), f"{state} · 점수 {plan.score}/100")
         st.caption(f"구조: {repeat_text} · 위험 상태: {plan.risk_state}")
         levels = st.columns(3)
         levels[0].metric("진입 기준가", price_text(plan.entry))
@@ -428,7 +440,11 @@ def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
         stops[2].metric("비용 반영 손익비", number_text(plan.diagnostics.get("reward_risk_net")))
         reasons = " · ".join(str(reason) for reason in (plan.reasons or [])[:2]) or "특별 경고 없음"
         st.caption(f"판단 근거: {reasons}")
-        st.caption(f"현재가 60초 갱신 · 구조 10분 · 호가 15분 · 왕복비용 가정 {cost_pct:.2f}% · 주문 기능 없음")
+        basis = st.columns(3)
+        basis[0].caption(f"진입 기준: {plan.strategy}")
+        basis[1].caption(f"목표 근거: {plan.target_basis or '5분 구조 확인 대기'}")
+        basis[2].caption(f"손절 근거: {plan.stop_basis or '1분 구조 확인 대기'}")
+        st.caption(f"현재가 60초 갱신 · 구조 10분 · 호가 15분 · 왕복비용 가정 {cost_pct:.2f}% · 자동 주문 없음")
         render_card_detail(item)
 
 
@@ -554,7 +570,7 @@ if cards:
     updated_at = max(card["quote"].timestamp for card in cards)
     source_labels = {str(card.get("candidate_source") or "시장 실시간 순위") for card in cards}
     source_text = " · ".join(sorted(source_labels))
-    st.markdown(f"<div class='connection ok'>실시간 현재가 기준 {updated_at.strftime('%H:%M:%S')} · {source_text} · 상승 추세를 우선으로 {len(cards)}개를 분석했습니다. `반복단타 가능`은 추가 구조 표시이며, 초록색 목표가와 빨간색 손절가는 수동매매 참고선입니다.</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='connection ok'>실시간 현재가 기준 {updated_at.strftime('%H:%M:%S')} · {source_text} · 상승 추세를 우선으로 {len(cards)}개를 분석했습니다. `반복단타 가능`은 추가 구조 표시이며, 초록색 목표가와 빨간색 손절가는 사용자 전략의 목표·손절 레벨입니다.</div>", unsafe_allow_html=True)
     for card_item in cards:
         render_live_card(card_item, float(cost_pct))
 elif kis_connected and not errors:
@@ -563,5 +579,5 @@ elif kis_connected and not errors:
 for error in errors:
     st.warning(f"일부 후보는 분석 데이터를 만들지 못했습니다: {error}")
 
-with st.expander("숫자 읽는 법"):
-    st.markdown("**현재가**는 60초마다 갱신합니다. **진입 기준가·1차/2차 목표가·손절가**는 완료된 1분봉과 5분봉 구조, 거래량·거래대금·호가 안전성에 따라 계산합니다. 신호가 `대기` 또는 `진입 금지`이면 가격이 표시돼도 매수 권유가 아닙니다. 자동 주문 기능은 없습니다.")
+with st.expander("숫자와 전략 신호 읽는 법"):
+    st.markdown("**현재가**는 60초마다 갱신합니다. **진입 기준가·1차/2차 목표가·손절가**는 완료된 1분봉과 5분봉 구조, 거래량·거래대금·호가 상태에 따라 계산합니다. `매수 검토 신호 · 진입 조건 충족`은 사용자가 정한 전략 게이트를 통과했다는 뜻이며, `진입 대기`와 `진입 차단`은 그 시점의 전략 조건이 충족되지 않았다는 뜻입니다. 자동 주문 기능은 없습니다.")

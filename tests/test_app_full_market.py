@@ -97,7 +97,10 @@ def test_connected_app_automatically_renders_live_candidate_card_without_user_se
     assert not app.button
     assert any("실시간 상승·반복단타 혼합 스캐너" in str(item.value) for item in app.markdown)
     assert any("005930" in str(item.value) for item in app.subheader)
-    assert {metric.label for metric in app.metric} >= {"현재가", "진입 기준가", "1차 목표 · 5분", "2차 목표 · 5분", "Hard Stop"}
+    assert {metric.label for metric in app.metric} >= {"현재가", "전략 신호", "진입 기준가", "1차 목표 · 5분", "2차 목표 · 5분", "Hard Stop"}
+    assert any("매수 검토 신호 · 진입 조건 충족" in str(metric.value) for metric in app.metric)
+    assert any("목표 근거: 완료 5분봉 스윙 저항" in str(item.value) for item in app.caption)
+    assert any("손절 근거: 1분봉 구조 무효화" in str(item.value) for item in app.caption)
     assert any("실시간 현재가 기준" in str(item.value) for item in app.markdown)
 
 
