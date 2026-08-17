@@ -9,7 +9,6 @@ from typing import Any
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 
 from scanner.calibration import calibration_for
 from scanner.cycle import CycleStore
@@ -403,6 +402,30 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
     }
 
 
+@st.fragment(run_every=1.0)
+def render_realtime_price(symbol: str, market_value: str, base_price: float, previous_close: float, initial_timestamp: str) -> None:
+    """Redraw only a card's live price area once per second.
+
+    This fragment reads the in-memory KIS WebSocket tick and never reruns candidate
+    ranking, chart analysis, or strategy calculations.  A REST snapshot is used only
+    until the first real-time trade arrives or while the stream reconnects.
+    """
+    market = Market(market_value)
+    tick = get_realtime_hub(CLIENT_CACHE_VERSION, current_secret_fingerprint()).tick(market, symbol)
+    if tick is None:
+        price = base_price
+        timestamp = datetime.fromisoformat(initial_timestamp)
+        source = "기준 시세 대기"
+    else:
+        price = tick.price
+        timestamp = tick.timestamp
+        source = "KIS 체결"
+    change_pct = ((price / previous_close) - 1.0) * 100.0 if previous_close > 0 else 0.0
+    st.metric("현재가", price_text(price), f"{change_pct:+.2f}%")
+    age_seconds = max(0, int((datetime.now(timestamp.tzinfo) - timestamp).total_seconds()))
+    st.caption(f"{source} · {timestamp.strftime('%H:%M:%S')} · 지연 {age_seconds}초")
+
+
 def trade_card_html(item: dict[str, Any], cost_pct: float) -> str:
     quote: Quote = item["quote"]
     plan = item["plan"]
@@ -460,7 +483,7 @@ def trade_card_html(item: dict[str, Any], cost_pct: float) -> str:
     <div class="plan-item"><div class="data-label">Hard Stop</div><div class="data-value stop">{price_text(hard_stop)}</div></div>
     <div class="plan-item"><div class="data-label">비용 반영 손익비</div><div class="data-value">{number_text(rr_value)}</div></div>
   </div>
-  <div class="card-foot">1차·2차 목표는 완료된 5분봉 구조를 우선 사용합니다. 왕복비용 가정 {cost_pct:.2f}% · 주문 기능 없음</div>
+  <div class="card-foot">1차·2차 목표는 완료된 5분봉 구조를 우선 사용합니다. 왕복비용 가정 {cost_pct:.2f}%</div>
 </section>
 """
     return card
@@ -487,7 +510,14 @@ def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
         st.subheader(title)
         st.caption(f"{item.get('candidate_source') or '시장 실시간 순위'} · {quote.session} · {plan.strategy}")
         top = st.columns(2)
-        top[0].metric("현재가", price_text(quote.price), f"{quote.change_pct:+.2f}%")
+        with top[0]:
+            render_realtime_price(
+                quote.symbol,
+                quote.market.value,
+                quote.price,
+                quote.previous_close,
+                quote.timestamp.isoformat(),
+            )
         top[1].metric("전략 신호", strategy_signal_text(plan), f"{state} · 점수 {plan.score}/100")
         st.caption(f"구조: {repeat_text} · 위험 상태: {plan.risk_state}")
         ensemble = plan.diagnostics.get("strategy_ensemble") or {}
@@ -512,7 +542,7 @@ def render_live_card(item: dict[str, Any], cost_pct: float) -> None:
             st.caption(f"동일 전략 실측: {plan.calibration_probability:.1f}% · 표본 {plan.calibration_samples}건 · {status}")
         else:
             st.caption(f"동일 전략 실측 표본 누적 중: {plan.calibration_samples}/30건 · 80% 검증 수치를 아직 표시하지 않습니다.")
-        st.caption(f"정밀 현재가 120초 갱신 · 구조 15분 · 호가 15분 · 왕복비용 가정 {cost_pct:.2f}% · 자동 주문 없음")
+        st.caption(f"현재가 숫자만 1초 갱신 · 완료봉 구조 1~5분 확정 · 호가 재확인 15분 · 왕복비용 가정 {cost_pct:.2f}%")
         render_card_detail(item)
 
 
@@ -575,13 +605,11 @@ with st.sidebar:
     budget = client.budget_status
     st.caption(f"호출 보호: 1분 {budget.minute_used}/{budget.minute_limit} · 5시간 {budget.five_hour_used}/{budget.five_hour_limit}")
     st.caption(realtime_hub.status_label())
-    st.caption("상승 후보 목록 30분 · KIS 체결 현재가 1초 · 구조/호가 10~15분 갱신 · 자동 주문 없음")
+    st.caption("상승 후보 목록 30분 · KIS 체결 현재가 1초 · 완료봉 구조 1~5분 · 호가 재확인 15분")
 
 kis_connected = client.ready
-if kis_connected:
-    # Price ticks arrive in a background KIS WebSocket. The 1-second rerun only
-    # redraws in-memory ticks; completed-bar analysis remains cached.
-    st_autorefresh(interval=1_000, key=f"live_dashboard_{market.value}")
+# KIS ticks are redrawn by each card's independent Streamlit fragment.  Do not
+# rerun the entire dashboard here: a full rerun causes visible white flashing.
 
 st.markdown("<div class='mobile-head'><h1>실시간 상승·반복단타 혼합 스캐너</h1><p>상승 추세 후보의 현재가 · 진입 기준가 · 5분 1차/2차 목표 · 구조 손절가를 바로 비교하고, 반복단타 구조는 별도로 구분합니다.</p></div>", unsafe_allow_html=True)
 
@@ -680,4 +708,4 @@ for error in errors:
     st.warning(f"일부 후보는 분석 데이터를 만들지 못했습니다: {error}")
 
 with st.expander("숫자와 전략 신호 읽는 법"):
-    st.markdown("**현재가**는 KIS 공식 실시간 체결가 연결이 유지되는 동안 1초마다 화면에 반영되고, 재연결 중에는 REST 현재가를 임시 표시합니다. **진입 기준가·1차/2차 목표가·손절가**는 완료된 1분봉과 5분봉 구조, 거래량·거래대금·호가 상태에 따라 계산합니다. `강한 매수 검토 · 실측 80% 이상`은 동일 전략·세션·점수 구간의 사후 표본이 30건 이상이고 1차 목표가가 Hard Stop보다 먼저 도달한 비율이 80% 이상일 때만 표시합니다. 표본 부족 구간은 80%라고 표시하지 않고 누적 상태로 남깁니다. 자동 주문 기능은 없습니다.")
+    st.markdown("**현재가** 영역만 KIS 공식 실시간 체결가로 1초마다 갱신되며, 나머지 후보 목록·카드·차트는 다시 로딩하지 않습니다. 재연결 중에는 REST 현재가를 임시 표시합니다. **진입 기준가·1차/2차 목표가·손절가**는 완료된 1분봉과 5분봉 구조, 거래량·거래대금·호가 상태에 따라 계산합니다. `강한 매수 검토 · 실측 80% 이상`은 동일 전략·세션·점수 구간의 사후 표본이 30건 이상이고 1차 목표가가 Hard Stop보다 먼저 도달한 비율이 80% 이상일 때만 표시합니다. 표본 부족 구간은 80%라고 표시하지 않고 누적 상태로 남깁니다.")
