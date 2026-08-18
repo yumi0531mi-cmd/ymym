@@ -1,0 +1,42 @@
+# 혼합형 스캐너 통합 점검 기록
+
+## 목적
+
+이 문서는 사용자가 제공한 **VWAP 5시간 지속형 스윙 반복단타 v4.0** 및 **초단타 VWAP·확률 기반 통합 설계 v3.3/v3.4**를 현재 스캐너와 대조한 기록이다. 목표는 상승 추세 눌림과 박스권 하단 회귀를 함께 다루되, **0.5~5.0% 반복 파동**, 유동성, 구조, 가짜 이탈 방어, 반복 피로도, 세션별 규칙을 하나의 최종 진입 판정으로 일관되게 적용하는 것이다.
+
+## 현재 코드에 이미 반영된 핵심
+
+| 요구 사항 | 현재 구현 위치 | 적용 상태 |
+|---|---|---|
+| 0.5~5.0% 반복 상승 Swing 최소 3회 | `scanner/persistence_engine.py`의 `extract_swings`, `final_buy_decision` | 적용됨 |
+| 상승 추세형과 박스권형 분리 | `scanner/engine.py`의 `TREND_SWING`, `RANGE_SWING` | 적용됨 |
+| VWAP·EMA·RVOL·거래대금·스프레드·손익비 | `scanner/engine.py`, `scanner/indicators.py` | 적용됨 |
+| 5시간 지속성 점수와 반복 피로도 | `scanner/persistence_engine.py`의 `persistence_score`, `swing_statistics` | 적용됨 |
+| 가짜 이탈·실제 붕괴·긴급 이탈 | `scanner/persistence_engine.py`의 `risk_state` | 적용됨 |
+| 쿨다운·Hard Kill | `scanner/cycle.py`, `scanner/engine.py` | 적용됨 |
+| 5·10·15·30분 방향·가격 경로 | `scanner/forecast.py`, `scanner/engine.py` | 적용됨 |
+| 하방 경로에서 상방 가격 표시 차단 | `scanner/engine.py`, `app.py` | 적용됨 |
+| 전체 경로 100건·80% 실측 관문 | `scanner/calibration.py`, `scanner/validation.py` | 적용됨 |
+
+## 통합 원칙
+
+두 보고서의 핵심은 별도 전략을 계속 추가하는 것이 아니라, 같은 신호를 여러 번 점수화해 과대평가하지 않는 것이다. 따라서 현재 구현처럼 **상승 추세형은 VWAP·EMA 지지 후 재상승**, **박스권형은 하단 지지 후 중앙선·상단 회복**으로 분기하되, 두 전략 모두 동일한 `FINAL_BUY` 관문을 통과해야 한다. 이 관문은 세션, 반복 Swing, 지속성, 진입 위치, 스프레드, 유동성, 비용 반영 손익비, 위험 상태, 쿨다운, Hard Kill, 그리고 표본이 충분할 때의 전체 경로 실측을 함께 확인한다.
+
+5시간은 미래를 보장하는 숫자가 아니라, 90·180·300분 완료봉으로 신뢰도를 높이며 매분 재검증하는 지속성 평가로 다룬다. 장 초반에는 구조 표본 부족을 `EARLY_*` 상태로 보수적으로 표시하고, 300분 완료봉이 확보된 경우에만 `OBSERVED_300`으로 구분한다.
+
+## 현재가 수신 분리
+
+KIS 원시 WebSocket이 Streamlit Cloud 환경에서 연결되지 않을 때 카드 가격이 고정되는 문제를 보완하기 위해, Yahoo Finance WebSocket을 **표시 전용 보조 틱**으로 분리했다. KIS 체결이 있으면 KIS를 우선하고, KIS 틱이 없을 때만 Yahoo 보조 틱을 카드 현재가에 사용한다. Yahoo 보조 틱은 VWAP·완료봉·호가 안전성·목표가·손절가·검증 기록에는 사용하지 않는다.
+
+Yahoo Finance는 거래소에 따라 실시간 또는 지연 데이터를 제공하므로, 화면은 항상 `KIS 체결`과 `Yahoo 보조 시세`를 출처별로 표시해야 한다. Yahoo의 문서는 WebSocket 구독·해지 기능을 제공하며, 많은 거래소에서 스트리밍 시세를 제공하지만 모든 시장의 실시간을 보장하지는 않는다고 명시한다. [1] [2]
+
+2026-08-18 장중 점검에서 `005930.KS`를 15초간 구독해 초 단위 timestamp가 다른 다수의 메시지와 가격 변화(269,750원 ↔ 269,500원)를 수신했다. 이 결과는 **보조 시세 스트림의 연속 갱신 가능성**을 보인 것이며, KIS 기준 체결가 일치나 목표가 검증을 대체하지 않는다.
+
+## 남은 구현·검증
+
+카드에 5시간 지속성 등급·점수와 위험 상태를 짧게 표시하고, Yahoo 보조 틱이 수신된 경우에만 ‘계속 갱신 중’으로 표시해야 한다. 또한 KIS와 Yahoo의 가격·시각을 장중 표본으로 나란히 기록해 허용 오차와 지연을 측정하고, 이를 검증 결과에서 분리 보고해야 한다.
+
+## 참고 자료
+
+[1]: https://ranaroussi.github.io/yfinance/reference/api/yfinance.AsyncWebSocket.html "yfinance AsyncWebSocket API"
+[2]: https://in.help.yahoo.com/kb/finance-app-for-android/check-real-time-data-yahoo-finance-web-sln2321.html "Yahoo Finance의 실시간 데이터 확인 안내"

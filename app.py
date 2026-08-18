@@ -22,6 +22,7 @@ from scanner.realtime import KISRealtimeHub
 from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
+from scanner.yahoo_realtime import YahooRealtimeHub
 
 APP_VERSION = "5.6-kis-realtime"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
@@ -30,6 +31,7 @@ CLIENT_CACHE_VERSION = "client-contract-v8-live-card-targets"
 # The market-data connection has its own lifecycle. Bump this only when the
 # WebSocket protocol or recovery contract changes, without issuing a new REST token.
 REALTIME_HUB_CACHE_VERSION = "realtime-hub-v2-heartbeat-recovery"
+YAHOO_REALTIME_HUB_CACHE_VERSION = "yahoo-realtime-hub-v1-display-only"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 MAX_LIVE_CARDS = 5
 MAX_CANDIDATE_LIST = 20
@@ -114,6 +116,19 @@ def current_realtime_hub() -> KISRealtimeHub:
     if not isinstance(hub, KISRealtimeHub) or not callable(getattr(hub, "completed_bar_rows", None)):
         get_realtime_hub.clear()
         hub = get_realtime_hub(REALTIME_HUB_CACHE_VERSION, fingerprint)
+    return hub
+
+
+@st.cache_resource
+def get_yahoo_realtime_hub(cache_version: str) -> YahooRealtimeHub:
+    return YahooRealtimeHub()
+
+
+def current_yahoo_realtime_hub() -> YahooRealtimeHub:
+    hub = get_yahoo_realtime_hub(YAHOO_REALTIME_HUB_CACHE_VERSION)
+    if not isinstance(hub, YahooRealtimeHub):
+        get_yahoo_realtime_hub.clear()
+        hub = get_yahoo_realtime_hub(YAHOO_REALTIME_HUB_CACHE_VERSION)
     return hub
 
 
@@ -231,6 +246,16 @@ def quote_with_live_tick(base: Quote) -> Quote:
         volume=tick.volume if tick.volume is not None else base.volume,
         turnover=base.turnover, session=base.session, source=tick.source,
     )
+
+
+def display_tick(market: Market, symbol: str):
+    """Return a live price for the card only, preferring KIS over Yahoo.
+
+    KIS ticks remain the only live source allowed to alter structural analysis and
+    validation. Yahoo is a display backup, so its quote can never change VWAP,
+    completed bars, targets, stops, or KIS-based validation outcomes.
+    """
+    return current_realtime_hub().tick(market, symbol) or current_yahoo_realtime_hub().tick(market, symbol)
 
 
 def price_ceiling(market: Market) -> float:
@@ -619,15 +644,15 @@ def render_realtime_price(symbol: str, market_value: str, base_price: float, pre
     until the first real-time trade arrives or while the stream reconnects.
     """
     market = Market(market_value)
-    tick = current_realtime_hub().tick(market, symbol)
+    tick = display_tick(market, symbol)
     if tick is None:
         price = base_price
         timestamp = datetime.fromisoformat(initial_timestamp)
-        source = "기준 시세 대기"
+        source = "현재가 수신 대기"
     else:
         price = tick.price
         timestamp = tick.timestamp
-        source = "KIS 체결"
+        source = "KIS 체결" if tick.source == "KIS_WEBSOCKET" else "Yahoo 보조 시세"
     change_pct = ((price / previous_close) - 1.0) * 100.0 if previous_close > 0 else 0.0
     st.metric("현재가", price_text(price), f"{change_pct:+.2f}%")
     refresh_at = datetime.now(timestamp.tzinfo).strftime("%H:%M:%S")
@@ -795,6 +820,7 @@ def render_chart(bars: pd.DataFrame, plan: Any, key: str) -> None:
 
 client = current_client()
 realtime_hub = current_realtime_hub()
+yahoo_realtime_hub = current_yahoo_realtime_hub()
 active_secret_fingerprint = current_secret_fingerprint()
 event_store = get_event_store(active_secret_fingerprint)
 cycle_store = get_cycle_store(active_secret_fingerprint)
@@ -819,6 +845,8 @@ with st.sidebar:
     budget = client.budget_status
     st.caption(f"호출 보호: 1분 {budget.minute_used}/{budget.minute_limit} · 5시간 {budget.five_hour_used}/{budget.five_hour_limit}")
     st.caption(realtime_hub.status_label())
+    if not realtime_hub.connected:
+        st.caption(yahoo_realtime_hub.status_label())
     if event_store.configured:
         st.caption("검증 성과 저장: 영구 보관 연결됨")
     else:
@@ -871,6 +899,14 @@ else:
                 requests.append(candidate)
             visible_requests = requests[:MAX_LIVE_CARDS + 1]
             realtime_hub.configure(
+                (
+                    market,
+                    str(candidate["symbol"]),
+                    str(candidate.get("exchange") or ("NAS" if market == Market.US else "")),
+                )
+                for candidate in visible_requests
+            )
+            yahoo_realtime_hub.configure(
                 (
                     market,
                     str(candidate["symbol"]),

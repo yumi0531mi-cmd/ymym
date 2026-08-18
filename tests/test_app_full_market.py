@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -58,8 +59,9 @@ def _plan(*_args, **_kwargs) -> TradePlan:
 def test_missing_kis_credentials_shows_safe_waiting_screen_without_buttons():
     st.cache_resource.clear()
     st.cache_data.clear()
-    app = AppTest.from_file(APP_PATH)
-    app.run(timeout=30)
+    with patch.dict(os.environ, {"KIS_APP_KEY": "", "KIS_APP_SECRET": "", "KIS_ACCESS_TOKEN": ""}, clear=False):
+        app = AppTest.from_file(APP_PATH)
+        app.run(timeout=30)
 
     assert not app.exception
     assert not app.button

@@ -1,5 +1,6 @@
 from scanner.models import Market
 from scanner.realtime import KISRealtimeHub, KR_TRADE_TR_ID, US_TRADE_TR_ID
+from scanner.yahoo_realtime import YahooRealtimeHub
 
 
 class ApprovalOnlyClient:
@@ -112,3 +113,21 @@ def test_kis_realtime_resets_approval_on_subscription_auth_error():
 
     assert hub._approval_key == ""
     assert hub._approval_expires_monotonic == 0.0
+
+
+def test_yahoo_realtime_normalizes_market_symbols_and_stores_display_tick():
+    hub = YahooRealtimeHub()
+    assert hub.yahoo_symbol(Market.US, "aapl", "NAS") == "AAPL"
+    assert hub.yahoo_symbol(Market.KR, "005930", "KOSPI") == "005930.KS"
+    assert hub.yahoo_symbol(Market.KR, "035900", "KOSDAQ") == "035900.KQ"
+
+    hub._consume(
+        {"id": "AAPL", "price": "210.25", "time": "1787047200000", "change_percent": "1.5", "bid": "210.24", "ask": "210.26", "day_volume": "12345"},
+        {"AAPL": (Market.US, "AAPL")},
+    )
+
+    tick = hub.tick(Market.US, "AAPL")
+    assert tick is not None
+    assert tick.price == 210.25
+    assert tick.change_pct == 1.5
+    assert tick.source == "YAHOO_WEBSOCKET"
