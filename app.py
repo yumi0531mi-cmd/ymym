@@ -1156,7 +1156,7 @@ def render_live_card(
             trigger = str((item["plan"].diagnostics.get("strategy_path") or {}).get("reentry_trigger") or "5분 반전 확인")
             st.warning(f"눌림·재매수 대기 · {trigger}")
         else:
-            st.success("FINAL_BUY · 표시 진입가·목표가·손절가와 5·15·30분 경로를 함께 확인")
+            st.success("현재 1회 진입 조건 통과 · 1차·2차 목표가와 손절가를 함께 확인")
         render_realtime_price(
             refresh_seconds,
             quote.symbol,
@@ -1309,7 +1309,7 @@ kis_connected = client.ready
 # KIS ticks are redrawn by each card's independent Streamlit fragment.  Do not
 # rerun the entire dashboard here: a full rerun causes visible white flashing.
 
-st.markdown("<div class='mobile-head'><h1>실시간 상승·반복단타 혼합 스캐너</h1><p>현재가 · 추천 매수가 · 추천 매도가 · 차트 지지 · 손절가 · 구조 · 시간별 예상</p></div>", unsafe_allow_html=True)
+st.markdown("<div class='mobile-head'><h1>실시간 상승 차트 스캐너</h1><p>현재 1회 진입 · 1차·2차 목표가 · 차트 지지 · 손절가 · 5·15·30분 구조</p></div>", unsafe_allow_html=True)
 
 cards: list[dict[str, Any]] = []
 errors: list[str] = []
@@ -1411,14 +1411,13 @@ if analysis_cards:
     run_hidden_forecast_validation(analysis_cards, float(cost_pct), int(min_score), store)
 
 capture_pending_forecast_paths(store, market.value)
-render_latest_forecast_result(store)
 
 if cards:
     updated_at = max(card["quote"].timestamp for card in cards)
     source_labels = {str(card.get("candidate_source") or "시장 실시간 순위") for card in cards}
     source_text = " · ".join(sorted(source_labels))
-    st.subheader(f"현재 매수 가능 · {len(cards)}종목")
-    st.caption(f"시장 순위 100개 → 빠른 선별 {MAX_FAST_SHORTLIST}개 → 정밀 분석 {analyzed_count}개 → 추천 조건 통과 {len(cards)}개 · 과열 {len(blocked_cards)}개 제외 · {updated_at.strftime('%H:%M:%S')} · {realtime_hub.status_label()} · {source_text}")
+    st.subheader(f"상승 차트 · 현재 1회 진입 가능 {len(cards)}종목")
+    st.caption(f"정밀 분석 {analyzed_count}개 중 현재 진입 조건 통과 {len(cards)}개 · {updated_at.strftime('%H:%M:%S')} · {realtime_hub.status_label()} · {source_text}")
     for card_item in cards:
         render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "FINAL_BUY")
 elif kis_connected and not errors and not candidates:
@@ -1426,27 +1425,31 @@ elif kis_connected and not errors and not candidates:
     st.info(f"현재 {limit_text} 가격 조건과 상승 후보 기준을 함께 통과한 종목이 없습니다.")
 
 if candidates and not cards:
-    st.info("현재 매수 가능 0종목 · 억지 추천은 표시하지 않습니다. 아래 눌림·재매수 대기와 관찰 후보의 구조·탈락 사유를 확인하세요.")
+    st.info("현재 상승 차트에서 1회 진입 조건을 모두 통과한 종목이 없습니다.")
 
-if pullback_cards:
-    st.subheader(f"눌림·재매수 대기 · {len(pullback_cards)}종목")
-    st.caption("상승·박스 구조와 비용 반영 손익비는 유지되지만, 지금은 5분 눌림 또는 재반전 확인 단계입니다.")
-    for card_item in pullback_cards:
-        render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "PULLBACK_WAIT")
+with st.expander(f"익절 뒤 반복단타 참고 · 재진입 대기 {len(pullback_cards)}종목", expanded=False):
+    if pullback_cards:
+        st.caption("현재 1회 진입 카드가 아니라, 익절 뒤에도 반복 Swing 구조가 살아 있을 때 참고하는 재진입 대기 목록입니다.")
+        for card_item in pullback_cards:
+            render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "PULLBACK_WAIT")
+    else:
+        st.caption("현재 반복단타 재진입 구조를 별도로 확인할 종목이 없습니다.")
 
-if stage_summary["funnel"]:
-    funnel = " → ".join(f"{label} {count}" for label, count in stage_summary["funnel"].items())
-    st.caption(f"단계 통과 현황 · {funnel}")
-    reason_rows = [
-        {"주요 탈락 이유": reason, "종목 수": count}
-        for reason, count in sorted(stage_summary["reasons"].items(), key=lambda item: (-item[1], item[0]))[:5]
-    ]
-    if reason_rows:
-        st.subheader(f"관찰 후보 · {stage_summary['stages']['OBSERVATION']}종목")
-        st.dataframe(pd.DataFrame(reason_rows), hide_index=True, width="stretch")
-        rows = observation_rows(all_analyzed_cards)
-        if rows:
-            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+with st.expander("검증·관찰 상세", expanded=False):
+    render_latest_forecast_result(store)
+    if stage_summary["funnel"]:
+        funnel = " → ".join(f"{label} {count}" for label, count in stage_summary["funnel"].items())
+        st.caption(f"단계 통과 현황 · {funnel}")
+        reason_rows = [
+            {"주요 탈락 이유": reason, "종목 수": count}
+            for reason, count in sorted(stage_summary["reasons"].items(), key=lambda item: (-item[1], item[0]))[:5]
+        ]
+        if reason_rows:
+            st.subheader(f"관찰 후보 · {stage_summary['stages']['OBSERVATION']}종목")
+            st.dataframe(pd.DataFrame(reason_rows), hide_index=True, width="stretch")
+            rows = observation_rows(all_analyzed_cards)
+            if rows:
+                st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 for error in errors:
     st.warning(f"일부 후보는 분석 데이터를 만들지 못했습니다: {error}")
