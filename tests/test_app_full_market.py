@@ -266,6 +266,14 @@ def test_live_card_hides_candidate_that_turns_into_daily_overheat_after_selectio
     assert card_ready_for_display(item) is False
 
 
+def test_daily_overheat_guard_uses_refreshed_current_price_against_previous_close():
+    from app import is_daily_overheated
+
+    assert is_daily_overheated(112.01, 100.0) is True
+    assert is_daily_overheated(112.00, 100.0) is False
+    assert is_daily_overheated(0.0, 100.0) is False
+
+
 def test_card_trade_status_separates_buy_wait_and_downward_candidates():
     from app import card_ready_for_display, card_trade_status, visible_trade_cards
 

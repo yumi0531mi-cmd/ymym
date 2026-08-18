@@ -272,6 +272,13 @@ def eligible_price(candidate: dict[str, Any], market: Market) -> bool:
     return 0 < price < price_ceiling(market) and 0 < change_pct <= MAX_DAILY_RISE_PCT
 
 
+def is_daily_overheated(price: float, previous_close: float) -> bool:
+    """Return whether a refreshed quote must be removed from final candidate cards."""
+    if price <= 0 or previous_close <= 0:
+        return False
+    return (price / previous_close - 1.0) * 100.0 > MAX_DAILY_RISE_PCT + 1e-9
+
+
 def sort_rising_candidates(candidates: list[dict[str, Any]], market: Market) -> list[dict[str, Any]]:
     """Keep the user's price range and rank rising candidates by screen strength."""
     eligible = [candidate for candidate in candidates if eligible_price(candidate, market)]
@@ -750,6 +757,11 @@ def _render_realtime_price_content(symbol: str, market_value: str, exchange: str
             timestamp = datetime.fromisoformat(initial_timestamp)
             source = "KIS 현재가 재수신 대기"
     change_pct = ((price / previous_close) - 1.0) * 100.0 if previous_close > 0 else 0.0
+    if is_daily_overheated(price, previous_close):
+        # A 1-second tick may cross the guard after the parent card list was made.
+        # Re-run the parent once so the final-card filter removes this symbol instead
+        # of leaving a stale overheated card on screen for the next minute refresh.
+        st.rerun(scope="app")
     st.metric("현재가", price_text(price), f"{change_pct:+.2f}%")
     refresh_at = datetime.now(timestamp.tzinfo).strftime("%H:%M:%S")
     st.caption(f"{source} · KIS 시각 {timestamp.strftime('%H:%M:%S')} · 화면 확인 {refresh_at}")
