@@ -33,3 +33,18 @@ def test_merge_rankings_reads_overseas_symbol_shape():
     assert len(candidates) == 1
     assert candidates[0].symbol == "SOXL"
     assert candidates[0].screen_score == 100
+
+
+def test_merge_rankings_excludes_kr_directional_products_but_keeps_plain_etfs():
+    rankings = {
+        "상승률 순위": [
+            {"mksc_shrn_iscd": "069500", "hts_kor_isnm": "KODEX 200", "prdy_ctrt": "1.2"},
+            {"mksc_shrn_iscd": "122630", "hts_kor_isnm": "KODEX 레버리지", "prdy_ctrt": "4.2"},
+            {"mksc_shrn_iscd": "252670", "hts_kor_isnm": "KODEX 200선물인버스2X", "prdy_ctrt": "3.1"},
+            {"mksc_shrn_iscd": "123456", "hts_kor_isnm": "일반 ETN", "prdy_ctrt": "2.0"},
+        ]
+    }
+
+    candidates = merge_rankings(Market.KR, rankings)
+
+    assert {candidate.symbol for candidate in candidates} == {"069500", "123456"}

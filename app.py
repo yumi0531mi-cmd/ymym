@@ -15,7 +15,7 @@ from scanner.cycle import CycleStore
 from scanner.engine import analyze
 from scanner.indicators import resample
 from scanner.kis_client import KISClient, KISError, secrets_fingerprint
-from scanner.market_screener import merge_rankings
+from scanner.market_screener import is_kr_directional_product, merge_rankings
 from scanner.models import Market, Quote, Regime, Signal
 from scanner.persistence import EventStore
 from scanner.realtime import KISRealtimeHub
@@ -281,6 +281,8 @@ def load_dashboard_candidates(market_value: str) -> list[dict[str, Any]]:
     items = KR_LIQUID if market == Market.KR else US_LIQUID
     fallback: list[dict[str, Any]] = []
     for item in items:
+        if market == Market.KR and is_kr_directional_product(item.name):
+            continue
         try:
             quote = client.quote(item.symbol, market, item.exchange, include_orderbook=False)
         except KISError:
@@ -306,6 +308,8 @@ def scan_starter_universe(market_value: str) -> tuple[list[tuple[str, float]], l
     quotes: list[Quote] = []
     errors: list[str] = []
     for item in items:
+        if scan_market == Market.KR and is_kr_directional_product(item.name):
+            continue
         try:
             quotes.append(
                 get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).quote(
@@ -328,6 +332,7 @@ def load_kr_search_index() -> list[dict[str, str]]:
         return [
             {"symbol": item.symbol, "name": item.name, "market": ""}
             for item in KR_LIQUID
+            if not is_kr_directional_product(item.name)
         ]
 
 
@@ -335,7 +340,7 @@ def search_kr_stock(query: str, limit: int = 6) -> list[dict[str, str]]:
     needle = query.strip().replace(" ", "")
     if not needle:
         return []
-    items = load_kr_search_index()
+    items = [item for item in load_kr_search_index() if not is_kr_directional_product(str(item.get("name") or ""))]
     if needle.isdigit():
         padded = needle.zfill(6)
         return [item for item in items if item.get("symbol") == padded][:limit]

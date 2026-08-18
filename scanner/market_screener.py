@@ -6,6 +6,18 @@ from typing import Any, Iterable
 from .models import Market
 
 
+# General ETF/ETN products remain eligible. Only directional leveraged/inverse
+# products are excluded from the domestic scanner at the user's request.
+KR_DIRECTIONAL_PRODUCT_TOKENS = (
+    "레버리지", "인버스", "곱버스", "LEVERAGE", "INVERSE",
+)
+
+
+def is_kr_directional_product(name: str) -> bool:
+    normalized = str(name or "").upper().replace(" ", "")
+    return any(token.replace(" ", "") in normalized for token in KR_DIRECTIONAL_PRODUCT_TOKENS)
+
+
 @dataclass
 class MarketCandidate:
     symbol: str
@@ -55,6 +67,8 @@ def _candidate_from_row(row: dict[str, Any], market: Market, source: str) -> Mar
     if not symbol:
         return None
     name = _first_text(row, ("hts_kor_isnm", "hts_kor_isnm", "ovrs_item_name", "name", "ename", "item_name")) or symbol
+    if market == Market.KR and is_kr_directional_product(name):
+        return None
     return MarketCandidate(
         symbol=symbol.upper(),
         name=name,
