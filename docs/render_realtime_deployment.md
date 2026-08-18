@@ -7,8 +7,9 @@
 1. Render Dashboard에서 **New > Blueprint**를 선택한다.
 2. GitHub 저장소 `yumi0531mi-cmd/ymym`을 연결한다.
 3. Blueprint가 요구하는 `KIS_APP_KEY`, `KIS_APP_SECRET`을 Secret 값으로 입력한다.
-4. 기존 검증 데이터를 계속 쓸 경우 `SUPABASE_URL`, `SUPABASE_KEY`도 입력한다. 사용하지 않으면 빈 값으로 둔다.
-5. 생성 후 앱의 사이드바가 `KIS 실시간 체결 연결됨 · 1초 화면 갱신`으로 바뀌는지 확인한다.
+4. 생성 후 앱의 사이드바가 `KIS 실시간 체결 연결됨 · 1초 화면 갱신`으로 바뀌는지 확인한다.
+
+Supabase는 선택 사항이다. 기존 검증 데이터를 계속 보관하려는 경우에만 배포 후 Render 환경 변수에 `SUPABASE_URL`, `SUPABASE_KEY`를 별도로 추가한다.
 
 ## 운영 선택
 

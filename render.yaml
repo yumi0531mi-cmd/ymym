@@ -16,7 +16,3 @@ services:
         sync: false
       - key: KIS_ALLOW_TOKEN_ISSUE
         value: "true"
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_KEY
-        sync: false
