@@ -23,13 +23,13 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
-APP_VERSION = "6.0-live-scalping-screen"
+APP_VERSION = "6.1-ranked-100-final-5"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
-CLIENT_CACHE_VERSION = "client-contract-v11-us-day-bars"
+CLIENT_CACHE_VERSION = "client-contract-v12-ranked-100-pages"
 # The market-data connection has its own lifecycle. Bump this only when the
 # WebSocket protocol or recovery contract changes, without issuing a new REST token.
-REALTIME_HUB_CACHE_VERSION = "realtime-hub-v3-visible-fallback"
+REALTIME_HUB_CACHE_VERSION = "realtime-hub-v4-ranked-five"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 MAX_LIVE_CARDS = 5
 MAX_ANALYSIS_CANDIDATES = 5
@@ -285,7 +285,10 @@ def load_dashboard_candidates(market_value: str, cache_version: str) -> list[dic
     market = Market(market_value)
     client = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint())
     try:
-        rankings = client.market_rankings(market, limit=MAX_CANDIDATE_LIST)
+        # The v12 KIS client defaults to 100 rank rows. Calling without the
+        # optional keyword also keeps a live Streamlit worker safe if it is
+        # briefly finishing a rerun that still holds the prior method shape.
+        rankings = client.market_rankings(market)
         candidates = [candidate.to_dict() for candidate in merge_rankings(market, rankings, limit=MAX_CANDIDATE_LIST)]
         for candidate in candidates:
             candidate["candidate_source"] = "시장 실시간 순위"
