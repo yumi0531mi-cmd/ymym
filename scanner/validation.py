@@ -228,7 +228,7 @@ class ValidationCase:
         signal_at = datetime.fromisoformat(self.signal_time)
         if signal_at.tzinfo is not None and getattr(frame.index, "tz", None) is None:
             signal_at = signal_at.replace(tzinfo=None)
-        for horizon in (5, 10, 15, 30):
+        for horizon in (5, 15, 30):
             cutoff = signal_at + pd.Timedelta(horizon, unit="min")
             eligible = frame.loc[frame.index <= cutoff]
             if not eligible.empty:
@@ -450,7 +450,7 @@ class ValidationStore:
         by_source: dict[str, list[dict[str, Any]]] = {}
         horizon_stats = {
             str(minutes): {"complete": 0, "range_pass": 0, "direction_pass": 0, "strict_pass": 0}
-            for minutes in (5, 10, 15, 30)
+            for minutes in (5, 15, 30)
         }
         for row in complete:
             horizons = [item for item in row.get("horizons", []) if item.get("actual") is not None]

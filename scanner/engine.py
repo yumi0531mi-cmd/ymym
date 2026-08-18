@@ -5,7 +5,7 @@ from datetime import datetime
 import pandas as pd
 
 from .calibration import MIN_COMPLETE_PATH_SAMPLES
-from .forecast import cap_upside_forecast_path, forecast_path
+from .forecast import apply_risk_persistence_to_forecast, cap_upside_forecast_path, forecast_path
 from .indicators import enrich
 from .models import Market, Quote, Regime, Signal, TradePlan
 from .persistence_engine import final_buy_decision, persistence_score, risk_state
@@ -193,6 +193,7 @@ def analyze(
     entry = entry or quote.price
     target1, target2, support, target1_basis, target2_basis, support_basis = trade_levels(df, entry, box)
     raw_forecast_points = forecast_path(completed, regime, reference_price=quote.price)
+    forecast_engine_diagnostics = dict(getattr(raw_forecast_points, "diagnostics", {}))
     entry_resistance_1m, _, _, _ = confirmed_levels(df, entry)
     flags = fake_signal_flags(completed, support, entry_resistance_1m)
     risk = risk_state(df, current_price=quote.price, support=support, fake_breakdown=flags["fake_breakdown"])
@@ -218,12 +219,29 @@ def analyze(
         target1 is not None and target2 is not None
         and breakout_flow_confirmed and breakout_trade_confirmed and breakout_retest_confirmed
     )
+    remaining = remaining_session_minutes(quote.market, quote.timestamp)
+    persistence = persistence_score(
+        df,
+        regime=regime,
+        box_valid=bool(box),
+        rvol=float(latest.rvol),
+        notional_rvol=float(latest.notional_rvol),
+        spread_ok=spread_ok,
+        remaining_minutes=remaining,
+    )
     forecast_points = cap_upside_forecast_path(
         raw_forecast_points, quote.price, target1, target2, breakout_extension_confirmed
     )
+    forecast_points = apply_risk_persistence_to_forecast(
+        forecast_points,
+        quote.price,
+        risk.state,
+        persistence.score,
+        persistence.swing.fatigue,
+    )
     forecast_by_minutes = {point.minutes: point for point in forecast_points}
     has_downward_forecast = any(point.direction == Regime.DOWN for point in forecast_points)
-    forecast_path_ready = {point.minutes for point in forecast_points} == {5, 10, 15, 30}
+    forecast_path_ready = {point.minutes for point in forecast_points} == {5, 15, 30}
     long_price_path_confirmed = forecast_path_ready and all(
         point.direction == Regime.UP and float(point.base) > quote.price
         for point in forecast_points
@@ -240,16 +258,6 @@ def analyze(
             target1_basis, target2_basis = "방향 재계산 중", "방향 재계산 중"
         else:
             target1_basis, target2_basis = "현재가 위 구조 목표 재확인 중", "다음 구조 목표 재확인 중"
-    remaining = remaining_session_minutes(quote.market, quote.timestamp)
-    persistence = persistence_score(
-        df,
-        regime=regime,
-        box_valid=bool(box),
-        rvol=float(latest.rvol),
-        notional_rvol=float(latest.notional_rvol),
-        spread_ok=spread_ok,
-        remaining_minutes=remaining,
-    )
 
     cost_pct = _round_trip_cost_pct(quote.market) if round_trip_cost_pct is None else max(round_trip_cost_pct, 0.0)
     cost_amount = entry * cost_pct / 100
@@ -319,7 +327,7 @@ def analyze(
         calibration_expectancy_pct=calibration_expectancy_pct,
     )
     gates = dict(decision.gates)
-    gates["5·10·15·30분 상방 경로"] = long_price_path_confirmed
+    gates["5·15·30분 상방 경로"] = long_price_path_confirmed
     gates["호환 전략 조합"] = ensemble.cluster not in {"CONFLICT", "DATA_WAIT"} and ensemble.score >= 30
     gates["사용자 최소점수"] = score >= minimum_score
     final_buy = all(gates.values())
@@ -338,11 +346,11 @@ def analyze(
     if not rr_ok:
         reasons.append("1차 목표 기준 비용 반영 순손익비가 1.10 미만입니다.")
     if has_downward_forecast:
-        reasons.append("5·10·15·30분 예상에 하방 경로가 있어 상승 가격 추천을 표시하지 않습니다.")
+        reasons.append("5·15·30분 예상에 하방 경로가 있어 상승 가격 추천을 표시하지 않습니다.")
     elif not forecast_path_ready:
-        reasons.append("5·10·15·30분 방향을 계산할 완료 분봉이 아직 충분하지 않습니다.")
+        reasons.append("5·15·30분 방향을 계산할 완료 분봉이 아직 충분하지 않습니다.")
     elif not long_price_path_confirmed:
-        reasons.append("5·10·15·30분 상방 경로가 모두 확인되기 전에는 상승 가격 추천을 표시하지 않습니다.")
+        reasons.append("5·15·30분 상방 경로가 모두 확인되기 전에는 상승 가격 추천을 표시하지 않습니다.")
     if flags["fake_breakout"]:
         reasons.append("가짜 돌파 경고: 저항 위 고가 뒤 종가가 저항 아래로 복귀했습니다.")
     if flags["upper_rejection"]:
@@ -394,6 +402,28 @@ def analyze(
         "remaining_session_minutes": remaining,
         "completed_bar_at": str(completed.index[-1]),
         "strategy_ensemble": ensemble.to_dict(),
+        "data_quality": {
+            "status": "READY" if data_verified and len(completed) >= 60 else "LIMITED",
+            "completed_minute_bars": len(completed),
+            "indicator_warmup_ready": len(completed) >= 60,
+            "orderbook_available": bool(quote.bid and quote.ask),
+            "quote_source": quote.source,
+        },
+        "market_state": forecast_engine_diagnostics.get("market_state", "TRANSITION"),
+        "direction_engines": forecast_engine_diagnostics.get("direction_engines", {}),
+        "indicator_components": forecast_engine_diagnostics.get("components", {}),
+        "direction_invalidation": {
+            "risk_state": risk.state,
+            "pattern_fatigue": persistence.swing.fatigue,
+            "persistence_score": persistence.score,
+        },
+        "target_reachability": {
+            str(minutes): {
+                "target1": bool(target1 and forecast_by_minutes.get(minutes) and forecast_by_minutes[minutes].high >= target1),
+                "target2": bool(target2 and forecast_by_minutes.get(minutes) and forecast_by_minutes[minutes].high >= target2),
+            }
+            for minutes in (5, 15, 30)
+        },
         "calibration_probability_pct": calibration_probability if calibration_samples >= MIN_COMPLETE_PATH_SAMPLES else None,
         "calibration_expectancy_pct": calibration_expectancy_pct if calibration_samples >= MIN_COMPLETE_PATH_SAMPLES else None,
     }

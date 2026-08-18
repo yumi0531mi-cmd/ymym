@@ -23,7 +23,7 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
-APP_VERSION = "6.3-structural-cap"
+APP_VERSION = "6.4-3horizon-recommendations"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
 CLIENT_CACHE_VERSION = "client-contract-v12-ranked-100-pages"
@@ -41,6 +41,9 @@ MAX_PENDING_FORECAST_WATCHES = 1
 MAX_DAILY_RISE_PCT = 12.0
 KR_PRICE_CEILING = 300_000.0
 US_PRICE_CEILING = 200.0
+MIN_NET_TARGET_UPSIDE_PCT = 0.50
+MIN_NET_REWARD_RISK = 1.10
+MAX_STOP_DISTANCE_PCT = 2.00
 KR_SEARCH_INDEX_PATH = Path("data/kr_stock_index.json")
 ACTIVE_CARD_SESSIONS = {"KR_REGULAR", "US_DAY", "US_PRE", "US_REGULAR", "US_AFTER"}
 
@@ -570,7 +573,7 @@ def structure_strip_html(structure: dict[str, str]) -> str:
 def compact_directions(plan: Any) -> str:
     signs = {Regime.UP: "+", Regime.DOWN: "-", Regime.RANGE: "0"}
     values = []
-    for minutes in (5, 10, 15, 30):
+    for minutes in (5, 15, 30):
         point = forecast_point_for(plan, minutes)
         values.append(f"{minutes}분 {signs.get(point.direction, '?') if point else '?'}")
     return " · ".join(values)
@@ -654,14 +657,14 @@ def record_forecast_accuracy_audit(
     cost_pct: float,
     exchange: str = "",
 ) -> tuple[int, bool]:
-    """Record every complete forecast path, including down and watch cards, for prediction auditing."""
+    """Record every complete 5·15·30분 forecast path for prediction auditing."""
     scored_cases = store.score_ready(quote.symbol, quote.market.value, bars, float(cost_pct))
     live_tick = current_realtime_hub().tick(quote.market, quote.symbol)
     forecast_minutes = {point.minutes for point in getattr(plan, "forecasts", [])}
     if not (
         chart_aligned
         and bool(plan.diagnostics.get("forecast_path_ready"))
-        and forecast_minutes == {5, 10, 15, 30}
+        and forecast_minutes == {5, 15, 30}
     ):
         return scored_cases, False
     observed_price = live_tick.price if live_tick is not None else quote.price
@@ -788,7 +791,7 @@ def render_realtime_price(refresh_seconds: int, *args) -> None:
 
 def mixed_card_priority(item: dict[str, Any]) -> tuple[int, int, int]:
     plan = item["plan"]
-    decision_rank = {"매수 조건 충족": 3, "눌림목 대기": 2, "관찰": 1, "하방 제외": 0, "급등 과열 제외": 0}[card_trade_status(item)]
+    decision_rank = 3 if card_trade_status(item) == "매수 조건 충족" else 0
     trend_rank = 2 if plan.regime == Regime.UP else (1 if plan.regime == Regime.RANGE else 0)
     repeat_rank = 1 if repeat_band_pct(plan) is not None else 0
     return (decision_rank, trend_rank + repeat_rank, plan.score)
@@ -805,13 +808,34 @@ def card_trade_status(item: dict[str, Any]) -> str:
         return "하방 제외"
     if plan.signal == Signal.BUY and bool(diagnostics.get("long_price_path_confirmed")):
         return "매수 조건 충족"
-    if bool(diagnostics.get("long_price_path_confirmed")):
-        return "눌림목 대기"
-    return "관찰"
+    return "추천 조건 미충족"
+
+
+def recommendation_quality_passes(plan: Any, levels: dict[str, float | str | bool]) -> bool:
+    """Require a usable net target, bounded structural risk, and cost-aware reward/risk."""
+    if not bool(levels.get("available")):
+        return False
+    try:
+        entry = float(levels["entry"])
+        target1 = float(levels["target1"])
+        stop = float(levels["stop"])
+        cost_pct = max(0.0, float(plan.diagnostics.get("round_trip_cost_pct") or 0.0))
+        reward_risk = float(plan.diagnostics.get("reward_risk_net"))
+    except (KeyError, TypeError, ValueError):
+        return False
+    if entry <= 0 or not 0 < stop < entry < target1:
+        return False
+    net_upside_pct = (target1 / entry - 1.0) * 100.0 - cost_pct
+    stop_distance_pct = (entry / stop - 1.0) * 100.0
+    return (
+        net_upside_pct >= MIN_NET_TARGET_UPSIDE_PCT
+        and reward_risk >= MIN_NET_REWARD_RISK
+        and stop_distance_pct <= MAX_STOP_DISTANCE_PCT
+    )
 
 
 def card_ready_for_display(item: dict[str, Any]) -> bool:
-    """Show automatic cards only after the complete short-horizon reference set exists."""
+    """Show only executable recommendations, never observation or wait cards."""
     quote = item.get("quote")
     if not isinstance(quote, Quote) or quote.session not in ACTIVE_CARD_SESSIONS:
         return False
@@ -826,34 +850,15 @@ def card_ready_for_display(item: dict[str, Any]) -> bool:
     if bool(diagnostics.get("has_downward_forecast")):
         return False
     levels = actionable_display_levels(plan, quote)
-    return bool(levels.get("available")) and card_trade_status(item) in {"매수 조건 충족", "눌림목 대기"}
-
-
-def card_ready_for_observation(item: dict[str, Any]) -> bool:
-    """Allow a complete down/mixed path as an observation card, never as an upside-price card."""
-    quote = item.get("quote")
-    if not isinstance(quote, Quote) or quote.session not in ACTIVE_CARD_SESSIONS:
-        return False
-    if quote.change_pct > MAX_DAILY_RISE_PCT or not bool(item.get("chart_aligned")):
-        return False
-    plan = item["plan"]
-    return bool(plan.diagnostics.get("forecast_path_ready"))
+    return card_trade_status(item) == "매수 조건 충족" and recommendation_quality_passes(plan, levels)
 
 
 def visible_trade_cards(items: list[dict[str, Any]], display_limit: int = MAX_LIVE_CARDS) -> list[dict[str, Any]]:
-    """Show strong upside cards first, then complete observation paths until the card limit."""
+    """Show at most five fully actionable recommendations; an empty list remains empty."""
     limit = max(1, min(int(display_limit), MAX_LIVE_CARDS))
-    upside = [item for item in items if card_ready_for_display(item)]
-    upside.sort(key=mixed_card_priority, reverse=True)
-    if len(upside) >= limit:
-        return upside[:limit]
-    selected_ids = {id(item) for item in upside}
-    observations = [
-        item for item in items
-        if id(item) not in selected_ids and card_ready_for_observation(item)
-    ]
-    observations.sort(key=mixed_card_priority, reverse=True)
-    return (upside + observations)[:limit]
+    recommendations = [item for item in items if card_ready_for_display(item)]
+    recommendations.sort(key=mixed_card_priority, reverse=True)
+    return recommendations[:limit]
 
 
 def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
@@ -914,8 +919,8 @@ def render_plan_fields(item: dict[str, Any]) -> None:
     else:
         observation_text = "현재가 위 목표 구조 재확인 중"
     st.markdown(structure_strip_html(structure), unsafe_allow_html=True)
-    forecast_columns = st.columns(4)
-    for column, minutes in zip(forecast_columns, (5, 10, 15, 30)):
+    forecast_columns = st.columns(3)
+    for column, minutes in zip(forecast_columns, (5, 15, 30)):
         point = forecast_point_for(plan, minutes) if chart_aligned else None
         column.metric(f"{minutes}분 예상", price_text(point.base if point else None))
         direction = forecast_direction_text(point)
@@ -1015,17 +1020,7 @@ def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int, stor
         # producing links to a previous card. A keyed plain title has no anchor
         # state and remains bound to the correct symbol.
         st.markdown(f"<div class='ticker'>{html.escape(title)}</div>", unsafe_allow_html=True)
-        status = card_trade_status(item)
-        if status == "매수 조건 충족":
-            st.success("매수 조건 충족 · 표시 진입가와 손절가 확인 후 분할 진입")
-        elif status == "눌림목 대기":
-            st.warning("눌림목 대기 · 현재가 추격 금지")
-        elif status == "하방 제외":
-            st.error("하방 관찰 · 상방 가격 추천 없음")
-        elif status == "급등 과열 제외":
-            st.warning("급등 과열 제외 · 추격하지 않음")
-        else:
-            st.info("관찰 · 상방 조건이 모두 맞을 때까지 진입 금지")
+        st.success("추천 조건 통과 · 표시 진입가·목표가·손절가와 5·15·30분 경로를 함께 확인")
         render_realtime_price(
             refresh_seconds,
             quote.symbol,
@@ -1051,6 +1046,33 @@ def render_card_detail(item: dict[str, Any]) -> None:
             st.write(f"- {reason}")
         st.caption(f"1차 목표 근거: {plan.target_basis or '구조 미확인'} · 2차 목표 근거: {plan.target2_basis or '구조 미확인'}")
         st.caption(f"전체 경로 검증: {plan.calibration_probability:.1f}%" if plan.calibration_probability is not None else f"전체 경로 검증 표본: {plan.calibration_samples}/100")
+        diagnostics = plan.diagnostics
+        data_quality = diagnostics.get("data_quality", {})
+        st.caption(
+            f"데이터 품질: {data_quality.get('status', '미확인')} · 완료 1분봉 {data_quality.get('completed_minute_bars', 0)}개 · "
+            f"시장 상태: {diagnostics.get('market_state', 'TRANSITION')} · 위험 상태: {plan.risk_state}"
+        )
+        direction_engines = diagnostics.get("direction_engines", {})
+        if isinstance(direction_engines, dict) and direction_engines:
+            rows = [
+                {
+                    "시간": f"{minutes}분",
+                    "상태": detail.get("state", ""),
+                    "방향 점수": f"{float(detail.get('score', 0)):+.2f}",
+                    "예상 이동폭": f"{float(detail.get('expected_move_pct', 0)):+.2f}%",
+                    "변동 범위": f"±{float(detail.get('move_range_pct', 0)):.2f}%",
+                }
+                for minutes, detail in sorted(direction_engines.items(), key=lambda pair: int(pair[0]))
+                if isinstance(detail, dict)
+            ]
+            if rows:
+                st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        invalidation = diagnostics.get("direction_invalidation", {})
+        if isinstance(invalidation, dict):
+            st.caption(
+                f"방향 무효화·감쇠: {invalidation.get('risk_state', plan.risk_state)} · "
+                f"Pattern Fatigue {invalidation.get('pattern_fatigue', 0)} · 지속성 {invalidation.get('persistence_score', '미산출')}"
+            )
         if not item["bars"].empty:
             render_chart(item["bars"].tail(120), plan, key=f"chart_{quote.market.value}_{quote.symbol}")
 
@@ -1254,11 +1276,8 @@ if cards:
     updated_at = max(card["quote"].timestamp for card in cards)
     source_labels = {str(card.get("candidate_source") or "시장 실시간 순위") for card in cards}
     source_text = " · ".join(sorted(source_labels))
-    actionable_count = sum(card_trade_status(card) == "매수 조건 충족" for card in cards)
-    waiting_count = sum(card_trade_status(card) == "눌림목 대기" for card in cards)
-    observation_count = sum(card_trade_status(card) in {"하방 제외", "관찰"} for card in cards)
-    st.subheader(f"실시간 후보 · 매수 {actionable_count} · 눌림 대기 {waiting_count} · 하방 관찰 {observation_count}")
-    st.caption(f"시장 순위 100개 → 빠른 선별 {MAX_FAST_SHORTLIST}개 → 정밀 분석 {analyzed_count}개 → 실시간 체결 {len(cards)}개 · 과열 {len(blocked_cards)}개 제외 · {updated_at.strftime('%H:%M:%S')} · {realtime_hub.status_label()} · {source_text}")
+    st.subheader(f"실시간 추천 종목 · {len(cards)}개")
+    st.caption(f"시장 순위 100개 → 빠른 선별 {MAX_FAST_SHORTLIST}개 → 정밀 분석 {analyzed_count}개 → 추천 조건 통과 {len(cards)}개 · 과열 {len(blocked_cards)}개 제외 · {updated_at.strftime('%H:%M:%S')} · {realtime_hub.status_label()} · {source_text}")
     for card_item in cards:
         render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds)
 elif kis_connected and not errors and not candidates:
@@ -1266,7 +1285,7 @@ elif kis_connected and not errors and not candidates:
     st.info(f"현재 {limit_text} 가격 조건과 상승 후보 기준을 함께 통과한 종목이 없습니다.")
 
 if candidates and not cards:
-    st.warning("현재 상위 후보 중 5·10·15·30분 상방 경로를 통과한 종목이 없습니다. 하락·진입금지 종목은 표시하지 않습니다.")
+    st.info("현재 추천 종목 없음 · 상위 후보 중 최소 순기대폭·비용 반영 손익비·손절거리·5·15·30분 상방 경로를 모두 통과한 종목이 없습니다.")
 
 for error in errors:
     st.warning(f"일부 후보는 분석 데이터를 만들지 못했습니다: {error}")

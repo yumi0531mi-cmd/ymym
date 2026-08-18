@@ -76,7 +76,6 @@ def _plan(*_args, **_kwargs) -> TradePlan:
         stop_basis="1분봉 구조 무효화", entry_basis="완료봉 EMA9 지지", score=87, reasons=["완료봉 확인"], risk_state="NORMAL",
         forecasts=[
             ForecastPoint(5, 70000, 71000, 71500, Regime.UP, "EMA9·VWAP 위 · 거래량 강화"),
-            ForecastPoint(10, 70200, 71500, 72200, Regime.UP, "EMA9·VWAP 위 · 거래량 강화"),
             ForecastPoint(15, 70500, 72000, 73000, Regime.UP, "EMA9·VWAP 위 · 거래량 강화"),
             ForecastPoint(30, 71000, 73500, 75000, Regime.UP, "EMA9·VWAP 위 · 거래량 강화"),
         ],
@@ -203,7 +202,7 @@ def test_forecast_audit_starts_only_one_pending_path_per_market(tmp_path):
 
     assert first_recorded is True
     assert second_recorded is False
-    assert len(store.pending_forecast_audits("KR", version="6.3-structural-cap")) == 1
+    assert len(store.pending_forecast_audits("KR", version="6.4-3horizon-recommendations")) == 1
 
 
 def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():
@@ -234,7 +233,7 @@ def test_visible_trade_cards_keep_up_to_five_ready_candidates():
     assert {item["quote"].symbol for item in visible}.issubset({f"T{index}" for index in range(6)})
 
 
-def test_visible_trade_cards_fill_with_complete_downward_observations_when_upside_is_scarce():
+def test_visible_trade_cards_do_not_fill_with_downward_observations_when_recommendations_are_scarce():
     from app import visible_trade_cards
 
     upside = {"quote": _quote(), "plan": _plan(), "chart_aligned": True}
@@ -249,8 +248,7 @@ def test_visible_trade_cards_fill_with_complete_downward_observations_when_upsid
 
     visible = visible_trade_cards([upside, *observations])
 
-    assert len(visible) == 4
-    assert {item["quote"].symbol for item in visible} == {"005930", "D0", "D1", "D2"}
+    assert visible == [upside]
 
 
 def test_live_card_hides_candidate_that_turns_into_daily_overheat_after_selection():
@@ -279,17 +277,17 @@ def test_latest_completed_forecast_case_uses_only_active_rule_version_and_comple
 
     store = SimpleNamespace(cases=lambda: [
         SimpleNamespace(validation_kind="FORECAST_AUDIT", version="6.2-old", data_completeness="COMPLETE", full_path_pass=True, signal_time="2026-08-18T10:30:00"),
-        SimpleNamespace(validation_kind="FORECAST_AUDIT", version="6.3-structural-cap", data_completeness="PENDING", full_path_pass=None, signal_time="2026-08-18T10:31:00"),
-        SimpleNamespace(validation_kind="FORECAST_AUDIT", version="6.3-structural-cap", data_completeness="COMPLETE", full_path_pass=False, signal_time="2026-08-18T10:32:00"),
+        SimpleNamespace(validation_kind="FORECAST_AUDIT", version="6.4-3horizon-recommendations", data_completeness="PENDING", full_path_pass=None, signal_time="2026-08-18T10:31:00"),
+        SimpleNamespace(validation_kind="FORECAST_AUDIT", version="6.4-3horizon-recommendations", data_completeness="COMPLETE", full_path_pass=False, signal_time="2026-08-18T10:32:00"),
     ])
 
-    latest = latest_completed_forecast_case(store, "6.3-structural-cap")
+    latest = latest_completed_forecast_case(store, "6.4-3horizon-recommendations")
 
     assert latest is not None
     assert latest.signal_time == "2026-08-18T10:32:00"
 
 
-def test_card_trade_status_separates_buy_wait_and_downward_candidates():
+def test_card_trade_status_displays_only_buy_ready_recommendations():
     from app import card_ready_for_display, card_trade_status, visible_trade_cards
 
     plan = _plan()
@@ -303,15 +301,31 @@ def test_card_trade_status_separates_buy_wait_and_downward_candidates():
     assert card_ready_for_display(item) is True
 
     plan.signal = Signal.WAIT
-    assert card_trade_status(item) == "눌림목 대기"
-    assert card_ready_for_display(item) is True
+    assert card_trade_status(item) == "추천 조건 미충족"
+    assert card_ready_for_display(item) is False
 
     plan.diagnostics["has_downward_forecast"] = True
     assert card_trade_status(item) == "하방 제외"
-    assert visible_trade_cards([item], 10) == [item]
+    assert visible_trade_cards([item], 10) == []
 
     plan.diagnostics["has_downward_forecast"] = False
     plan.diagnostics["forecast_path_ready"] = False
+    assert card_ready_for_display(item) is False
+
+
+def test_card_ready_for_display_rejects_too_small_net_target_or_too_distant_stop():
+    from app import card_ready_for_display
+
+    plan = _plan()
+    quote = _quote()
+    item = {"quote": quote, "plan": plan, "chart_aligned": True}
+    assert card_ready_for_display(item) is True
+
+    plan.target = 70200
+    assert card_ready_for_display(item) is False
+
+    plan.target = 71000
+    plan.hard_stop = 68000
     assert card_ready_for_display(item) is False
 
 
@@ -376,7 +390,7 @@ def test_connected_app_automatically_renders_live_candidate_card_without_user_se
     assert any("실시간 상승·반복단타 혼합 스캐너" in str(item.value) for item in app.markdown)
     assert any("005930" in str(item.value) for item in app.markdown)
     assert {metric.label for metric in app.metric} >= {"현재가", "추천 매수가", "추천 매도가 1차", "추천 매도가 2차", "손절가"}
-    assert {metric.label for metric in app.metric} >= {"5분 예상", "10분 예상", "15분 예상", "30분 예상", "현재 차트 지지"}
+    assert {metric.label for metric in app.metric} >= {"5분 예상", "15분 예상", "30분 예상", "현재 차트 지지"}
     assert any("정밀 분석 1개" in str(item.value) for item in app.caption)
 
 

@@ -4,8 +4,8 @@ import numpy as np
 import pandas as pd
 
 from scanner.engine import analyze
-from scanner.forecast import cap_upside_forecast_path
-from scanner.indicators import resample
+from scanner.forecast import apply_risk_persistence_to_forecast, cap_upside_forecast_path, forecast_path
+from scanner.indicators import enrich, resample
 from scanner.models import Market, Quote, Regime, Signal
 from scanner.models import ForecastPoint
 from scanner.persistence import EventStore, ManualTrade
@@ -52,7 +52,7 @@ def test_validation_requires_all_horizons():
     case = ValidationCase.from_plan(plan, plan.current_price, "US_REGULAR")
     actual = {h.minutes: h.predicted_base for h in case.horizons}
     # Force one horizon outside its range: the entire path must fail.
-    actual[10] = case.horizons[1].predicted_high * 2
+    actual[15] = case.horizons[1].predicted_high * 2
     case.target_pass = True
     case.score_path(actual, plan.regime)
     assert case.full_path_pass is False
@@ -66,7 +66,7 @@ def test_repeat_box_width_is_bounded():
 
 
 def test_upside_forecast_is_capped_by_primary_structure_before_breakout_confirmation():
-    raw = [ForecastPoint(minutes, 100.0, 120.0, 125.0, Regime.UP, "raw") for minutes in (5, 10, 15, 30)]
+    raw = [ForecastPoint(minutes, 100.0, 120.0, 125.0, Regime.UP, "raw") for minutes in (5, 15, 30)]
 
     capped = cap_upside_forecast_path(raw, 100.0, 103.0, 108.0, False)
 
@@ -76,7 +76,7 @@ def test_upside_forecast_is_capped_by_primary_structure_before_breakout_confirma
 
 
 def test_upside_forecast_uses_next_resistance_only_after_all_breakout_conditions_are_confirmed():
-    raw = [ForecastPoint(minutes, 100.0, 120.0, 125.0, Regime.UP, "raw") for minutes in (5, 10, 15, 30)]
+    raw = [ForecastPoint(minutes, 100.0, 120.0, 125.0, Regime.UP, "raw") for minutes in (5, 15, 30)]
 
     extended = cap_upside_forecast_path(raw, 100.0, 103.0, 104.5, True)
 
@@ -85,7 +85,7 @@ def test_upside_forecast_uses_next_resistance_only_after_all_breakout_conditions
 
 
 def test_upside_forecast_without_resistance_still_stops_at_five_percent_total_path_ceiling():
-    raw = [ForecastPoint(minutes, 100.0, 150.0, 160.0, Regime.UP, "raw") for minutes in (5, 10, 15, 30)]
+    raw = [ForecastPoint(minutes, 100.0, 150.0, 160.0, Regime.UP, "raw") for minutes in (5, 15, 30)]
 
     capped = cap_upside_forecast_path(raw, 100.0, None, None, False)
 
@@ -111,7 +111,7 @@ def test_future_scoring_is_chronological_and_strict():
                            "close": current * 1.001, "volume": 1000}, index=idx)
     case.score_future_bars(future)
     assert case.mfe_pct is not None and case.mae_pct is not None
-    assert len([h for h in case.horizons if h.actual is not None]) == 4
+    assert len([h for h in case.horizons if h.actual is not None]) == 3
 
 
 def test_forecast_audit_scores_full_path_from_kis_rest_snapshots():
@@ -291,7 +291,7 @@ def test_downward_forecast_hides_upward_price_plan(monkeypatch):
         "forecast_path",
         lambda *_args, **_kwargs: [
             ForecastPoint(minutes, 118.0, 119.0, 120.0, Regime.DOWN, "test down")
-            for minutes in (5, 10, 15, 30)
+            for minutes in (5, 15, 30)
         ],
     )
 
@@ -300,5 +300,49 @@ def test_downward_forecast_hides_upward_price_plan(monkeypatch):
     assert plan.target is None
     assert plan.target2 is None
     assert plan.diagnostics["long_price_path_confirmed"] is False
-    assert plan.diagnostics["final_buy_gates"]["5·10·15·30분 상방 경로"] is False
+    assert plan.diagnostics["final_buy_gates"]["5·15·30분 상방 경로"] is False
     assert plan.signal != Signal.BUY
+
+
+def test_indicator_enrichment_adds_role_separated_direction_inputs():
+    enriched = enrich(bars(80))
+
+    for column in ("stoch_k", "stoch_d", "macd_hist", "adx", "plus_di", "minus_di", "boll_width_pct", "obv", "cmf", "mfi", "roc10", "regression_slope"):
+        assert column in enriched.columns
+        assert pd.notna(enriched[column].iloc[-1])
+
+
+def test_forecast_path_keeps_horizon_specific_direction_engine_details():
+    forecast = forecast_path(bars(100, slope=.08), Regime.UP, reference_price=108.0)
+
+    assert [point.minutes for point in forecast] == [5, 15, 30]
+    assert getattr(forecast, "diagnostics")["market_state"] in {"TREND", "BREAKOUT", "TRANSITION", "RANGE"}
+    engines = getattr(forecast, "diagnostics")["direction_engines"]
+    assert set(engines) == {"5", "15", "30"}
+    assert engines["5"]["weights"] != engines["30"]["weights"]
+
+
+def test_engine_exposes_data_quality_direction_engines_and_target_reachability():
+    plan = analyze(quote(float(bars().close.iloc[-1])), bars())
+
+    assert plan.diagnostics["data_quality"]["completed_minute_bars"] >= 30
+    assert set(plan.diagnostics["direction_engines"]) == {"5", "15", "30"}
+    assert set(plan.diagnostics["target_reachability"]) == {"5", "15", "30"}
+    assert {"risk_state", "pattern_fatigue", "persistence_score"} <= set(plan.diagnostics["direction_invalidation"])
+
+
+def test_real_breakdown_invalidates_stale_upside_forecasts_at_every_horizon():
+    points = [ForecastPoint(minutes, 100.0, 102.0, 104.0, Regime.UP, "test") for minutes in (5, 15, 30)]
+
+    adjusted = apply_risk_persistence_to_forecast(points, 100.0, "REAL_BREAKDOWN", 85, 0)
+
+    assert all(point.direction == Regime.DOWN for point in adjusted)
+    assert all(point.base < 100.0 for point in adjusted)
+
+
+def test_pattern_fatigue_damps_the_thirty_minute_path_more_than_five_minutes():
+    points = [ForecastPoint(minutes, 100.0, 104.0, 105.0, Regime.UP, "test") for minutes in (5, 15, 30)]
+
+    adjusted = apply_risk_persistence_to_forecast(points, 100.0, "NORMAL_SWING", 50, 40)
+
+    assert adjusted[-1].base - 100.0 < adjusted[0].base - 100.0

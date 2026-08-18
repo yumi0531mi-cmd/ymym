@@ -110,11 +110,11 @@ def test_strategy_summary_includes_expectancy_and_profit_factor(tmp_path):
 def test_forecast_audit_summary_separates_all_direction_paths_from_trade_metrics(tmp_path):
     complete_down = [
         {"minutes": minutes, "actual": 99.0, "range_pass": True, "direction_pass": True, "pass_all": True}
-        for minutes in (5, 10, 15, 30)
+        for minutes in (5, 15, 30)
     ]
     complete_up_miss = [
         {"minutes": minutes, "actual": 101.0, "range_pass": minutes != 30, "direction_pass": True, "pass_all": minutes != 30}
-        for minutes in (5, 10, 15, 30)
+        for minutes in (5, 15, 30)
     ]
     rows = [
         {
@@ -149,7 +149,7 @@ def test_rest_snapshot_store_scores_mature_forecast_audit_once(tmp_path):
         latest_trade_price=100.0, quote_age_seconds=0.0, quote_pass=True, entry=None,
         predicted_regime="상승", actual_regime=None, regime_pass=None, target=None, target_basis="",
         stop=None, validation_kind="FORECAST_AUDIT", price_source="KIS REST",
-        horizons=[HorizonResult(minutes, 100.5, 101.0, 101.5, "상승") for minutes in (5, 10, 15, 30)],
+        horizons=[HorizonResult(minutes, 100.5, 101.0, 101.5, "상승") for minutes in (5, 15, 30)],
     )
     store = ValidationStore(tmp_path)
     store.save(case)
@@ -185,7 +185,7 @@ def test_late_first_rest_snapshot_expires_incomplete_audit_without_blocking_queu
         latest_trade_price=100.0, quote_age_seconds=0.0, quote_pass=True, entry=None,
         predicted_regime="상승", actual_regime=None, regime_pass=None, target=None, target_basis="",
         stop=None, validation_kind="FORECAST_AUDIT", exchange="NAS",
-        horizons=[HorizonResult(minutes, 100.5, 101.0, 101.5, "상승") for minutes in (5, 10, 15, 30)],
+        horizons=[HorizonResult(minutes, 100.5, 101.0, 101.5, "상승") for minutes in (5, 15, 30)],
     )
     store = ValidationStore(tmp_path)
     store.save(case)
