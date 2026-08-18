@@ -89,3 +89,70 @@ def test_final_buy_blocks_hard_kill_even_when_other_gates_pass():
     )
     assert decision.final_buy is False
     assert decision.gates["Hard Kill"] is False
+
+
+def test_trend_entry_can_pass_without_repeat_swing_when_other_safety_gates_pass():
+    persistence = PersistenceResult(
+        score=60,
+        band="WATCH",
+        horizon_state="PROJECTED_90",
+        confidence_pct=60.0,
+        horizon_minutes=300,
+        swing=SwingStatistics(),
+        vwap_occupancy_pct=80.0,
+        structure_ok=True,
+        liquidity_ok=True,
+        spread_ok=True,
+        remaining_minutes=100,
+        new_entry_allowed=True,
+    )
+    decision = final_buy_decision(
+        persistence=persistence,
+        risk=RiskResult("NORMAL_SWING", 100.0, 99.0, 2),
+        session_ok=True,
+        data_fresh=True,
+        execution_ok=True,
+        entry_zone_ok=True,
+        reward_risk_ok=True,
+        cooldown_active=False,
+        hard_kill=False,
+        calibration_probability=None,
+        calibration_samples=0,
+        require_repeat_swing=False,
+        minimum_persistence_score=55,
+    )
+    assert decision.final_buy is True
+    assert decision.gates["반복 Swing 구조"] is True
+
+
+def test_range_entry_still_requires_repeat_swing_structure():
+    persistence = PersistenceResult(
+        score=80,
+        band="PERSISTENT_A",
+        horizon_state="OBSERVED_300",
+        confidence_pct=90.0,
+        horizon_minutes=300,
+        swing=SwingStatistics(),
+        vwap_occupancy_pct=80.0,
+        structure_ok=True,
+        liquidity_ok=True,
+        spread_ok=True,
+        remaining_minutes=100,
+        new_entry_allowed=True,
+    )
+    decision = final_buy_decision(
+        persistence=persistence,
+        risk=RiskResult("NORMAL_SWING", 100.0, 99.0, 2),
+        session_ok=True,
+        data_fresh=True,
+        execution_ok=True,
+        entry_zone_ok=True,
+        reward_risk_ok=True,
+        cooldown_active=False,
+        hard_kill=False,
+        calibration_probability=None,
+        calibration_samples=0,
+        require_repeat_swing=True,
+    )
+    assert decision.final_buy is False
+    assert decision.gates["반복 Swing 구조"] is False

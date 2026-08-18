@@ -328,14 +328,19 @@ def final_buy_decision(
     calibration_probability: float | None,
     calibration_samples: int,
     calibration_expectancy_pct: float | None = None,
+    require_repeat_swing: bool = True,
+    minimum_persistence_score: int = 70,
 ) -> FinalDecision:
+    repeat_swing_ok = (
+        persistence.swing.valid_count >= 3
+        and bool(persistence.swing.representative_width_pct and 0.5 <= persistence.swing.representative_width_pct <= 5.0)
+    )
     gates = {
         "세션": session_ok,
         "남은 장시간": persistence.new_entry_allowed,
         "데이터 최신": data_fresh,
-        "Swing 3회": persistence.swing.valid_count >= 3,
-        "대표폭": bool(persistence.swing.representative_width_pct and 0.5 <= persistence.swing.representative_width_pct <= 5.0),
-        "지속성": persistence.score >= 70,
+        "반복 Swing 구조": repeat_swing_ok if require_repeat_swing else True,
+        "지속성": persistence.score >= minimum_persistence_score,
         "전략 구조": persistence.structure_ok,
         "진입 위치": entry_zone_ok,
         "실행 안전": execution_ok,

@@ -375,6 +375,8 @@ def analyze(
         calibration_probability=calibration_probability,
         calibration_samples=calibration_samples,
         calibration_expectancy_pct=calibration_expectancy_pct,
+        require_repeat_swing=is_range_strategy,
+        minimum_persistence_score=55 if is_trend_strategy else 70,
     )
     gates = dict(decision.gates)
     gates["15·30분 구조 경로"] = long_price_path_confirmed
@@ -449,6 +451,12 @@ def analyze(
             "structure_confirmed": long_price_path_confirmed,
             "entry_timing_confirmed": strategy_entry_timing_confirmed,
             "pullback_reentry_wait": pullback_reentry_wait,
+            "repeat_swing_required_for_entry": is_range_strategy,
+            "repeat_swing_available": bool(
+                persistence.swing.valid_count >= 3
+                and persistence.swing.representative_width_pct
+                and 0.5 <= persistence.swing.representative_width_pct <= 5.0
+            ),
             "reentry_trigger": (
                 "VWAP·EMA9 재회복 뒤 5분 반전 확인" if trend_pullback_reentry_wait
                 else "박스 하단 지지 재확인 뒤 5분 반전 확인" if range_pullback_reentry_wait

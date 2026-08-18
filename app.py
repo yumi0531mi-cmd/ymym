@@ -897,7 +897,7 @@ def observation_reason(item: dict[str, Any]) -> str:
         return "데이터·방향 계산 대기"
     if bool(diagnostics.get("has_downward_forecast")):
         return "15·30분 구조 하방"
-    if repeat_band_pct(plan) is None:
+    if plan.regime == Regime.RANGE and repeat_band_pct(plan) is None:
         return "Swing 반복폭 부족"
     levels = actionable_display_levels(plan, quote)
     if not bool(levels.get("available")):
