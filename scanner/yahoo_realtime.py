@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -27,6 +28,11 @@ def _number(value: Any) -> float | None:
     return parsed if parsed == parsed else None
 
 
+def choose_display_tick(kis_tick: RealtimeTick | None, yahoo_tick: RealtimeTick | None) -> RealtimeTick | None:
+    """Prefer the official KIS trade tick; use Yahoo only for display fallback."""
+    return kis_tick or yahoo_tick
+
+
 class YahooRealtimeHub:
     """Free Yahoo Finance streaming quote backup for the visible card prices.
 
@@ -41,11 +47,12 @@ class YahooRealtimeHub:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
-        self._desired: dict[tuple[Market, str], tuple[str, str]] = {}
+        self._desired: dict[tuple[Market, str], tuple[tuple[str, ...], str]] = {}
         self._ticks: dict[tuple[Market, str], RealtimeTick] = {}
         self._connected = False
         self._last_error = ""
         self._last_message_at: datetime | None = None
+        self._enabled = os.getenv("SCANNER_ENABLE_YAHOO_STREAM", "true").strip().lower() in {"1", "true", "yes", "on"}
 
     @staticmethod
     def yahoo_symbol(market: Market, symbol: str, exchange: str = "") -> str:
@@ -56,6 +63,20 @@ class YahooRealtimeHub:
         # KOSDAQ tag when available; KOSPI is the safe default for six-digit KR codes.
         suffix = ".KQ" if str(exchange).strip().upper() in {"KOSDAQ", "KQ"} else ".KS"
         return f"{clean}{suffix}"
+
+    @classmethod
+    def yahoo_symbols(cls, market: Market, symbol: str, exchange: str = "") -> tuple[str, ...]:
+        """Return every Yahoo symbol that can represent a candidate safely.
+
+        KIS ranking feeds can omit the KRX board for domestic candidates. In that
+        case we subscribe to both Korean Yahoo suffixes rather than silently leaving
+        the current-price card unchanged. At most five cards are visible, so this
+        bounded fallback adds no broad-market polling.
+        """
+        if market == Market.US or str(exchange).strip():
+            return (cls.yahoo_symbol(market, symbol, exchange),)
+        clean = str(symbol).strip().upper()
+        return (f"{clean}.KS", f"{clean}.KQ")
 
     @property
     def connected(self) -> bool:
@@ -73,6 +94,8 @@ class YahooRealtimeHub:
             return self._last_message_at
 
     def status_label(self) -> str:
+        if not self._enabled:
+            return "Yahoo 보조 시세 비활성화됨"
         if self.connected:
             return "Yahoo 보조 시세 수신 중 · 카드 현재가 1초 확인"
         if yf is None:
@@ -80,11 +103,13 @@ class YahooRealtimeHub:
         return "Yahoo 보조 시세 연결 준비 중"
 
     def configure(self, symbols: Iterable[tuple[Market, str, str]]) -> None:
-        desired: dict[tuple[Market, str], tuple[str, str]] = {}
+        if not self._enabled:
+            return
+        desired: dict[tuple[Market, str], tuple[tuple[str, ...], str]] = {}
         for market, symbol, exchange in symbols:
             clean = str(symbol).strip().upper()
             if clean:
-                desired[(market, clean)] = (self.yahoo_symbol(market, clean, exchange), str(exchange).strip().upper())
+                desired[(market, clean)] = (self.yahoo_symbols(market, clean, exchange), str(exchange).strip().upper())
         with self._lock:
             if desired == self._desired:
                 return
@@ -103,7 +128,7 @@ class YahooRealtimeHub:
         self._stop.set()
         self._wake.set()
 
-    def _snapshot(self) -> dict[tuple[Market, str], tuple[str, str]]:
+    def _snapshot(self) -> dict[tuple[Market, str], tuple[tuple[str, ...], str]]:
         with self._lock:
             return dict(self._desired)
 
@@ -131,9 +156,13 @@ class YahooRealtimeHub:
                 self._stop.wait(retry_seconds)
                 retry_seconds = min(retry_seconds * 2, 20.0)
 
-    async def _listen(self, desired: dict[tuple[Market, str], tuple[str, str]]) -> None:
+    async def _listen(self, desired: dict[tuple[Market, str], tuple[tuple[str, ...], str]]) -> None:
         assert yf is not None
-        reverse = {yahoo_symbol: key for key, (yahoo_symbol, _) in desired.items()}
+        reverse = {
+            yahoo_symbol: key
+            for key, (yahoo_symbols, _) in desired.items()
+            for yahoo_symbol in yahoo_symbols
+        }
 
         def receive(payload: dict[str, Any]) -> None:
             self._consume(payload, reverse)

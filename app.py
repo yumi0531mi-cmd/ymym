@@ -22,7 +22,7 @@ from scanner.realtime import KISRealtimeHub
 from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
-from scanner.yahoo_realtime import YahooRealtimeHub
+from scanner.yahoo_realtime import YahooRealtimeHub, choose_display_tick
 
 APP_VERSION = "5.6-kis-realtime"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
@@ -255,7 +255,10 @@ def display_tick(market: Market, symbol: str):
     validation. Yahoo is a display backup, so its quote can never change VWAP,
     completed bars, targets, stops, or KIS-based validation outcomes.
     """
-    return current_realtime_hub().tick(market, symbol) or current_yahoo_realtime_hub().tick(market, symbol)
+    return choose_display_tick(
+        current_realtime_hub().tick(market, symbol),
+        current_yahoo_realtime_hub().tick(market, symbol),
+    )
 
 
 def price_ceiling(market: Market) -> float:

@@ -1,6 +1,6 @@
 from scanner.models import Market
-from scanner.realtime import KISRealtimeHub, KR_TRADE_TR_ID, US_TRADE_TR_ID
-from scanner.yahoo_realtime import YahooRealtimeHub
+from scanner.realtime import KISRealtimeHub, KR_TRADE_TR_ID, US_TRADE_TR_ID, RealtimeTick
+from scanner.yahoo_realtime import YahooRealtimeHub, choose_display_tick
 
 
 class ApprovalOnlyClient:
@@ -120,6 +120,7 @@ def test_yahoo_realtime_normalizes_market_symbols_and_stores_display_tick():
     assert hub.yahoo_symbol(Market.US, "aapl", "NAS") == "AAPL"
     assert hub.yahoo_symbol(Market.KR, "005930", "KOSPI") == "005930.KS"
     assert hub.yahoo_symbol(Market.KR, "035900", "KOSDAQ") == "035900.KQ"
+    assert hub.yahoo_symbols(Market.KR, "950260") == ("950260.KS", "950260.KQ")
 
     hub._consume(
         {"id": "AAPL", "price": "210.25", "time": "1787047200000", "change_percent": "1.5", "bid": "210.24", "ask": "210.26", "day_volume": "12345"},
@@ -131,3 +132,15 @@ def test_yahoo_realtime_normalizes_market_symbols_and_stores_display_tick():
     assert tick.price == 210.25
     assert tick.change_pct == 1.5
     assert tick.source == "YAHOO_WEBSOCKET"
+
+
+def test_card_display_prefers_kis_tick_and_uses_yahoo_only_when_kis_is_missing():
+    from datetime import datetime
+    from scanner.sessions import KST
+
+    moment = datetime(2026, 8, 18, 12, 40, tzinfo=KST)
+    kis_tick = RealtimeTick("005930", Market.KR, 70000, 1.0, moment, source="KIS_WEBSOCKET")
+    yahoo_tick = RealtimeTick("005930", Market.KR, 69950, 0.9, moment, source="YAHOO_WEBSOCKET")
+
+    assert choose_display_tick(kis_tick, yahoo_tick) is kis_tick
+    assert choose_display_tick(None, yahoo_tick) is yahoo_tick
