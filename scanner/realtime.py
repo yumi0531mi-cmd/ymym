@@ -217,7 +217,16 @@ class KISRealtimeHub:
                 continue
             try:
                 approval = self._approval()
-                async with websockets.connect(self.websocket_url, ping_interval=20, ping_timeout=20, open_timeout=8) as ws:
+                # KIS uses its official raw WebSocket endpoint on port 21000.  Do not
+                # route this market-data stream through an automatically discovered
+                # HTTP proxy, which can time out before the KIS handshake completes.
+                async with websockets.connect(
+                    self.websocket_url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    open_timeout=8,
+                    proxy=None,
+                ) as ws:
                     for (market, symbol), exchange in desired.items():
                         if market == Market.KR:
                             await ws.send(self._request(approval, KR_TRADE_TR_ID, symbol))
