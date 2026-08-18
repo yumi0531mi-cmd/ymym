@@ -329,6 +329,45 @@ def test_card_ready_for_display_rejects_too_small_net_target_or_too_distant_stop
     assert card_ready_for_display(item) is False
 
 
+def test_pullback_wait_keeps_intact_trend_with_five_minute_downside_visible():
+    from app import card_ready_for_display, card_ready_for_pullback_wait, card_stage, card_trade_status
+
+    plan = _plan()
+    plan.signal = Signal.WAIT
+    plan.forecasts[0] = ForecastPoint(5, 69500, 69800, 70000, Regime.DOWN, "5m pullback")
+    plan.diagnostics["strategy_path"] = {
+        "kind": "TREND_SWING",
+        "structure_confirmed": True,
+        "entry_timing_confirmed": False,
+        "pullback_reentry_wait": True,
+        "reentry_trigger": "VWAP·EMA9 재회복 뒤 5분 반전 확인",
+    }
+    item = {"quote": _quote(), "plan": plan, "chart_aligned": True}
+
+    assert card_ready_for_display(item) is False
+    assert card_ready_for_pullback_wait(item) is True
+    assert card_trade_status(item) == "눌림·재매수 대기"
+    assert card_stage(item) == "PULLBACK_WAIT"
+
+
+def test_candidate_stage_summary_reports_observation_reason_counts():
+    from app import candidate_stage_summary
+
+    final_item = {"quote": _quote(), "plan": _plan(), "chart_aligned": True}
+    observation_plan = _plan()
+    observation_plan.signal = Signal.WAIT
+    observation_plan.repeat_box = (69000, 71000)
+    observation_plan.diagnostics["reward_risk_net"] = 0.8
+    observation_item = {"quote": _quote(), "plan": observation_plan, "chart_aligned": True}
+
+    summary = candidate_stage_summary([final_item, observation_item], candidate_pool=12)
+
+    assert summary["funnel"]["후보풀"] == 12
+    assert summary["stages"]["FINAL_BUY"] == 1
+    assert summary["stages"]["OBSERVATION"] == 1
+    assert summary["reasons"]["손익비 부족"] == 1
+
+
 def test_missing_kis_credentials_shows_safe_waiting_screen_without_buttons():
     st.cache_resource.clear()
     st.cache_data.clear()

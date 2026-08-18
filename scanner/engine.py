@@ -177,8 +177,11 @@ def analyze(
         )
 
     states = multi_timeframe(completed)
-    trend_confirmed = states[15].regime == Regime.UP and states[5].regime == Regime.UP
+    # 15분 구조가 상승이면 5분 하락은 즉시 하락 추세가 아니라 정상 눌림일 수 있다.
+    # 5분은 전략의 진입 타이밍으로 별도 판정한다.
+    trend_confirmed = states[15].regime == Regime.UP
     box = repeat_box(df, quote.price)
+    zone = price_zone_in_box(box, quote.price)
     if trend_confirmed:
         regime, strategy = Regime.UP, "TREND_SWING · 상승 추세 눌림"
     elif box:
@@ -240,12 +243,60 @@ def analyze(
         persistence.swing.fatigue,
     )
     forecast_by_minutes = {point.minutes: point for point in forecast_points}
-    has_downward_forecast = any(point.direction == Regime.DOWN for point in forecast_points)
     forecast_path_ready = {point.minutes for point in forecast_points} == {5, 15, 30}
-    long_price_path_confirmed = forecast_path_ready and all(
-        point.direction == Regime.UP and float(point.base) > quote.price
-        for point in forecast_points
+    point_5 = forecast_by_minutes.get(5)
+    point_15 = forecast_by_minutes.get(15)
+    point_30 = forecast_by_minutes.get(30)
+    is_trend_strategy = strategy.startswith("TREND_SWING")
+    is_range_strategy = strategy.startswith("RANGE_SWING")
+    trend_structure_confirmed = bool(
+        forecast_path_ready
+        and point_15 is not None and point_30 is not None
+        and point_15.direction == Regime.UP and point_30.direction == Regime.UP
     )
+    range_structure_confirmed = bool(
+        forecast_path_ready and box
+        and point_15 is not None and point_30 is not None
+        and point_15.direction in {Regime.UP, Regime.RANGE}
+        and point_30.direction in {Regime.UP, Regime.RANGE}
+    )
+    # A 5-minute downside in an otherwise intact trend or range is a timing state,
+    # not a structural breakdown. Structural downside is reserved for 15/30 minutes.
+    has_downward_forecast = bool(
+        forecast_path_ready
+        and ((point_15 is not None and point_15.direction == Regime.DOWN)
+             or (point_30 is not None and point_30.direction == Regime.DOWN))
+    )
+    long_price_path_confirmed = (
+        trend_structure_confirmed if is_trend_strategy
+        else range_structure_confirmed if is_range_strategy
+        else False
+    )
+    trend_entry_timing_confirmed = bool(
+        trend_structure_confirmed and point_5 is not None
+        and point_5.direction == Regime.UP and float(point_5.base) > quote.price
+    )
+    range_entry_timing_confirmed = bool(
+        range_structure_confirmed and point_5 is not None
+        and point_5.direction == Regime.UP and float(point_5.base) > quote.price
+    )
+    strategy_entry_timing_confirmed = (
+        trend_entry_timing_confirmed if is_trend_strategy
+        else range_entry_timing_confirmed if is_range_strategy
+        else False
+    )
+    trend_pullback_reentry_wait = bool(
+        trend_structure_confirmed and point_5 is not None
+        and point_5.direction in {Regime.DOWN, Regime.RANGE}
+        and risk.state in {"NORMAL_PULLBACK", "SHAKEOUT", "NORMAL_SWING"}
+    )
+    range_pullback_reentry_wait = bool(
+        range_structure_confirmed and point_5 is not None
+        and point_5.direction in {Regime.DOWN, Regime.RANGE}
+        and zone == "하단 진입 구간"
+        and risk.state not in {"REAL_BREAKDOWN", "HARD_EXIT"}
+    )
+    pullback_reentry_wait = trend_pullback_reentry_wait or range_pullback_reentry_wait
     targets_ahead_of_quote = bool(
         long_price_path_confirmed and target1 is not None and target2 is not None
         and float(target1) > quote.price and float(target2) > float(target1)
@@ -276,7 +327,6 @@ def analyze(
     session_ok = quote.session in ACTIVE_SESSIONS
     vwap_ok = quote.price >= float(latest.vwap)
     ema_ok = quote.price >= float(latest.ema9)
-    zone = price_zone_in_box(box, quote.price)
     range_entry_ok = bool(box and zone == "하단 진입 구간")
     trend_entry_ok = trend_confirmed and vwap_ok and ema_ok
     entry_zone_ok = trend_entry_ok or range_entry_ok
@@ -327,7 +377,8 @@ def analyze(
         calibration_expectancy_pct=calibration_expectancy_pct,
     )
     gates = dict(decision.gates)
-    gates["5·15·30분 상방 경로"] = long_price_path_confirmed
+    gates["15·30분 구조 경로"] = long_price_path_confirmed
+    gates["전략별 5분 진입 타이밍"] = strategy_entry_timing_confirmed
     gates["호환 전략 조합"] = ensemble.cluster not in {"CONFLICT", "DATA_WAIT"} and ensemble.score >= 30
     gates["사용자 최소점수"] = score >= minimum_score
     final_buy = all(gates.values())
@@ -346,11 +397,13 @@ def analyze(
     if not rr_ok:
         reasons.append("1차 목표 기준 비용 반영 순손익비가 1.10 미만입니다.")
     if has_downward_forecast:
-        reasons.append("5·15·30분 예상에 하방 경로가 있어 상승 가격 추천을 표시하지 않습니다.")
+        reasons.append("15분 또는 30분 예상이 하방이어서 구조 상승 후보에서 제외합니다.")
     elif not forecast_path_ready:
         reasons.append("5·15·30분 방향을 계산할 완료 분봉이 아직 충분하지 않습니다.")
     elif not long_price_path_confirmed:
-        reasons.append("5·15·30분 상방 경로가 모두 확인되기 전에는 상승 가격 추천을 표시하지 않습니다.")
+        reasons.append("전략별 15·30분 구조 경로가 아직 확인되지 않았습니다.")
+    elif not strategy_entry_timing_confirmed:
+        reasons.append("5분은 구조가 아니라 현재 진입 타이밍입니다. 눌림·재반전 조건을 확인합니다.")
     if flags["fake_breakout"]:
         reasons.append("가짜 돌파 경고: 저항 위 고가 뒤 종가가 저항 아래로 복귀했습니다.")
     if flags["upper_rejection"]:
@@ -391,6 +444,21 @@ def analyze(
         "long_price_path_confirmed": long_price_path_confirmed,
         "has_downward_forecast": has_downward_forecast,
         "forecast_path_ready": forecast_path_ready,
+        "strategy_path": {
+            "kind": "TREND_SWING" if is_trend_strategy else "RANGE_SWING" if is_range_strategy else "NONE",
+            "structure_confirmed": long_price_path_confirmed,
+            "entry_timing_confirmed": strategy_entry_timing_confirmed,
+            "pullback_reentry_wait": pullback_reentry_wait,
+            "reentry_trigger": (
+                "VWAP·EMA9 재회복 뒤 5분 반전 확인" if trend_pullback_reentry_wait
+                else "박스 하단 지지 재확인 뒤 5분 반전 확인" if range_pullback_reentry_wait
+                else "현재 5분 진입 타이밍 확인"
+            ),
+            "directions": {
+                str(minutes): forecast_by_minutes[minutes].direction.value
+                for minutes in (5, 15, 30) if minutes in forecast_by_minutes
+            },
+        },
         "raw_hard_stop": raw_hard_stop,
         "round_trip_cost_pct": cost_pct,
         "target1_window_minutes": 5,

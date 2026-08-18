@@ -791,7 +791,7 @@ def render_realtime_price(refresh_seconds: int, *args) -> None:
 
 def mixed_card_priority(item: dict[str, Any]) -> tuple[int, int, int]:
     plan = item["plan"]
-    decision_rank = 3 if card_trade_status(item) == "매수 조건 충족" else 0
+    decision_rank = {"FINAL_BUY": 3, "PULLBACK_WAIT": 2, "OBSERVATION": 1}.get(card_stage(item), 0)
     trend_rank = 2 if plan.regime == Regime.UP else (1 if plan.regime == Regime.RANGE else 0)
     repeat_rank = 1 if repeat_band_pct(plan) is not None else 0
     return (decision_rank, trend_rank + repeat_rank, plan.score)
@@ -808,6 +808,8 @@ def card_trade_status(item: dict[str, Any]) -> str:
         return "하방 제외"
     if plan.signal == Signal.BUY and bool(diagnostics.get("long_price_path_confirmed")):
         return "매수 조건 충족"
+    if bool((diagnostics.get("strategy_path") or {}).get("pullback_reentry_wait")):
+        return "눌림·재매수 대기"
     return "추천 조건 미충족"
 
 
@@ -835,7 +837,7 @@ def recommendation_quality_passes(plan: Any, levels: dict[str, float | str | boo
 
 
 def card_ready_for_display(item: dict[str, Any]) -> bool:
-    """Show only executable recommendations, never observation or wait cards."""
+    """Return whether this item is an executable FINAL_BUY card."""
     quote = item.get("quote")
     if not isinstance(quote, Quote) or quote.session not in ACTIVE_CARD_SESSIONS:
         return False
@@ -853,12 +855,139 @@ def card_ready_for_display(item: dict[str, Any]) -> bool:
     return card_trade_status(item) == "매수 조건 충족" and recommendation_quality_passes(plan, levels)
 
 
+def card_ready_for_pullback_wait(item: dict[str, Any]) -> bool:
+    """Keep an intact trend/range pullback visible without marking it as executable now."""
+    quote = item.get("quote")
+    if not isinstance(quote, Quote) or quote.session not in ACTIVE_CARD_SESSIONS:
+        return False
+    if quote.change_pct > MAX_DAILY_RISE_PCT or not bool(item.get("chart_aligned")):
+        return False
+    plan = item["plan"]
+    diagnostics = plan.diagnostics
+    strategy_path = diagnostics.get("strategy_path") or {}
+    if not bool(diagnostics.get("forecast_path_ready")) or bool(diagnostics.get("has_downward_forecast")):
+        return False
+    if plan.risk_state in {"REAL_BREAKDOWN", "HARD_EXIT"}:
+        return False
+    levels = actionable_display_levels(plan, quote)
+    return bool(strategy_path.get("pullback_reentry_wait")) and recommendation_quality_passes(plan, levels)
+
+
+def card_stage(item: dict[str, Any]) -> str:
+    """Assign one screen stage: executable, pullback/re-entry wait, or observation."""
+    if card_ready_for_display(item):
+        return "FINAL_BUY"
+    if card_ready_for_pullback_wait(item):
+        return "PULLBACK_WAIT"
+    return "OBSERVATION"
+
+
+def observation_reason(item: dict[str, Any]) -> str:
+    """Give one concise, prioritized reason why a candidate is not currently executable."""
+    quote = item.get("quote")
+    if not isinstance(quote, Quote):
+        return "시세 데이터 확인 중"
+    plan = item["plan"]
+    diagnostics = plan.diagnostics
+    if quote.change_pct > MAX_DAILY_RISE_PCT:
+        return "당일 급등 과열"
+    if plan.risk_state in {"REAL_BREAKDOWN", "HARD_EXIT"}:
+        return plan.risk_state
+    if not bool(item.get("chart_aligned")) or not bool(diagnostics.get("forecast_path_ready")):
+        return "데이터·방향 계산 대기"
+    if bool(diagnostics.get("has_downward_forecast")):
+        return "15·30분 구조 하방"
+    if repeat_band_pct(plan) is None:
+        return "Swing 반복폭 부족"
+    levels = actionable_display_levels(plan, quote)
+    if not bool(levels.get("available")):
+        return "구조 가격대 재확인"
+    if not recommendation_quality_passes(plan, levels):
+        try:
+            if float(plan.diagnostics.get("reward_risk_net")) < MIN_NET_REWARD_RISK:
+                return "손익비 부족"
+        except (TypeError, ValueError):
+            pass
+        return "기대폭·손절거리 재확인"
+    point_5 = forecast_point_for(plan, 5)
+    if point_5 is not None and point_5.direction == Regime.DOWN:
+        return "5분 눌림 중"
+    return "재진입 구간 대기"
+
+
+def candidate_stage_summary(items: list[dict[str, Any]], candidate_pool: int) -> dict[str, Any]:
+    """Summarize funnel counts and prioritized observation reasons without fabricated data."""
+    reason_counts: dict[str, int] = {}
+    data_ready = 0
+    swing_ready = 0
+    strategy_ready = 0
+    reward_ready = 0
+    stages = {"FINAL_BUY": 0, "PULLBACK_WAIT": 0, "OBSERVATION": 0}
+    for item in items:
+        plan = item["plan"]
+        quote = item.get("quote")
+        stage = card_stage(item)
+        stages[stage] += 1
+        if bool(item.get("chart_aligned")) and bool(plan.diagnostics.get("forecast_path_ready")):
+            data_ready += 1
+        if repeat_band_pct(plan) is not None:
+            swing_ready += 1
+        if plan.regime in {Regime.UP, Regime.RANGE} and bool(plan.diagnostics.get("long_price_path_confirmed")):
+            strategy_ready += 1
+        if isinstance(quote, Quote) and recommendation_quality_passes(plan, actionable_display_levels(plan, quote)):
+            reward_ready += 1
+        if stage == "OBSERVATION":
+            reason = observation_reason(item)
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    return {
+        "funnel": {
+            "후보풀": candidate_pool,
+            "정밀 분석": len(items),
+            "데이터 정상": data_ready,
+            "Swing 확인": swing_ready,
+            "TREND/RANGE 적합": strategy_ready,
+            "손익비·손절 적합": reward_ready,
+            "진입대기": stages["PULLBACK_WAIT"],
+            "FINAL_BUY": stages["FINAL_BUY"],
+        },
+        "stages": stages,
+        "reasons": reason_counts,
+    }
+
+
+def observation_rows(items: list[dict[str, Any]], display_limit: int = 10) -> list[dict[str, str]]:
+    """Return compact, data-backed observation rows for candidates not ready to trade."""
+    rows: list[dict[str, str]] = []
+    for item in sorted(items, key=mixed_card_priority, reverse=True):
+        if card_stage(item) != "OBSERVATION":
+            continue
+        quote: Quote = item["quote"]
+        plan = item["plan"]
+        rows.append({
+            "종목": f"{quote.symbol} · {item.get('name') or quote.market.value}",
+            "구조": regime_text(plan.regime),
+            "5·15·30분": compact_directions(plan),
+            "주요 사유": observation_reason(item),
+        })
+        if len(rows) >= max(1, int(display_limit)):
+            break
+    return rows
+
+
 def visible_trade_cards(items: list[dict[str, Any]], display_limit: int = MAX_LIVE_CARDS) -> list[dict[str, Any]]:
-    """Show at most five fully actionable recommendations; an empty list remains empty."""
+    """Show at most five executable FINAL_BUY cards."""
     limit = max(1, min(int(display_limit), MAX_LIVE_CARDS))
     recommendations = [item for item in items if card_ready_for_display(item)]
     recommendations.sort(key=mixed_card_priority, reverse=True)
     return recommendations[:limit]
+
+
+def visible_pullback_cards(items: list[dict[str, Any]], display_limit: int = MAX_LIVE_CARDS) -> list[dict[str, Any]]:
+    """Show at most five structurally intact pullback/re-entry waits."""
+    limit = max(1, min(int(display_limit), MAX_LIVE_CARDS))
+    waits = [item for item in items if card_ready_for_pullback_wait(item)]
+    waits.sort(key=mixed_card_priority, reverse=True)
+    return waits[:limit]
 
 
 def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
@@ -950,7 +1079,7 @@ def render_live_plan_fields(item: dict[str, Any], cost_pct: float, min_score: in
 
 @st.fragment(run_every=60.0)
 def run_hidden_forecast_validation(items: list[dict[str, Any]], cost_pct: float, min_score: int, store: ValidationStore) -> None:
-    """Keep all five final analysis cards in the forecast audit without exposing blocked cards."""
+    """Keep visible FINAL_BUY and pullback/re-entry candidates in the forecast audit."""
     for item in items:
         live_card_snapshot(item, cost_pct, min_score, store)
 
@@ -1011,7 +1140,10 @@ def render_latest_forecast_result(store: ValidationStore) -> None:
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 
-def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore, refresh_seconds: int) -> None:
+def render_live_card(
+    item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore,
+    refresh_seconds: int, stage: str = "FINAL_BUY",
+) -> None:
     """Render a price-first card with 1-second tick and 1-minute structure refreshes."""
     quote: Quote = item["quote"]
     title = f"{quote.symbol} · {item.get('name') or quote.market.value}"
@@ -1020,7 +1152,11 @@ def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int, stor
         # producing links to a previous card. A keyed plain title has no anchor
         # state and remains bound to the correct symbol.
         st.markdown(f"<div class='ticker'>{html.escape(title)}</div>", unsafe_allow_html=True)
-        st.success("추천 조건 통과 · 표시 진입가·목표가·손절가와 5·15·30분 경로를 함께 확인")
+        if stage == "PULLBACK_WAIT":
+            trigger = str((item["plan"].diagnostics.get("strategy_path") or {}).get("reentry_trigger") or "5분 반전 확인")
+            st.warning(f"눌림·재매수 대기 · {trigger}")
+        else:
+            st.success("FINAL_BUY · 표시 진입가·목표가·손절가와 5·15·30분 경로를 함께 확인")
         render_realtime_price(
             refresh_seconds,
             quote.symbol,
@@ -1252,10 +1388,15 @@ if candidates:
 if cards:
     analyzed_count = len(cards)
     blocked_cards = [card for card in cards if card_trade_status(card) == "하방 제외"]
-    cards = visible_trade_cards(cards, candidate_card_count)
-    analysis_cards = list(cards)
+    all_analyzed_cards = list(cards)
+    cards = visible_trade_cards(all_analyzed_cards, candidate_card_count)
+    pullback_cards = visible_pullback_cards(all_analyzed_cards, candidate_card_count)
+    analysis_cards = list({id(card): card for card in [*cards, *pullback_cards]}.values())
+    stage_summary = candidate_stage_summary(all_analyzed_cards, len(candidates))
 else:
     analysis_cards = []
+    pullback_cards = []
+    stage_summary = candidate_stage_summary([], len(candidates))
 
 realtime_hub.configure(
     (
@@ -1276,16 +1417,36 @@ if cards:
     updated_at = max(card["quote"].timestamp for card in cards)
     source_labels = {str(card.get("candidate_source") or "시장 실시간 순위") for card in cards}
     source_text = " · ".join(sorted(source_labels))
-    st.subheader(f"실시간 추천 종목 · {len(cards)}개")
+    st.subheader(f"현재 매수 가능 · {len(cards)}종목")
     st.caption(f"시장 순위 100개 → 빠른 선별 {MAX_FAST_SHORTLIST}개 → 정밀 분석 {analyzed_count}개 → 추천 조건 통과 {len(cards)}개 · 과열 {len(blocked_cards)}개 제외 · {updated_at.strftime('%H:%M:%S')} · {realtime_hub.status_label()} · {source_text}")
     for card_item in cards:
-        render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds)
+        render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "FINAL_BUY")
 elif kis_connected and not errors and not candidates:
     limit_text = "30만 원 미만" if market == Market.KR else "200달러 미만"
     st.info(f"현재 {limit_text} 가격 조건과 상승 후보 기준을 함께 통과한 종목이 없습니다.")
 
 if candidates and not cards:
-    st.info("현재 추천 종목 없음 · 상위 후보 중 최소 순기대폭·비용 반영 손익비·손절거리·5·15·30분 상방 경로를 모두 통과한 종목이 없습니다.")
+    st.info("현재 매수 가능 0종목 · 억지 추천은 표시하지 않습니다. 아래 눌림·재매수 대기와 관찰 후보의 구조·탈락 사유를 확인하세요.")
+
+if pullback_cards:
+    st.subheader(f"눌림·재매수 대기 · {len(pullback_cards)}종목")
+    st.caption("상승·박스 구조와 비용 반영 손익비는 유지되지만, 지금은 5분 눌림 또는 재반전 확인 단계입니다.")
+    for card_item in pullback_cards:
+        render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "PULLBACK_WAIT")
+
+if stage_summary["funnel"]:
+    funnel = " → ".join(f"{label} {count}" for label, count in stage_summary["funnel"].items())
+    st.caption(f"단계 통과 현황 · {funnel}")
+    reason_rows = [
+        {"주요 탈락 이유": reason, "종목 수": count}
+        for reason, count in sorted(stage_summary["reasons"].items(), key=lambda item: (-item[1], item[0]))[:5]
+    ]
+    if reason_rows:
+        st.subheader(f"관찰 후보 · {stage_summary['stages']['OBSERVATION']}종목")
+        st.dataframe(pd.DataFrame(reason_rows), hide_index=True, width="stretch")
+        rows = observation_rows(all_analyzed_cards)
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 for error in errors:
     st.warning(f"일부 후보는 분석 데이터를 만들지 못했습니다: {error}")

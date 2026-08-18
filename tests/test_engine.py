@@ -300,8 +300,55 @@ def test_downward_forecast_hides_upward_price_plan(monkeypatch):
     assert plan.target is None
     assert plan.target2 is None
     assert plan.diagnostics["long_price_path_confirmed"] is False
-    assert plan.diagnostics["final_buy_gates"]["5·15·30분 상방 경로"] is False
+    assert plan.diagnostics["final_buy_gates"]["15·30분 구조 경로"] is False
     assert plan.signal != Signal.BUY
+
+
+def test_trend_pullback_keeps_fifteen_and_thirty_minute_up_structure_for_reentry_wait(monkeypatch):
+    from scanner import engine as engine_module
+    from scanner.persistence_engine import RiskResult
+    from scanner.strategy import TimeframeState
+
+    frame = bars()
+    monkeypatch.setattr(
+        engine_module,
+        "multi_timeframe",
+        lambda *_args, **_kwargs: {
+            1: TimeframeState(1, Regime.DOWN, .5, 100.0, 100.0, 101.0),
+            5: TimeframeState(5, Regime.DOWN, .5, 100.0, 100.0, 101.0),
+            15: TimeframeState(15, Regime.UP, .8, 101.0, 100.0, 99.0),
+            30: TimeframeState(30, Regime.UP, .8, 101.0, 100.0, 99.0),
+        },
+    )
+    monkeypatch.setattr(engine_module, "chart_entry_level", lambda *_args, **_kwargs: (100.0, "test entry"))
+    monkeypatch.setattr(
+        engine_module,
+        "trade_levels",
+        lambda *_args, **_kwargs: (130.0, 140.0, 95.0, "test target 1", "test target 2", "test support"),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "forecast_path",
+        lambda *_args, **_kwargs: [
+            ForecastPoint(5, 118.0, 119.0, 120.0, Regime.DOWN, "5m pullback"),
+            ForecastPoint(15, 120.0, 125.0, 130.0, Regime.UP, "15m trend"),
+            ForecastPoint(30, 122.0, 130.0, 135.0, Regime.UP, "30m trend"),
+        ],
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "risk_state",
+        lambda *_args, **_kwargs: RiskResult("NORMAL_PULLBACK", 98.0, 95.0, 2, ["normal pullback"]),
+    )
+
+    plan = engine_module.analyze(quote(120.0), frame)
+
+    assert plan.regime == Regime.UP
+    assert plan.diagnostics["long_price_path_confirmed"] is True
+    assert plan.diagnostics["has_downward_forecast"] is False
+    assert plan.diagnostics["final_buy_gates"]["전략별 5분 진입 타이밍"] is False
+    assert plan.diagnostics["strategy_path"]["pullback_reentry_wait"] is True
+    assert plan.signal == Signal.WAIT
 
 
 def test_indicator_enrichment_adds_role_separated_direction_inputs():
