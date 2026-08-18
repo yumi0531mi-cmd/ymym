@@ -159,3 +159,20 @@ def test_rest_snapshot_store_scores_mature_forecast_audit_once(tmp_path):
     assert store.capture_rest_snapshot_and_score("TEST", "US", datetime(2026, 8, 18, 10, 30), 101.0) == 1
     stored = store.cases()[0]
     assert stored.price_snapshots[-1]["source"] == "KIS REST"
+
+
+def test_pending_forecast_audits_keep_oldest_five_across_card_rotation(tmp_path):
+    store = ValidationStore(tmp_path)
+    for index in range(6):
+        case = ValidationCase(
+            case_id=f"US-{index}", version="test", symbol=f"T{index}", market="US", session="US_PRE",
+            signal_time=f"2026-08-18T10:0{index}:00", signal="대기", quote_price=100.0,
+            latest_trade_price=100.0, quote_age_seconds=0.0, quote_pass=True, entry=None,
+            predicted_regime="상승", actual_regime=None, regime_pass=None, target=None, target_basis="",
+            stop=None, validation_kind="FORECAST_AUDIT", exchange="NAS",
+        )
+        store.save(case)
+
+    pending = store.pending_forecast_audits("US", limit=5)
+
+    assert [case.symbol for case in pending] == ["T0", "T1", "T2", "T3", "T4"]

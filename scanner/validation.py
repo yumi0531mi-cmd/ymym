@@ -75,6 +75,7 @@ class ValidationCase:
     forecast_path_direction: str = "MIXED"
     price_source: str = "KIS 체결"
     price_snapshots: list[dict[str, Any]] = field(default_factory=list)
+    exchange: str = ""
 
     @classmethod
     def from_plan(
@@ -86,6 +87,7 @@ class ValidationCase:
         latest_trade_time: datetime | None = None,
         validation_kind: str = "ACTIONABLE",
         price_source: str = "KIS 체결",
+        exchange: str = "",
     ):
         directions = {point.direction.value for point in plan.forecasts}
         forecast_path_direction = directions.pop() if len(directions) == 1 else "MIXED"
@@ -142,6 +144,7 @@ class ValidationCase:
             forecast_path_direction=forecast_path_direction,
             price_source=price_source,
             price_snapshots=price_snapshots,
+            exchange=exchange,
         )
 
     def score_path(self, actual_prices: dict[int, float], actual_regime: Regime | None = None) -> None:
@@ -357,6 +360,14 @@ class ValidationStore:
 
     def pending(self, market: str | None = None) -> list[ValidationCase]:
         return [case for case in self.cases() if case.full_path_pass is None and (market is None or case.market == market)]
+
+    def pending_forecast_audits(self, market: str, limit: int = 5) -> list[ValidationCase]:
+        """Return the oldest incomplete full-path audits so candidate rotation cannot drop them."""
+        pending = [
+            case for case in self.pending(market)
+            if case.validation_kind == "FORECAST_AUDIT"
+        ]
+        return sorted(pending, key=lambda case: case.signal_time)[:max(1, min(int(limit), 5))]
 
     def score_ready(self, symbol: str, market: str, bars: pd.DataFrame, cost_pct: float) -> int:
         """Score pending same-symbol cases after a complete 30-minute future path exists."""
