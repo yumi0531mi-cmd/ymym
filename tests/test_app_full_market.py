@@ -203,7 +203,7 @@ def test_forecast_audit_starts_only_one_pending_path_per_market(tmp_path):
 
     assert first_recorded is True
     assert second_recorded is False
-    assert len(store.pending_forecast_audits("KR", version="6.2-single-path-audit")) == 1
+    assert len(store.pending_forecast_audits("KR", version="6.3-structural-cap")) == 1
 
 
 def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():
