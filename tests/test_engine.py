@@ -84,6 +84,28 @@ def test_future_scoring_is_chronological_and_strict():
     assert len([h for h in case.horizons if h.actual is not None]) == 4
 
 
+def test_forecast_audit_scores_full_path_from_kis_rest_snapshots():
+    df = bars(180)
+    current = float(df.close.iloc[-1])
+    plan = analyze(quote(current), df)
+    case = ValidationCase.from_plan(
+        plan, current, "US_REGULAR", validation_kind="FORECAST_AUDIT", latest_trade_time=plan.created_at,
+        price_source="KIS REST",
+    )
+    case.price_snapshots = [
+        {
+            "timestamp": (pd.Timestamp(case.signal_time) + pd.Timedelta(horizon.minutes, unit="min")).isoformat(),
+            "price": horizon.predicted_base,
+            "source": "KIS REST",
+        }
+        for horizon in case.horizons
+    ]
+
+    assert case.score_price_snapshots() is True
+    assert case.data_completeness == "COMPLETE"
+    assert case.full_path_pass is True
+
+
 def test_repeat_box_rejects_price_outside_the_box():
     df = bars(slope=0)
     assert repeat_box(df, 150) is None

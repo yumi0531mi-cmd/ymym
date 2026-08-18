@@ -6,7 +6,7 @@ from scanner.calibration import calibration_for
 from scanner.cycle import CycleStore
 from scanner.models import Market
 from scanner.persistence import EventStore
-from scanner.validation import ValidationStore
+from scanner.validation import HorizonResult, ValidationCase, ValidationStore
 
 
 class RowsOnlyStore:
@@ -119,11 +119,11 @@ def test_forecast_audit_summary_separates_all_direction_paths_from_trade_metrics
     rows = [
         {
             "validation_kind": "FORECAST_AUDIT", "data_completeness": "COMPLETE",
-            "forecast_path_direction": "DOWN", "full_path_pass": True, "horizons": complete_down,
+            "forecast_path_direction": "DOWN", "price_source": "KIS 체결", "full_path_pass": True, "horizons": complete_down,
         },
         {
             "validation_kind": "FORECAST_AUDIT", "data_completeness": "COMPLETE",
-            "forecast_path_direction": "UP", "full_path_pass": False, "horizons": complete_up_miss,
+            "forecast_path_direction": "UP", "price_source": "KIS REST", "full_path_pass": False, "horizons": complete_up_miss,
         },
     ]
     store = ValidationStore(tmp_path)
@@ -139,3 +139,23 @@ def test_forecast_audit_summary_separates_all_direction_paths_from_trade_metrics
     assert audit["direction_full_path_pass"] == 2
     assert audit["horizons"]["30"]["strict_rate"] == 50.0
     assert audit["by_prediction_direction"]["DOWN"]["strict_full_path_rate"] == 100.0
+    assert audit["by_price_source"]["KIS REST"]["strict_full_path_rate"] == 0.0
+
+
+def test_rest_snapshot_store_scores_mature_forecast_audit_once(tmp_path):
+    case = ValidationCase(
+        case_id="US-TEST-audit", version="test", symbol="TEST", market="US", session="US_PRE",
+        signal_time="2026-08-18T10:00:00", signal="대기", quote_price=100.0,
+        latest_trade_price=100.0, quote_age_seconds=0.0, quote_pass=True, entry=None,
+        predicted_regime="상승", actual_regime=None, regime_pass=None, target=None, target_basis="",
+        stop=None, validation_kind="FORECAST_AUDIT", price_source="KIS REST",
+        horizons=[HorizonResult(minutes, 100.5, 101.0, 101.5, "상승") for minutes in (5, 10, 15, 30)],
+    )
+    store = ValidationStore(tmp_path)
+    store.save(case)
+    assert store.capture_rest_snapshot_and_score("TEST", "US", datetime(2026, 8, 18, 10, 5), 101.0) == 0
+    assert store.capture_rest_snapshot_and_score("TEST", "US", datetime(2026, 8, 18, 10, 10), 101.0) == 0
+    assert store.capture_rest_snapshot_and_score("TEST", "US", datetime(2026, 8, 18, 10, 15), 101.0) == 0
+    assert store.capture_rest_snapshot_and_score("TEST", "US", datetime(2026, 8, 18, 10, 30), 101.0) == 1
+    stored = store.cases()[0]
+    assert stored.price_snapshots[-1]["source"] == "KIS REST"

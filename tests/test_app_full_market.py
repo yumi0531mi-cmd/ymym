@@ -159,6 +159,28 @@ def test_forecast_audit_records_complete_watch_path_separately():
     assert saved_case.signal == Signal.WAIT.value
     assert saved_case.validation_kind == "FORECAST_AUDIT"
     assert saved_case.forecast_path_direction == Regime.UP.value
+    assert saved_case.price_source == "KIS 체결"
+
+
+def test_forecast_audit_uses_labeled_kis_rest_snapshot_while_trade_tick_reconnects():
+    from app import record_forecast_accuracy_audit
+
+    store = SimpleNamespace(
+        score_ready=Mock(return_value=0),
+        capture_rest_snapshot_and_score=Mock(return_value=0),
+        save_once=Mock(return_value=(Path("case.json"), True)),
+    )
+    hub = SimpleNamespace(tick=Mock(return_value=None))
+    watch_plan = _plan()
+    watch_plan.signal = Signal.WAIT
+
+    with patch("app.current_realtime_hub", return_value=hub):
+        _, recorded = record_forecast_accuracy_audit(store, watch_plan, _quote(), _bars(), True, 0.05)
+
+    assert recorded is True
+    saved_case = store.save_once.call_args.args[0]
+    assert saved_case.latest_trade_price == 70000
+    assert saved_case.price_source == "KIS REST"
 
 
 def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():

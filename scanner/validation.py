@@ -73,6 +73,8 @@ class ValidationCase:
     target_outcome: str | None = None
     validation_kind: str = "ACTIONABLE"
     forecast_path_direction: str = "MIXED"
+    price_source: str = "KIS 체결"
+    price_snapshots: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_plan(
@@ -83,6 +85,7 @@ class ValidationCase:
         version: str = "1.0.0",
         latest_trade_time: datetime | None = None,
         validation_kind: str = "ACTIONABLE",
+        price_source: str = "KIS 체결",
     ):
         directions = {point.direction.value for point in plan.forecasts}
         forecast_path_direction = directions.pop() if len(directions) == 1 else "MIXED"
@@ -97,6 +100,11 @@ class ValidationCase:
         structural_target_confirmed = any(token in (plan.target_basis or "") for token in ("스윙", "반복박스", "저항"))
         entry_executable = bool(quote_pass is True and orderbook_available and plan.entry and plan.stop)
         horizons = [HorizonResult(point.minutes, point.low, point.base, point.high, point.direction.value) for point in plan.forecasts]
+        price_snapshots = (
+            [{"timestamp": latest_trade_time.isoformat(), "price": float(latest_trade_price), "source": price_source}]
+            if latest_trade_time is not None and latest_trade_price is not None
+            else []
+        )
         return cls(
             case_id=case_id,
             version=version,
@@ -132,10 +140,12 @@ class ValidationCase:
             structural_target_confirmed=structural_target_confirmed,
             validation_kind=validation_kind,
             forecast_path_direction=forecast_path_direction,
+            price_source=price_source,
+            price_snapshots=price_snapshots,
         )
 
     def score_path(self, actual_prices: dict[int, float], actual_regime: Regime | None = None) -> None:
-        origin = self.entry or self.quote_price
+        origin = self.quote_price if self.validation_kind == "FORECAST_AUDIT" else self.entry or self.quote_price
         for horizon in self.horizons:
             actual = actual_prices.get(horizon.minutes)
             horizon.actual = actual
@@ -165,6 +175,42 @@ class ValidationCase:
                 self.structural_target_confirmed,
             )
         ) and self.data_completeness == "COMPLETE"
+
+    def score_price_snapshots(self) -> bool:
+        """Score a forecast audit from timestamped KIS REST snapshots after 30 minutes."""
+        if self.validation_kind != "FORECAST_AUDIT" or not self.horizons or not self.price_snapshots:
+            return False
+        signal_at = pd.Timestamp(self.signal_time)
+        observations: list[tuple[pd.Timestamp, float]] = []
+        for snapshot in self.price_snapshots:
+            try:
+                observed_at = pd.Timestamp(snapshot["timestamp"])
+                if observed_at.tzinfo is None and signal_at.tzinfo is not None:
+                    observed_at = observed_at.tz_localize(signal_at.tzinfo)
+                elif observed_at.tzinfo is not None and signal_at.tzinfo is None:
+                    observed_at = observed_at.tz_localize(None)
+                observations.append((observed_at, float(snapshot["price"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not observations:
+            return False
+        observations.sort(key=lambda item: item[0])
+        actual_prices: dict[int, float] = {}
+        for horizon in self.horizons:
+            cutoff = signal_at + pd.Timedelta(horizon.minutes, unit="min")
+            eligible = [item for item in observations if signal_at <= item[0] <= cutoff]
+            if eligible:
+                actual_prices[horizon.minutes] = eligible[-1][1]
+        if len(actual_prices) != len(self.horizons):
+            return False
+        final_price = actual_prices[max(actual_prices)]
+        actual_regime = (
+            Regime.UP if final_price > self.quote_price * 1.0005
+            else Regime.DOWN if final_price < self.quote_price * 0.9995
+            else Regime.RANGE
+        )
+        self.score_path(actual_prices, actual_regime)
+        return self.data_completeness == "COMPLETE"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -336,6 +382,40 @@ class ValidationStore:
             scored += 1
         return scored
 
+    def capture_rest_snapshot_and_score(
+        self,
+        symbol: str,
+        market: str,
+        observed_at: datetime,
+        price: float,
+        source: str = "KIS REST",
+    ) -> int:
+        """Append one KIS REST snapshot to pending forecast audits and score mature paths."""
+        if price <= 0:
+            return 0
+        observed = pd.Timestamp(observed_at)
+        scored = 0
+        for case in self.pending(market):
+            if case.symbol != symbol or case.validation_kind != "FORECAST_AUDIT":
+                continue
+            signal_at = pd.Timestamp(case.signal_time)
+            comparable_observed = observed
+            if comparable_observed.tzinfo is None and signal_at.tzinfo is not None:
+                comparable_observed = comparable_observed.tz_localize(signal_at.tzinfo)
+            elif comparable_observed.tzinfo is not None and signal_at.tzinfo is None:
+                comparable_observed = comparable_observed.tz_localize(None)
+            if comparable_observed < signal_at:
+                continue
+            timestamp_text = observed_at.isoformat()
+            snapshots = list(case.price_snapshots)
+            if not any(str(snapshot.get("timestamp")) == timestamp_text for snapshot in snapshots):
+                snapshots.append({"timestamp": timestamp_text, "price": float(price), "source": source})
+                case.price_snapshots = snapshots
+            if comparable_observed >= signal_at + pd.Timedelta(30, unit="min") and case.score_price_snapshots():
+                scored += 1
+            self.update(case)
+        return scored
+
     @staticmethod
     def _forecast_audit_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         """Summarize direction and price-path accuracy without mixing it with trade outcomes."""
@@ -343,6 +423,7 @@ class ValidationStore:
         strict_passes = [row for row in complete if row.get("full_path_pass") is True]
         direction_passes = []
         by_direction: dict[str, list[dict[str, Any]]] = {}
+        by_source: dict[str, list[dict[str, Any]]] = {}
         horizon_stats = {
             str(minutes): {"complete": 0, "range_pass": 0, "direction_pass": 0, "strict_pass": 0}
             for minutes in (5, 10, 15, 30)
@@ -353,6 +434,8 @@ class ValidationStore:
                 direction_passes.append(row)
             direction = str(row.get("forecast_path_direction") or "MIXED")
             by_direction.setdefault(direction, []).append(row)
+            source = str(row.get("price_source") or "KIS 체결")
+            by_source.setdefault(source, []).append(row)
             for horizon in horizons:
                 minutes = str(horizon.get("minutes"))
                 if minutes not in horizon_stats:
@@ -377,6 +460,16 @@ class ValidationStore:
             }
             for direction, group in by_direction.items()
         }
+        by_source_summary = {
+            source: {
+                "complete": len(group),
+                "strict_full_path_pass": sum(row.get("full_path_pass") is True for row in group),
+                "strict_full_path_rate": (
+                    sum(row.get("full_path_pass") is True for row in group) / len(group) * 100 if group else None
+                ),
+            }
+            for source, group in by_source.items()
+        }
         return {
             "records": len(rows),
             "complete_paths": len(complete),
@@ -386,6 +479,7 @@ class ValidationStore:
             "direction_full_path_rate": len(direction_passes) / len(complete) * 100 if complete else None,
             "horizons": horizon_stats,
             "by_prediction_direction": by_direction_summary,
+            "by_price_source": by_source_summary,
         }
 
     def summary(self) -> dict[str, Any]:
@@ -459,7 +553,7 @@ class ValidationStore:
         path = Path(output)
         path.parent.mkdir(parents=True, exist_ok=True)
         fields = [
-            "case_id", "version", "symbol", "market", "session", "signal_time", "signal", "score", "risk_state",
+                "case_id", "version", "symbol", "market", "session", "signal_time", "signal", "score", "risk_state", "validation_kind", "price_source", "price_snapshots",
             "quote_price", "latest_trade_price", "latest_trade_time", "quote_age_seconds", "quote_pass",
             "entry", "entry_executable", "orderbook_available", "spread_pct",
             "predicted_regime", "actual_regime", "regime_pass", "structural_target_confirmed",

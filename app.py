@@ -660,19 +660,26 @@ def record_forecast_accuracy_audit(
     live_tick = current_realtime_hub().tick(quote.market, quote.symbol)
     forecast_minutes = {point.minutes for point in getattr(plan, "forecasts", [])}
     if not (
-        live_tick
-        and chart_aligned
+        chart_aligned
         and bool(plan.diagnostics.get("forecast_path_ready"))
         and forecast_minutes == {5, 10, 15, 30}
     ):
         return scored_cases, False
+    observed_price = live_tick.price if live_tick is not None else quote.price
+    observed_time = live_tick.timestamp if live_tick is not None else quote.timestamp
+    price_source = "KIS 체결" if live_tick is not None else "KIS REST"
+    if live_tick is None:
+        scored_cases += store.capture_rest_snapshot_and_score(
+            quote.symbol, quote.market.value, observed_time, observed_price, price_source
+        )
     case = ValidationCase.from_plan(
         plan,
-        live_tick.price,
+        observed_price,
         quote.session,
         version=APP_VERSION,
-        latest_trade_time=live_tick.timestamp,
+        latest_trade_time=observed_time,
         validation_kind="FORECAST_AUDIT",
+        price_source=price_source,
     )
     _, recorded_case = store.save_once(case, cooldown_seconds=300)
     return scored_cases, recorded_case
