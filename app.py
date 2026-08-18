@@ -35,7 +35,9 @@ MAX_LIVE_CARDS = 5
 MAX_ANALYSIS_CANDIDATES = 5
 MAX_CANDIDATE_LIST = 100
 MAX_FAST_SHORTLIST = 15
-MAX_PENDING_FORECAST_WATCHES = 5
+# KIS WebSocket이 재연결 중일 때 REST 보조 경로는 한 표본만 이어 기록한다.
+# 후보 분석 호출과 합쳐도 분당 30건 제한을 넘기지 않기 위한 안전 장치다.
+MAX_PENDING_FORECAST_WATCHES = 1
 KR_PRICE_CEILING = 300_000.0
 US_PRICE_CEILING = 200.0
 KR_SEARCH_INDEX_PATH = Path("data/kr_stock_index.json")
@@ -923,18 +925,22 @@ def run_hidden_forecast_validation(items: list[dict[str, Any]], cost_pct: float,
 
 @st.fragment(run_every=60.0)
 def capture_pending_forecast_paths(store: ValidationStore, market_value: str) -> None:
-    """Continue up to five started forecasts after their cards leave the rotating watchlist."""
+    """Continue one REST-backed forecast, or a live-tick path, after card rotation."""
     market = Market(market_value)
     for case in store.pending_forecast_audits(market.value, MAX_PENDING_FORECAST_WATCHES):
+        tick = display_tick(market, case.symbol)
+        if tick is not None:
+            store.capture_rest_snapshot_and_score(
+                case.symbol, market.value, tick.timestamp, tick.price, "KIS 체결"
+            )
+            continue
         try:
             quote = _quote_from_cache_record(_load_quote_record(case.symbol, market.value, case.exchange))
         except (KISError, OSError, ValueError, KeyError):
             continue
-        tick = display_tick(market, case.symbol)
-        observed_price = tick.price if tick is not None else quote.price
-        observed_time = tick.timestamp if tick is not None else quote.timestamp
-        source = "KIS 체결" if tick is not None else "KIS REST"
-        store.capture_rest_snapshot_and_score(case.symbol, market.value, observed_time, observed_price, source)
+        store.capture_rest_snapshot_and_score(
+            case.symbol, market.value, quote.timestamp, quote.price, "KIS REST"
+        )
 
 
 def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore, refresh_seconds: int) -> None:

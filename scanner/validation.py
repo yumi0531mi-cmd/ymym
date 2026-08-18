@@ -424,6 +424,11 @@ class ValidationStore:
                 case.price_snapshots = snapshots
             if comparable_observed >= signal_at + pd.Timedelta(30, unit="min") and case.score_price_snapshots():
                 scored += 1
+            elif comparable_observed >= signal_at + pd.Timedelta(32, unit="min"):
+                # A late first snapshot cannot reconstruct the earlier 5/10/15-minute
+                # values. Close it as incomplete so it cannot block later candidates.
+                case.data_completeness = "EXPIRED"
+                case.full_path_pass = False
             self.update(case)
         return scored
 
@@ -484,6 +489,7 @@ class ValidationStore:
         return {
             "records": len(rows),
             "complete_paths": len(complete),
+            "expired_paths": sum(row.get("data_completeness") == "EXPIRED" for row in rows),
             "strict_full_path_pass": len(strict_passes),
             "strict_full_path_rate": len(strict_passes) / len(complete) * 100 if complete else None,
             "direction_full_path_pass": len(direction_passes),
