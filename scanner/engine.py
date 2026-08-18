@@ -171,6 +171,14 @@ def analyze(
     target1, target2, support, target1_basis, target2_basis, support_basis = trade_levels(df, entry, box)
     forecast_points = forecast_path(completed, regime, reference_price=quote.price)
     forecast_by_minutes = {point.minutes: point for point in forecast_points}
+    # A card may present an upward entry/target ladder only when every displayed
+    # 5/10/15/30-minute forecast is upward and its base estimate is above live price.
+    # A single downward horizon turns the card into observation-only rather than
+    # mixing a bearish forecast with an upward price recommendation.
+    long_price_path_confirmed = bool(forecast_points) and all(
+        point.direction == Regime.UP and float(point.base) > quote.price
+        for point in forecast_points
+    )
     # A forecast is never allowed to become an upside target below the intended entry.
     # If completed five-minute resistance is unavailable, display no target instead of
     # presenting a directionally invalid price level.
@@ -184,15 +192,17 @@ def analyze(
         target2 = float(forecast_target2.base)
         target2_basis = "15분 완료봉 모멘텀·VWAP·EMA·거래량·거래대금·ATR 계산"
     # A structural target that has already been passed by the live quote cannot guide
-    # a fresh entry. Hide the whole target ladder until new completed-bar resistance
-    # is formed above the current price.
+    # a fresh entry. Likewise, any downward forecast disables upward price guidance.
     targets_ahead_of_quote = bool(
-        target1 is not None and target2 is not None
+        long_price_path_confirmed and target1 is not None and target2 is not None
         and float(target1) > quote.price and float(target2) > float(target1)
     )
     if not targets_ahead_of_quote:
         target1, target2 = None, None
-        target1_basis, target2_basis = "현재가 위 1차 목표 재확인 중", "현재가 위 2차 목표 재확인 중"
+        if not long_price_path_confirmed:
+            target1_basis, target2_basis = "하방 경로 관찰 중", "하방 경로 관찰 중"
+        else:
+            target1_basis, target2_basis = "현재가 위 1차 목표 재확인 중", "현재가 위 2차 목표 재확인 중"
     entry_resistance_1m, _, _, _ = confirmed_levels(df, entry)
     flags = fake_signal_flags(completed, support, entry_resistance_1m)
     risk = risk_state(df, current_price=quote.price, support=support, fake_breakdown=flags["fake_breakdown"])
@@ -289,6 +299,7 @@ def analyze(
         calibration_expectancy_pct=calibration_expectancy_pct,
     )
     gates = dict(decision.gates)
+    gates["5·10·15·30분 상방 경로"] = long_price_path_confirmed
     gates["호환 전략 조합"] = ensemble.cluster not in {"CONFLICT", "DATA_WAIT"} and ensemble.score >= 30
     gates["사용자 최소점수"] = score >= minimum_score
     final_buy = all(gates.values())
@@ -306,6 +317,8 @@ def analyze(
         reasons.append("호가 스프레드가 확인되지 않았거나 세션 허용 한도를 넘었습니다.")
     if not rr_ok:
         reasons.append("1차 목표 기준 비용 반영 순손익비가 1.10 미만입니다.")
+    if not long_price_path_confirmed:
+        reasons.append("5·10·15·30분 예상에 하방 또는 박스 경로가 있어 상승 가격 추천을 표시하지 않습니다.")
     if flags["fake_breakout"]:
         reasons.append("가짜 돌파 경고: 저항 위 고가 뒤 종가가 저항 아래로 복귀했습니다.")
     if flags["upper_rejection"]:
@@ -339,6 +352,7 @@ def analyze(
         "notional_rvol_threshold": notional_threshold,
         "reward_risk_net": reward_risk,
         "price_structure_valid": structure_ok,
+        "long_price_path_confirmed": long_price_path_confirmed,
         "raw_hard_stop": raw_hard_stop,
         "round_trip_cost_pct": cost_pct,
         "target1_window_minutes": 5,

@@ -466,6 +466,8 @@ def dashboard_structure(item: dict[str, Any]) -> dict[str, str]:
     }.get(plan.risk_state, "구조 확인 중")
     if not item.get("chart_aligned", True):
         current_state = str(item.get("chart_alignment_reason") or "완료 분봉 확인 중")
+    elif not bool(plan.diagnostics.get("long_price_path_confirmed")):
+        current_state = "하방 경로 관찰"
     return {
         "유형": kind,
         "큰 추세": trend_label,
@@ -660,27 +662,34 @@ def render_plan_fields(item: dict[str, Any]) -> None:
     structure = dashboard_structure(item)
     chart_aligned = bool(item.get("chart_aligned", True))
     price_structure_valid = bool(plan.diagnostics.get("price_structure_valid"))
-    show_price_structure = chart_aligned and price_structure_valid
+    long_price_path_confirmed = bool(plan.diagnostics.get("long_price_path_confirmed"))
+    show_price_structure = chart_aligned and price_structure_valid and long_price_path_confirmed
     target_1 = plan.target if show_price_structure else None
     target_2 = plan.target2 if show_price_structure else None
     support = plan.soft_stop if show_price_structure else None
     stop = (plan.hard_stop or plan.invalidation or plan.stop) if show_price_structure else None
+    observation_text = "하방 예상 · 상방 가격 추천 없음" if chart_aligned and not long_price_path_confirmed else "현재가 위 목표 구조 재확인 중"
     st.markdown(structure_strip_html(structure), unsafe_allow_html=True)
     forecast_columns = st.columns(4)
     for column, minutes in zip(forecast_columns, (5, 10, 15, 30)):
         point = forecast_point_for(plan, minutes) if chart_aligned else None
-        column.metric(
-            f"{minutes}분 예상",
-            price_text(point.base if point else None),
-            forecast_direction_text(point),
-        )
+        column.metric(f"{minutes}분 예상", price_text(point.base if point else None))
+        direction = forecast_direction_text(point)
+        if point is not None and point.direction == Regime.DOWN:
+            direction = f"▼ {direction}"
+        elif point is not None and point.direction == Regime.UP:
+            direction = f"▲ {direction}"
+        column.caption(direction)
     prices = st.columns(2)
-    prices[0].metric("추천 매수가", buy_range_text(plan, quote) if chart_aligned else "완료 분봉 확인 중")
-    prices[1].metric("추천 매도가 1차", price_text(target_1))
+    prices[0].metric(
+        "추천 매수가",
+        buy_range_text(plan, quote) if show_price_structure else (observation_text if chart_aligned else "완료 분봉 확인 중"),
+    )
+    prices[1].metric("추천 매도가 1차", price_text(target_1) if show_price_structure else observation_text)
     exits = st.columns(3)
-    exits[0].metric("추천 매도가 2차", price_text(target_2))
-    exits[1].metric("현재 차트 지지", price_text(support))
-    exits[2].metric("손절가", price_text(stop))
+    exits[0].metric("추천 매도가 2차", price_text(target_2) if show_price_structure else observation_text)
+    exits[1].metric("현재 차트 지지", price_text(support) if show_price_structure else observation_text)
+    exits[2].metric("손절가", price_text(stop) if show_price_structure else observation_text)
 
 
 @st.fragment(run_every=60.0)

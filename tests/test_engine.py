@@ -221,3 +221,32 @@ def test_invalid_structural_stop_falls_back_below_entry(monkeypatch):
     assert plan.hard_stop is not None and plan.hard_stop < plan.entry
     assert plan.soft_stop is not None and plan.soft_stop < plan.entry
     assert plan.diagnostics["raw_hard_stop"] == 105.0
+
+
+def test_downward_forecast_hides_upward_price_plan(monkeypatch):
+    from scanner import engine as engine_module
+    from scanner.models import ForecastPoint
+
+    frame = bars()
+    monkeypatch.setattr(engine_module, "chart_entry_level", lambda *_args, **_kwargs: (100.0, "test entry"))
+    monkeypatch.setattr(
+        engine_module,
+        "trade_levels",
+        lambda *_args, **_kwargs: (130.0, 140.0, 95.0, "test target 1", "test target 2", "test support"),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "forecast_path",
+        lambda *_args, **_kwargs: [
+            ForecastPoint(minutes, 118.0, 119.0, 120.0, Regime.DOWN, "test down")
+            for minutes in (5, 10, 15, 30)
+        ],
+    )
+
+    plan = engine_module.analyze(quote(120.0), frame)
+
+    assert plan.target is None
+    assert plan.target2 is None
+    assert plan.diagnostics["long_price_path_confirmed"] is False
+    assert plan.diagnostics["final_buy_gates"]["5·10·15·30분 상방 경로"] is False
+    assert plan.signal != Signal.BUY
