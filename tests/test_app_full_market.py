@@ -19,10 +19,10 @@ from scanner.realtime import RealtimeTick
 
 APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
 MOCK_RANKINGS = {
-    "거래대금·거래량 순위": [
+    "거래량 TOP100": [
         {"mksc_shrn_iscd": "005930", "hts_kor_isnm": "삼성전자", "stck_prpr": "70000", "acml_vol": "100000"},
     ],
-    "상승률 순위": [
+    "거래대금 TOP100": [
         {"mksc_shrn_iscd": "005930", "hts_kor_isnm": "삼성전자", "prdy_ctrt": "2.0"},
     ],
 }
@@ -327,6 +327,23 @@ def test_card_ready_for_display_rejects_too_small_net_target_or_too_distant_stop
     plan.target = 71000
     plan.hard_stop = 68000
     assert card_ready_for_display(item) is False
+
+
+def test_first_target_reachable_stays_visible_when_current_entry_timing_is_wait():
+    from app import card_stage, first_target_reachable, visible_target1_wait_cards
+
+    plan = _plan()
+    plan.signal = Signal.WAIT
+    plan.diagnostics["target_reachability"] = {
+        "5": {"target1": True, "target2": False},
+        "15": {"target1": True, "target2": False},
+        "30": {"target1": False, "target2": False},
+    }
+    item = {"quote": _quote(), "plan": plan, "chart_aligned": True}
+
+    assert first_target_reachable(item) is True
+    assert card_stage(item) == "TARGET1_WAIT"
+    assert visible_target1_wait_cards([item]) == [item]
 
 
 def test_pullback_wait_keeps_intact_trend_with_five_minute_downside_visible():

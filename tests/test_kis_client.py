@@ -178,12 +178,10 @@ def test_kr_market_rankings_use_two_first_page_requests(tmp_path):
     rankings = client.market_rankings(Market.KR)
 
     assert len(calls) == 2
-    assert {call[0] for call in calls} == {
-        "/uapi/domestic-stock/v1/quotations/volume-rank",
-        "/uapi/domestic-stock/v1/ranking/fluctuation",
-    }
-    assert len(rankings["거래대금·거래량 순위"]) == 1
-    assert len(rankings["상승률 순위"]) == 1
+    assert {call[0] for call in calls} == {"/uapi/domestic-stock/v1/quotations/volume-rank"}
+    assert {call[2]["FID_BLNG_CLS_CODE"] for call in calls} == {"0", "3"}
+    assert len(rankings["거래량 TOP100"]) == 1
+    assert len(rankings["거래대금 TOP100"]) == 1
 
 
 def test_us_market_rankings_use_two_requests_per_exchange(tmp_path):
@@ -200,8 +198,12 @@ def test_us_market_rankings_use_two_requests_per_exchange(tmp_path):
 
     assert len(calls) == 6
     assert {call[2]["EXCD"] for call in calls} == {"NAS", "NYS", "AMS"}
-    assert len(rankings["거래대금·거래량 순위"]) == 3
-    assert len(rankings["상승률 순위"]) == 3
+    assert {call[0] for call in calls} == {
+        "/uapi/overseas-stock/v1/ranking/trade-pbmn",
+        "/uapi/overseas-stock/v1/ranking/trade-vol",
+    }
+    assert len(rankings["거래대금 TOP100"]) == 3
+    assert len(rankings["거래량 TOP100"]) == 3
 
 
 def test_connection_diagnostics_hides_values_and_accepts_any_nested_section(tmp_path):
@@ -239,18 +241,18 @@ def test_domestic_rankings_keeps_successful_source_when_paired_rank_fails(tmp_pa
     client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
     calls = []
 
-    def fake_get_page(path, _tr_id, _params, _tr_cont=""):
+    def fake_get_page(path, _tr_id, params, _tr_cont=""):
         calls.append(path)
-        if path.endswith("volume-rank"):
+        if path.endswith("volume-rank") and params["FID_BLNG_CLS_CODE"] == "0":
             return {"output": [{"mksc_shrn_iscd": "005930", "stck_prpr": "70000"}]}, ""
-        raise KISError("temporary fluctuation rank failure")
+        raise KISError("temporary turnover rank failure")
 
     client._get_page = fake_get_page  # type: ignore[method-assign]
     rankings = client.market_rankings(Market.KR)
 
     assert len(calls) == 2
-    assert rankings["거래대금·거래량 순위"]
-    assert rankings["상승률 순위"] == []
+    assert rankings["거래량 TOP100"]
+    assert rankings["거래대금 TOP100"] == []
 
 
 def test_kr_market_rankings_collects_next_page_until_limit(tmp_path):
@@ -270,5 +272,5 @@ def test_kr_market_rankings_collects_next_page_until_limit(tmp_path):
     rankings = client.market_rankings(Market.KR, limit=3)
 
     assert [item[1] for item in calls] == ["", "N", ""]
-    assert [row["mksc_shrn_iscd"] for row in rankings["거래대금·거래량 순위"]] == ["000001", "000002", "000003"]
-    assert [row["mksc_shrn_iscd"] for row in rankings["상승률 순위"]] == ["000004"]
+    assert [row["mksc_shrn_iscd"] for row in rankings["거래량 TOP100"]] == ["000001", "000002", "000003"]
+    assert [row["mksc_shrn_iscd"] for row in rankings["거래대금 TOP100"]] == ["000004"]

@@ -555,7 +555,7 @@ class KISClient:
             # account entitlement. Keep a successful rank source rather than
             # discarding it because the paired source is temporarily unavailable.
             volume_rows: list[dict[str, Any]] = []
-            fluctuation_rows: list[dict[str, Any]] = []
+            turnover_rows: list[dict[str, Any]] = []
             failures: list[KISError] = []
             try:
                 volume_rows = self._ranking_pages(
@@ -566,7 +566,7 @@ class KISClient:
                         "FID_COND_SCR_DIV_CODE": "20171",
                         "FID_INPUT_ISCD": "0000",
                         "FID_DIV_CLS_CODE": "0",
-                        "FID_BLNG_CLS_CODE": "3",
+                        "FID_BLNG_CLS_CODE": "0",
                         "FID_TRGT_CLS_CODE": "111111111",
                         "FID_TRGT_EXLS_CLS_CODE": "0000000000",
                         "FID_INPUT_PRICE_1": "0",
@@ -580,24 +580,21 @@ class KISClient:
             except KISError as exc:
                 failures.append(exc)
             try:
-                fluctuation_rows = self._ranking_pages(
-                "/uapi/domestic-stock/v1/ranking/fluctuation",
-                "FHPST01700000",
+                turnover_rows = self._ranking_pages(
+                "/uapi/domestic-stock/v1/quotations/volume-rank",
+                "FHPST01710000",
                 {
-                        "fid_rsfl_rate2": "30",
-                        "fid_cond_mrkt_div_code": "J",
-                        "fid_cond_scr_div_code": "20170",
-                        "fid_input_iscd": "0000",
-                        "fid_rank_sort_cls_code": "0000",
-                        "fid_input_cnt_1": "0",
-                        "fid_prc_cls_code": "0",
-                        "fid_input_price_1": "0",
-                        "fid_input_price_2": "10000000",
-                        "fid_vol_cnt": "0",
-                        "fid_trgt_cls_code": "0",
-                        "fid_trgt_exls_cls_code": "0",
-                    "fid_div_cls_code": "0",
-                    "fid_rsfl_rate1": "0",
+                        "FID_COND_MRKT_DIV_CODE": "J",
+                        "FID_COND_SCR_DIV_CODE": "20171",
+                        "FID_INPUT_ISCD": "0000",
+                        "FID_DIV_CLS_CODE": "0",
+                        "FID_BLNG_CLS_CODE": "3",
+                        "FID_TRGT_CLS_CODE": "111111111",
+                        "FID_TRGT_EXLS_CLS_CODE": "0000000000",
+                        "FID_INPUT_PRICE_1": "0",
+                        "FID_INPUT_PRICE_2": "10000000",
+                        "FID_VOL_CNT": "0",
+                        "FID_INPUT_DATE_1": "",
                 },
                 "output",
                 limit=limit,
@@ -605,24 +602,24 @@ class KISClient:
             except KISError as exc:
                 failures.append(exc)
             rows = {
-                "거래대금·거래량 순위": volume_rows,
-                "상승률 순위": fluctuation_rows,
+                "거래량 TOP100": volume_rows,
+                "거래대금 TOP100": turnover_rows,
             }
             if not any(rows.values()) and failures:
                 raise failures[0]
             return rows
 
         return {
-            "거래대금·거래량 순위": self._us_ranking_pages(
+            "거래대금 TOP100": self._us_ranking_pages(
                 "/uapi/overseas-stock/v1/ranking/trade-pbmn",
                 "HHDFS76320010",
                 {"NDAY": "0", "VOL_RANG": "0", "AUTH": "", "KEYB": "", "PRC1": "", "PRC2": ""},
                 limit=limit,
             ),
-            "상승률 순위": self._us_ranking_pages(
-                "/uapi/overseas-stock/v1/ranking/updown-rate",
-                "HHDFS76290000",
-                {"NDAY": "0", "GUBN": "1", "VOL_RANG": "0", "AUTH": "", "KEYB": ""},
+            "거래량 TOP100": self._us_ranking_pages(
+                "/uapi/overseas-stock/v1/ranking/trade-vol",
+                "HHDFS76310010",
+                {"NDAY": "0", "VOL_RANG": "0", "AUTH": "", "KEYB": "", "PRC1": "", "PRC2": ""},
                 limit=limit,
             ),
         }

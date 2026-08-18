@@ -33,7 +33,7 @@ class MarketCandidate:
 
     @property
     def screen_score(self) -> int:
-        return sum(45 if source == "거래대금·거래량 순위" else 35 for source in self.sources) + (20 if len(self.sources) >= 2 else 0)
+        return sum(45 if source == "거래대금 TOP100" else 35 for source in self.sources) + (20 if len(self.sources) >= 2 else 0)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -83,8 +83,8 @@ def _candidate_from_row(row: dict[str, Any], market: Market, source: str) -> Mar
     )
 
 
-def merge_rankings(market: Market, rankings: dict[str, Iterable[dict[str, Any]]], limit: int = 20) -> list[MarketCandidate]:
-    """Merge first-page KIS rank results without fetching per-symbol details."""
+def merge_rankings(market: Market, rankings: dict[str, Iterable[dict[str, Any]]], limit: int = 200) -> list[MarketCandidate]:
+    """Preserve the deduplicated TOP100 volume/turnover union before detailed analysis."""
     candidates: dict[str, MarketCandidate] = {}
     for source, rows in rankings.items():
         for row in rows:

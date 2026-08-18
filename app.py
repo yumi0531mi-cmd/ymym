@@ -33,7 +33,7 @@ REALTIME_HUB_CACHE_VERSION = "realtime-hub-v4-ranked-five"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 MAX_LIVE_CARDS = 5
 MAX_ANALYSIS_CANDIDATES = 8
-MAX_CANDIDATE_LIST = 100
+MAX_CANDIDATE_LIST = 200
 MAX_FAST_SHORTLIST = 15
 # KIS WebSocket이 재연결 중일 때 REST 보조 경로는 한 표본만 이어 기록한다.
 # 후보 분석 호출과 합쳐도 분당 30건 제한을 넘기지 않기 위한 안전 장치다.
@@ -275,6 +275,15 @@ def eligible_price(candidate: dict[str, Any], market: Market) -> bool:
     return 0 < price < price_ceiling(market) and 0 < change_pct <= MAX_DAILY_RISE_PCT
 
 
+def candidate_pool_price_eligible(candidate: dict[str, Any], market: Market) -> bool:
+    """Keep the TOP100 volume/turnover union intact except for the user's price ceiling."""
+    try:
+        price = float(candidate.get("price") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return 0 < price < price_ceiling(market)
+
+
 def is_daily_overheated(price: float, previous_close: float) -> bool:
     """Return whether a refreshed quote must be removed from final candidate cards."""
     if price <= 0 or previous_close <= 0:
@@ -297,14 +306,14 @@ def sort_rising_candidates(candidates: list[dict[str, Any]], market: Market) -> 
 
 
 def fast_shortlist_candidates(candidates: list[dict[str, Any]], market: Market) -> list[dict[str, Any]]:
-    """Narrow a 100-name KIS ranking universe before any symbol-level REST calls."""
+    """Narrow the preserved ranking union before any symbol-level REST calls."""
     shortlisted = sort_rising_candidates(candidates, market)[:MAX_FAST_SHORTLIST]
     return [{**candidate, "candidate_stage": "순위·유동성 빠른 선별"} for candidate in shortlisted]
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_dashboard_candidates(market_value: str, cache_version: str) -> list[dict[str, Any]]:
-    """Return up to 100 rising price-eligible candidates without detailed analysis yet."""
+    """Return the price-eligible TOP100 volume/turnover union without signal filtering."""
     market = Market(market_value)
     client = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint())
     try:
@@ -314,10 +323,18 @@ def load_dashboard_candidates(market_value: str, cache_version: str) -> list[dic
         rankings = client.market_rankings(market)
         candidates = [candidate.to_dict() for candidate in merge_rankings(market, rankings, limit=MAX_CANDIDATE_LIST)]
         for candidate in candidates:
-            candidate["candidate_source"] = "시장 실시간 순위"
-        ranked = sort_rising_candidates(candidates, market)
-        if ranked:
-            return ranked[:MAX_CANDIDATE_LIST]
+            candidate["candidate_source"] = "거래량 TOP100 ∪ 거래대금 TOP100"
+        pool = [candidate for candidate in candidates if candidate_pool_price_eligible(candidate, market)]
+        if pool:
+            return sorted(
+                pool,
+                key=lambda candidate: (
+                    float(candidate.get("screen_score") or 0.0),
+                    float(candidate.get("turnover") or 0.0),
+                    float(candidate.get("volume") or 0.0),
+                ),
+                reverse=True,
+            )
     except KISError:
         # Ranking availability differs by market session and account entitlement.
         # A transparent liquid-list fallback avoids a blank first screen.
@@ -873,12 +890,34 @@ def card_ready_for_pullback_wait(item: dict[str, Any]) -> bool:
     return bool(strategy_path.get("pullback_reentry_wait")) and recommendation_quality_passes(plan, levels)
 
 
+def first_target_reachable(item: dict[str, Any]) -> bool:
+    """Identify a structurally reachable first target even when current entry timing is not ready."""
+    quote = item.get("quote")
+    if not isinstance(quote, Quote) or quote.session not in ACTIVE_CARD_SESSIONS:
+        return False
+    if quote.change_pct > MAX_DAILY_RISE_PCT or not bool(item.get("chart_aligned")):
+        return False
+    plan = item["plan"]
+    diagnostics = plan.diagnostics
+    if not bool(diagnostics.get("forecast_path_ready")) or bool(diagnostics.get("has_downward_forecast")):
+        return False
+    if plan.risk_state in {"REAL_BREAKDOWN", "HARD_EXIT"}:
+        return False
+    levels = actionable_display_levels(plan, quote)
+    if not recommendation_quality_passes(plan, levels):
+        return False
+    reachability = diagnostics.get("target_reachability") or {}
+    return any(bool((reachability.get(str(minutes)) or {}).get("target1")) for minutes in (5, 15))
+
+
 def card_stage(item: dict[str, Any]) -> str:
-    """Assign one screen stage: executable, pullback/re-entry wait, or observation."""
+    """Assign one stage without hiding a reachable first-target candidate."""
     if card_ready_for_display(item):
         return "FINAL_BUY"
     if card_ready_for_pullback_wait(item):
         return "PULLBACK_WAIT"
+    if first_target_reachable(item):
+        return "TARGET1_WAIT"
     return "OBSERVATION"
 
 
@@ -922,7 +961,7 @@ def candidate_stage_summary(items: list[dict[str, Any]], candidate_pool: int) ->
     swing_ready = 0
     strategy_ready = 0
     reward_ready = 0
-    stages = {"FINAL_BUY": 0, "PULLBACK_WAIT": 0, "OBSERVATION": 0}
+    stages = {"FINAL_BUY": 0, "PULLBACK_WAIT": 0, "TARGET1_WAIT": 0, "OBSERVATION": 0}
     for item in items:
         plan = item["plan"]
         quote = item.get("quote")
@@ -947,6 +986,7 @@ def candidate_stage_summary(items: list[dict[str, Any]], candidate_pool: int) ->
             "Swing 확인": swing_ready,
             "TREND/RANGE 적합": strategy_ready,
             "손익비·손절 적합": reward_ready,
+            "1차 목표 가능": stages["FINAL_BUY"] + stages["PULLBACK_WAIT"] + stages["TARGET1_WAIT"],
             "진입대기": stages["PULLBACK_WAIT"],
             "FINAL_BUY": stages["FINAL_BUY"],
         },
@@ -986,6 +1026,14 @@ def visible_pullback_cards(items: list[dict[str, Any]], display_limit: int = MAX
     """Show at most five structurally intact pullback/re-entry waits."""
     limit = max(1, min(int(display_limit), MAX_LIVE_CARDS))
     waits = [item for item in items if card_ready_for_pullback_wait(item)]
+    waits.sort(key=mixed_card_priority, reverse=True)
+    return waits[:limit]
+
+
+def visible_target1_wait_cards(items: list[dict[str, Any]], display_limit: int = MAX_LIVE_CARDS) -> list[dict[str, Any]]:
+    """Show first-target-reachable candidates whose exact entry timing is still pending."""
+    limit = max(1, min(int(display_limit), MAX_LIVE_CARDS))
+    waits = [item for item in items if card_stage(item) == "TARGET1_WAIT"]
     waits.sort(key=mixed_card_priority, reverse=True)
     return waits[:limit]
 
@@ -1154,7 +1202,9 @@ def render_live_card(
         st.markdown(f"<div class='ticker'>{html.escape(title)}</div>", unsafe_allow_html=True)
         if stage == "PULLBACK_WAIT":
             trigger = str((item["plan"].diagnostics.get("strategy_path") or {}).get("reentry_trigger") or "5분 반전 확인")
-            st.warning(f"눌림·재매수 대기 · {trigger}")
+            st.warning(f"1차 목표 가능 · 눌림 진입 대기 · {trigger}")
+        elif stage == "TARGET1_WAIT":
+            st.info("1차 목표 도달 가능 · 현재 추격 진입은 대기하고 표시 재매수가까지 되돌림을 확인")
         else:
             st.success("현재 1회 진입 조건 통과 · 1차·2차 목표가와 손절가를 함께 확인")
         render_realtime_price(
@@ -1285,7 +1335,7 @@ with st.sidebar:
     min_score = st.slider("최소 신호 점수", min_value=60, max_value=100, value=80, step=5)
     refresh_seconds = int(st.radio("현재가 화면 갱신", [1, 3, 5], horizontal=True, format_func=lambda value: f"{value}초"))
     candidate_card_count = MAX_LIVE_CARDS
-    st.caption("시장 후보 100개 → 빠른 선별 15개 → 정밀 분석·실시간 체결 5개")
+    st.caption("거래량 TOP100 ∪ 거래대금 TOP100 후보풀 → 빠른 선별 15개 → 정밀 분석 최대 8개 → 실시간 핵심 카드 최대 5개")
     sidebar_session = market_session(market)
     if sidebar_session not in ACTIVE_CARD_SESSIONS:
         st.info("현재 거래 시간이 아닙니다")
@@ -1348,7 +1398,7 @@ elif not kis_connected:
     st.info("연결 확인 — " + " · ".join(f"{name}: {value}" for name, value in client.connection_diagnostics.items()))
 else:
     try:
-        with st.spinner("시장 전체에서 가격 조건을 통과한 상승 후보를 자동으로 찾는 중…"):
+        with st.spinner("거래량 TOP100 ∪ 거래대금 TOP100 후보풀에서 상승 차트를 자동으로 찾는 중…"):
             candidates = load_dashboard_candidates(market.value, APP_VERSION)
             requests: list[dict[str, Any]] = []
             if direct_request is not None:
@@ -1366,7 +1416,7 @@ else:
                 try:
                     card = analyze_card(symbol, market, exchange, float(cost_pct), int(min_score), store)
                     card["name"] = str(candidate.get("name") or symbol)
-                    card["candidate_source"] = str(candidate.get("candidate_source") or "시장 실시간 순위")
+                    card["candidate_source"] = str(candidate.get("candidate_source") or "거래량 TOP100 ∪ 거래대금 TOP100")
                     cards.append(card)
                 except KISError as exc:
                     errors.append(f"{symbol}: {str(exc)[:180]}")
@@ -1391,11 +1441,15 @@ if cards:
     all_analyzed_cards = list(cards)
     cards = visible_trade_cards(all_analyzed_cards, candidate_card_count)
     pullback_cards = visible_pullback_cards(all_analyzed_cards, candidate_card_count)
-    analysis_cards = list({id(card): card for card in [*cards, *pullback_cards]}.values())
+    target1_wait_cards = visible_target1_wait_cards(all_analyzed_cards, candidate_card_count)
+    entry_wait_cards = list({id(card): card for card in [*pullback_cards, *target1_wait_cards]}.values())
+    analysis_cards = list({id(card): card for card in [*cards, *entry_wait_cards]}.values())
     stage_summary = candidate_stage_summary(all_analyzed_cards, len(candidates))
 else:
     analysis_cards = []
     pullback_cards = []
+    target1_wait_cards = []
+    entry_wait_cards = []
     stage_summary = candidate_stage_summary([], len(candidates))
 
 realtime_hub.configure(
@@ -1414,7 +1468,7 @@ capture_pending_forecast_paths(store, market.value)
 
 if cards:
     updated_at = max(card["quote"].timestamp for card in cards)
-    source_labels = {str(card.get("candidate_source") or "시장 실시간 순위") for card in cards}
+    source_labels = {str(card.get("candidate_source") or "거래량 TOP100 ∪ 거래대금 TOP100") for card in cards}
     source_text = " · ".join(sorted(source_labels))
     st.subheader(f"상승 차트 · 현재 1회 진입 가능 {len(cards)}종목")
     st.caption(f"정밀 분석 {analyzed_count}개 중 현재 진입 조건 통과 {len(cards)}개 · {updated_at.strftime('%H:%M:%S')} · {realtime_hub.status_label()} · {source_text}")
@@ -1422,18 +1476,23 @@ if cards:
         render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "FINAL_BUY")
 elif kis_connected and not errors and not candidates:
     limit_text = "30만 원 미만" if market == Market.KR else "200달러 미만"
-    st.info(f"현재 {limit_text} 가격 조건과 상승 후보 기준을 함께 통과한 종목이 없습니다.")
+    st.info(f"현재 {limit_text} 가격 상한 안의 거래량·거래대금 후보풀을 받지 못했습니다. 순위 API를 다음 갱신 때 다시 확인합니다.")
 
 if candidates and not cards:
-    st.info("현재 상승 차트에서 1회 진입 조건을 모두 통과한 종목이 없습니다.")
+    st.info("현재 상승 차트에서 지금 1회 진입 조건을 모두 통과한 종목은 없습니다.")
 
-with st.expander(f"익절 뒤 반복단타 참고 · 재진입 대기 {len(pullback_cards)}종목", expanded=False):
-    if pullback_cards:
-        st.caption("현재 1회 진입 카드가 아니라, 익절 뒤에도 반복 Swing 구조가 살아 있을 때 참고하는 재진입 대기 목록입니다.")
-        for card_item in pullback_cards:
-            render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "PULLBACK_WAIT")
-    else:
-        st.caption("현재 반복단타 재진입 구조를 별도로 확인할 종목이 없습니다.")
+if candidates:
+    st.caption(
+        f"후보풀 {len(candidates)}종목 · 빠른 선별 {len(fast_shortlist) if 'fast_shortlist' in locals() else 0}종목 · "
+        f"정밀 분석 {stage_summary['funnel']['정밀 분석']}종목 · 1차 목표 가능 {stage_summary['funnel']['1차 목표 가능']}종목 · "
+        f"현재 1회 진입 {stage_summary['stages']['FINAL_BUY']}종목"
+    )
+
+if entry_wait_cards:
+    st.subheader(f"1차 익절 가능 · 현재 진입 대기 {len(entry_wait_cards)}종목")
+    st.caption("목표 구조는 남아 있으나 현재 위치가 추격 구간이거나 5분 눌림 진행 중입니다. 각 카드의 추천 매수가가 재진입 참고 가격입니다.")
+    for card_item in entry_wait_cards:
+        render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, card_stage(card_item))
 
 with st.expander("검증·관찰 상세", expanded=False):
     render_latest_forecast_result(store)
