@@ -27,6 +27,9 @@ APP_VERSION = "5.6-kis-realtime"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
 CLIENT_CACHE_VERSION = "client-contract-v8-live-card-targets"
+# The market-data connection has its own lifecycle. Bump this only when the
+# WebSocket protocol or recovery contract changes, without issuing a new REST token.
+REALTIME_HUB_CACHE_VERSION = "realtime-hub-v2-heartbeat-recovery"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 MAX_LIVE_CARDS = 5
 MAX_CANDIDATE_LIST = 20
@@ -101,16 +104,16 @@ def current_client() -> KISClient:
 
 @st.cache_resource
 def get_realtime_hub(cache_version: str, secret_fingerprint: str) -> KISRealtimeHub:
-    return KISRealtimeHub(get_client(cache_version, secret_fingerprint))
+    return KISRealtimeHub(get_client(CLIENT_CACHE_VERSION, secret_fingerprint))
 
 
 def current_realtime_hub() -> KISRealtimeHub:
     """Return a current live hub even if Streamlit retained an older resource."""
     fingerprint = current_secret_fingerprint()
-    hub = get_realtime_hub(CLIENT_CACHE_VERSION, fingerprint)
+    hub = get_realtime_hub(REALTIME_HUB_CACHE_VERSION, fingerprint)
     if not isinstance(hub, KISRealtimeHub) or not callable(getattr(hub, "completed_bar_rows", None)):
         get_realtime_hub.clear()
-        hub = get_realtime_hub(CLIENT_CACHE_VERSION, fingerprint)
+        hub = get_realtime_hub(REALTIME_HUB_CACHE_VERSION, fingerprint)
     return hub
 
 
