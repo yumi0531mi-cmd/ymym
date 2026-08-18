@@ -234,6 +234,25 @@ def test_visible_trade_cards_keep_up_to_five_ready_candidates():
     assert {item["quote"].symbol for item in visible}.issubset({f"T{index}" for index in range(6)})
 
 
+def test_visible_trade_cards_fill_with_complete_downward_observations_when_upside_is_scarce():
+    from app import visible_trade_cards
+
+    upside = {"quote": _quote(), "plan": _plan(), "chart_aligned": True}
+    observations = []
+    for index in range(3):
+        plan = deepcopy(_plan())
+        plan.diagnostics["has_downward_forecast"] = True
+        quote = _quote()
+        quote.symbol = f"D{index}"
+        plan.symbol = quote.symbol
+        observations.append({"quote": quote, "plan": plan, "chart_aligned": True})
+
+    visible = visible_trade_cards([upside, *observations])
+
+    assert len(visible) == 4
+    assert {item["quote"].symbol for item in visible} == {"005930", "D0", "D1", "D2"}
+
+
 def test_live_card_hides_candidate_that_turns_into_daily_overheat_after_selection():
     from app import card_ready_for_display, card_trade_status
 
@@ -266,7 +285,7 @@ def test_card_trade_status_separates_buy_wait_and_downward_candidates():
 
     plan.diagnostics["has_downward_forecast"] = True
     assert card_trade_status(item) == "하방 제외"
-    assert visible_trade_cards([item], 10) == []
+    assert visible_trade_cards([item], 10) == [item]
 
     plan.diagnostics["has_downward_forecast"] = False
     plan.diagnostics["forecast_path_ready"] = False

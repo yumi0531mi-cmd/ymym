@@ -817,11 +817,31 @@ def card_ready_for_display(item: dict[str, Any]) -> bool:
     return bool(levels.get("available")) and card_trade_status(item) in {"매수 조건 충족", "눌림목 대기"}
 
 
+def card_ready_for_observation(item: dict[str, Any]) -> bool:
+    """Allow a complete down/mixed path as an observation card, never as an upside-price card."""
+    quote = item.get("quote")
+    if not isinstance(quote, Quote) or quote.session not in ACTIVE_CARD_SESSIONS:
+        return False
+    if quote.change_pct > MAX_DAILY_RISE_PCT or not bool(item.get("chart_aligned")):
+        return False
+    plan = item["plan"]
+    return bool(plan.diagnostics.get("forecast_path_ready"))
+
+
 def visible_trade_cards(items: list[dict[str, Any]], display_limit: int = MAX_LIVE_CARDS) -> list[dict[str, Any]]:
-    """Keep the dashboard free of incomplete, stale, downward, or blocked cards."""
-    visible = [item for item in items if card_ready_for_display(item)]
-    visible.sort(key=mixed_card_priority, reverse=True)
-    return visible[:max(1, min(int(display_limit), 10))]
+    """Show strong upside cards first, then complete observation paths until the card limit."""
+    limit = max(1, min(int(display_limit), MAX_LIVE_CARDS))
+    upside = [item for item in items if card_ready_for_display(item)]
+    upside.sort(key=mixed_card_priority, reverse=True)
+    if len(upside) >= limit:
+        return upside[:limit]
+    selected_ids = {id(item) for item in upside}
+    observations = [
+        item for item in items
+        if id(item) not in selected_ids and card_ready_for_observation(item)
+    ]
+    observations.sort(key=mixed_card_priority, reverse=True)
+    return (upside + observations)[:limit]
 
 
 def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
@@ -955,7 +975,9 @@ def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int, stor
         elif status == "눌림목 대기":
             st.warning("눌림목 대기 · 현재가 추격 금지")
         elif status == "하방 제외":
-            st.error("진입 금지 · 하방/데이터/위험 조건 확인")
+            st.error("하방 관찰 · 상방 가격 추천 없음")
+        elif status == "급등 과열 제외":
+            st.warning("급등 과열 제외 · 추격하지 않음")
         else:
             st.info("관찰 · 상방 조건이 모두 맞을 때까지 진입 금지")
         render_realtime_price(
@@ -1187,8 +1209,9 @@ if cards:
     source_text = " · ".join(sorted(source_labels))
     actionable_count = sum(card_trade_status(card) == "매수 조건 충족" for card in cards)
     waiting_count = sum(card_trade_status(card) == "눌림목 대기" for card in cards)
-    st.subheader(f"실시간 상방 후보 · 매수 {actionable_count} · 눌림 대기 {waiting_count}")
-    st.caption(f"시장 순위 100개 → 빠른 선별 {MAX_FAST_SHORTLIST}개 → 정밀 분석 {analyzed_count}개 → 실시간 체결 {len(cards)}개 · 하방/진입금지 {len(blocked_cards)}개 자동 제외 · {updated_at.strftime('%H:%M:%S')} · {realtime_hub.status_label()} · {source_text}")
+    observation_count = sum(card_trade_status(card) in {"하방 제외", "관찰"} for card in cards)
+    st.subheader(f"실시간 후보 · 매수 {actionable_count} · 눌림 대기 {waiting_count} · 하방 관찰 {observation_count}")
+    st.caption(f"시장 순위 100개 → 빠른 선별 {MAX_FAST_SHORTLIST}개 → 정밀 분석 {analyzed_count}개 → 실시간 체결 {len(cards)}개 · 과열 {len(blocked_cards)}개 제외 · {updated_at.strftime('%H:%M:%S')} · {realtime_hub.status_label()} · {source_text}")
     for card_item in cards:
         render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds)
 elif kis_connected and not errors and not candidates:
