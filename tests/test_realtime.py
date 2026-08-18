@@ -1,5 +1,12 @@
 from scanner.models import Market
-from scanner.realtime import KISRealtimeHub, KR_TRADE_TR_ID, US_TRADE_TR_ID, RealtimeTick
+from scanner.realtime import (
+    KISRealtimeHub,
+    KR_TRADE_TR_ID,
+    US_TRADE_TR_ID,
+    RealtimeTick,
+    process_realtime_hub,
+    reset_process_realtime_hubs,
+)
 
 
 class ApprovalOnlyClient:
@@ -131,3 +138,15 @@ def test_kis_realtime_waits_longer_when_same_appkey_is_already_in_use():
     assert KISRealtimeHub.reconnect_delay_after_error(1.0, error) == 30.0
     assert KISRealtimeHub.reconnect_delay_after_error(1.0, Exception("KIS 실시간 접속키 발급 실패(HTTP 403)")) == 120.0
     assert KISRealtimeHub.reconnect_delay_after_error(2.0, Exception("network timeout")) == 2.0
+
+
+def test_process_realtime_hub_keeps_one_hub_for_one_secret_set():
+    reset_process_realtime_hubs()
+    first = process_realtime_hub(ApprovalOnlyClient(), "same-secret")
+    second = process_realtime_hub(ApprovalOnlyClient(), "same-secret")
+    replacement = process_realtime_hub(ApprovalOnlyClient(), "new-secret")
+
+    assert first is second
+    assert replacement is not first
+    assert first._stop.is_set() is True
+    reset_process_realtime_hubs()

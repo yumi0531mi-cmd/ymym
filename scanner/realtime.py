@@ -29,6 +29,10 @@ KR_TRADE_FIELD_COUNT = 46
 US_TRADE_FIELD_COUNT = 26
 
 
+_PROCESS_HUB_LOCK = threading.RLock()
+_PROCESS_HUBS: dict[str, "KISRealtimeHub"] = {}
+
+
 @dataclass(frozen=True)
 class RealtimeTick:
     symbol: str
@@ -379,3 +383,32 @@ class KISRealtimeHub:
             self._last_message_at = tick.timestamp
             self._connected = True
             self._last_error = ""
+
+
+def process_realtime_hub(client: KISClient, secret_fingerprint: str) -> KISRealtimeHub:
+    """Return exactly one live hub for one Streamlit process and one KIS key set.
+
+    Streamlit reruns the script for browser interactions and may retain resources
+    across hot deploys.  A module-level registry prevents those reruns from
+    opening another KIS socket for the same credentials.
+    """
+    identity = str(secret_fingerprint)
+    with _PROCESS_HUB_LOCK:
+        existing = _PROCESS_HUBS.get(identity)
+        if existing is not None:
+            return existing
+        for old_identity, old_hub in list(_PROCESS_HUBS.items()):
+            if old_identity != identity:
+                old_hub.stop()
+                _PROCESS_HUBS.pop(old_identity, None)
+        hub = KISRealtimeHub(client)
+        _PROCESS_HUBS[identity] = hub
+        return hub
+
+
+def reset_process_realtime_hubs() -> None:
+    """Stop in-process hubs for deterministic tests and controlled resets."""
+    with _PROCESS_HUB_LOCK:
+        for hub in _PROCESS_HUBS.values():
+            hub.stop()
+        _PROCESS_HUBS.clear()

@@ -18,7 +18,7 @@ from scanner.kis_client import KISClient, KISError, secrets_fingerprint
 from scanner.market_screener import is_kr_directional_product, merge_rankings
 from scanner.models import Market, Quote, Regime, Signal
 from scanner.persistence import EventStore
-from scanner.realtime import KISRealtimeHub
+from scanner.realtime import KISRealtimeHub, process_realtime_hub
 from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
@@ -105,9 +105,10 @@ def current_client() -> KISClient:
     return client
 
 
-@st.cache_resource
 def get_realtime_hub(cache_version: str, secret_fingerprint: str) -> KISRealtimeHub:
-    return KISRealtimeHub(get_client(CLIENT_CACHE_VERSION, secret_fingerprint))
+    """Use the process singleton instead of one hub per Streamlit resource key."""
+    del cache_version
+    return process_realtime_hub(get_client(CLIENT_CACHE_VERSION, secret_fingerprint), secret_fingerprint)
 
 
 def current_realtime_hub() -> KISRealtimeHub:
@@ -115,7 +116,6 @@ def current_realtime_hub() -> KISRealtimeHub:
     fingerprint = current_secret_fingerprint()
     hub = get_realtime_hub(REALTIME_HUB_CACHE_VERSION, fingerprint)
     if not isinstance(hub, KISRealtimeHub) or not callable(getattr(hub, "completed_bar_rows", None)):
-        get_realtime_hub.clear()
         hub = get_realtime_hub(REALTIME_HUB_CACHE_VERSION, fingerprint)
     return hub
 
