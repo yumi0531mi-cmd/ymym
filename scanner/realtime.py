@@ -234,16 +234,45 @@ class KISRealtimeHub:
                                 self._wake.clear()
                                 break
                             continue
-                        self._consume(str(raw))
+                        raw_text = str(raw)
+                        if await self._handle_control_message(ws, raw_text):
+                            continue
+                        self._consume(raw_text)
             except Exception as exc:
+                detail = str(exc).replace("\n", " ")
                 with self._lock:
                     self._connected = False
-                    self._last_error = type(exc).__name__
+                    self._last_error = f"{type(exc).__name__}: {detail[:120]}" if detail else type(exc).__name__
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 20.0)
             finally:
                 with self._lock:
                     self._connected = False
+
+    async def _handle_control_message(self, ws, raw: str) -> bool:
+        """Handle KIS subscription replies and its application-level PINGPONG heartbeat."""
+        if raw.startswith("0|"):
+            return False
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            return False
+        header = payload.get("header") if isinstance(payload, dict) else {}
+        body = payload.get("body") if isinstance(payload, dict) else {}
+        tr_id = str((header or {}).get("tr_id") or "").upper()
+        if tr_id == "PINGPONG":
+            # KIS sends a JSON PINGPONG message in addition to WebSocket protocol
+            # ping frames. The official sample answers it with the original payload.
+            await ws.pong(raw)
+            return True
+        result_code = str((body or {}).get("rt_cd") or "")
+        if result_code and result_code != "0":
+            message = str((body or {}).get("msg1") or "KIS 구독 응답 오류")
+            if "approval" in message.lower() or "인증" in message:
+                self._approval_key = ""
+                self._approval_expires_monotonic = 0.0
+            raise KISError(f"KIS 실시간 구독 실패: {message[:120]}")
+        return bool(header or body)
 
     def _consume(self, raw: str) -> None:
         # KIS market-data messages use 0|TR_ID|COUNT|caret-separated-fields.

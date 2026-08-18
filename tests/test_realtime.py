@@ -69,3 +69,46 @@ def test_kis_realtime_excludes_forming_minute_from_completed_bars():
     assert rows[0]["low"] == 70000
     assert rows[0]["close"] == 70100
     assert rows[0]["volume"] == 30
+
+
+def test_kis_realtime_answers_application_pingpong():
+    import asyncio
+    import json
+
+    class Socket:
+        def __init__(self):
+            self.payloads = []
+
+        async def pong(self, payload):
+            self.payloads.append(payload)
+
+    hub = KISRealtimeHub(ApprovalOnlyClient())
+    socket = Socket()
+    raw = json.dumps({"header": {"tr_id": "PINGPONG"}, "body": {}})
+
+    handled = asyncio.run(hub._handle_control_message(socket, raw))
+
+    assert handled is True
+    assert socket.payloads == [raw]
+
+
+def test_kis_realtime_resets_approval_on_subscription_auth_error():
+    import asyncio
+    import json
+    import pytest
+    from scanner.kis_client import KISError
+
+    class Socket:
+        async def pong(self, payload):
+            raise AssertionError("pong should not be called")
+
+    hub = KISRealtimeHub(ApprovalOnlyClient())
+    hub._approval_key = "stale-key"
+    hub._approval_expires_monotonic = 999999.0
+    raw = json.dumps({"header": {"tr_id": "H0STCNT0"}, "body": {"rt_cd": "1", "msg1": "approval key invalid"}})
+
+    with pytest.raises(KISError):
+        asyncio.run(hub._handle_control_message(Socket(), raw))
+
+    assert hub._approval_key == ""
+    assert hub._approval_expires_monotonic == 0.0
