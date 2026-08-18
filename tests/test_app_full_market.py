@@ -105,6 +105,25 @@ def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():
     assert levels["available"] is False
 
 
+def test_card_trade_status_separates_buy_wait_and_downward_candidates():
+    from app import card_trade_status
+
+    plan = _plan()
+    plan.diagnostics.update({
+        "forecast_path_ready": True,
+        "long_price_path_confirmed": True,
+        "has_downward_forecast": False,
+    })
+    item = {"plan": plan, "chart_aligned": True}
+    assert card_trade_status(item) == "매수 조건 충족"
+
+    plan.signal = Signal.WAIT
+    assert card_trade_status(item) == "눌림목 대기"
+
+    plan.diagnostics["has_downward_forecast"] = True
+    assert card_trade_status(item) == "진입 금지"
+
+
 def test_missing_kis_credentials_shows_safe_waiting_screen_without_buttons():
     st.cache_resource.clear()
     st.cache_data.clear()
@@ -155,7 +174,7 @@ def test_connected_app_automatically_renders_live_candidate_card_without_user_se
     assert any("005930" in str(item.value) for item in app.markdown)
     assert {metric.label for metric in app.metric} >= {"현재가", "추천 매수가", "추천 매도가 1차", "추천 매도가 2차", "손절가"}
     assert {metric.label for metric in app.metric} >= {"5분 예상", "10분 예상", "15분 예상", "30분 예상", "현재 차트 지지"}
-    assert any("상세 카드 1개" in str(item.value) for item in app.caption)
+    assert any("분석 카드 1개" in str(item.value) for item in app.caption)
 
 
 def test_ranking_error_falls_back_to_liquid_candidates_and_still_renders_cards():
