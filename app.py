@@ -248,6 +248,15 @@ def price_ceiling(market: Market) -> float:
     return KR_PRICE_CEILING if market == Market.KR else US_PRICE_CEILING
 
 
+def default_market_label() -> str:
+    """Open the currently active market first while preserving a user's later choice."""
+    kr_session = market_session(Market.KR)
+    us_session = market_session(Market.US)
+    if kr_session not in ACTIVE_CARD_SESSIONS and us_session in ACTIVE_CARD_SESSIONS:
+        return "미국"
+    return "국내"
+
+
 def eligible_price(candidate: dict[str, Any], market: Market) -> bool:
     try:
         price = float(candidate.get("price") or 0.0)
@@ -948,7 +957,14 @@ store = ValidationStore(VALIDATION_ROOT, event_store=event_store)
 
 with st.sidebar:
     st.title("실시간 설정")
-    market_label = st.radio("시장", ["국내", "미국"], horizontal=True)
+    initial_market_label = default_market_label()
+    market_label = st.radio(
+        "시장",
+        ["국내", "미국"],
+        index=1 if initial_market_label == "미국" else 0,
+        horizontal=True,
+        key="market_selector",
+    )
     market = Market.KR if market_label == "국내" else Market.US
     search_query = st.text_input(
         "관심 종목 바로 보기",

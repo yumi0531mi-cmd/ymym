@@ -105,6 +105,16 @@ def test_actionable_levels_use_ordered_mechanical_fallback_for_upward_path():
     assert levels["target2"] >= levels["entry"] * 1.020
 
 
+def test_default_market_uses_active_us_session_after_korean_close():
+    from app import default_market_label
+
+    with patch("app.market_session", side_effect=lambda market: "US_PRE" if market == Market.US else "KR_CLOSED"):
+        assert default_market_label() == "미국"
+
+    with patch("app.market_session", return_value="KR_REGULAR"):
+        assert default_market_label() == "국내"
+
+
 def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():
     from app import actionable_display_levels
 
