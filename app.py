@@ -190,10 +190,6 @@ def load_rest_dashboard_quote(symbol: str, market_value: str, exchange: str) -> 
     )
 
 
-def load_dashboard_quote(symbol: str, market_value: str, exchange: str) -> Quote:
-    return quote_with_live_tick(load_rest_dashboard_quote(symbol, market_value, exchange))
-
-
 @st.cache_data(ttl=900, show_spinner=False)
 def load_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
     # Historical completed bars seed the analysis. Live KIS trades are merged below
@@ -580,7 +576,6 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
     rest_quote = load_rest_dashboard_quote(symbol, market.value, exchange)
     quote = quote_with_live_tick(rest_quote)
     bars = merge_live_completed_bars(load_bars(symbol, market.value, exchange), symbol, market)
-    bar_source = "KIS_1M"
     chart_aligned, chart_alignment_reason = completed_bar_alignment(quote, bars)
     cycle = cycle_store.get(symbol, market, quote.timestamp)
     preliminary = analyze(
@@ -612,7 +607,7 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
             "samples": calibration.samples, "probability_pct": calibration.probability_pct,
         },
         "validation_recorded": recorded_case, "validation_scored": scored_cases,
-        "chart_aligned": chart_aligned, "chart_alignment_reason": chart_alignment_reason, "bar_source": bar_source,
+        "chart_aligned": chart_aligned, "chart_alignment_reason": chart_alignment_reason,
     }
 
 
@@ -655,7 +650,6 @@ def mixed_card_priority(item: dict[str, Any]) -> tuple[int, int, int]:
 def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
     """Recalculate from the selected bounded 1-minute source without KIS polling."""
     base_quote: Quote = item["quote"]
-    bar_source = str(item.get("bar_source") or "KIS_1M")
     quote = quote_with_live_tick(base_quote)
     bars = merge_live_completed_bars(item["bars"], quote.symbol, quote.market)
     chart_aligned, chart_alignment_reason = completed_bar_alignment(quote, bars)
@@ -672,7 +666,7 @@ def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, st
         store, plan, quote, bars, chart_aligned, float(cost_pct)
     )
     return {
-        **item, "quote": quote, "bars": bars, "plan": plan, "bar_source": bar_source,
+        **item, "quote": quote, "bars": bars, "plan": plan,
         "validation_scored": scored_cases, "validation_recorded": recorded_case,
         "chart_aligned": chart_aligned, "chart_alignment_reason": chart_alignment_reason,
     }

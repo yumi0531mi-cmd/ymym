@@ -102,12 +102,11 @@ def _compression(frame: pd.DataFrame) -> bool:
     return prior > 0 and recent <= prior * 0.72
 
 
-def _gap_pct(frame: pd.DataFrame) -> float:
-    if len(frame) < 2:
+def _gap_pct(frame: pd.DataFrame, previous_close: float | None) -> float:
+    if frame.empty or previous_close is None or previous_close <= 0:
         return 0.0
-    prior_close = float(frame.close.iloc[0])
     opening = float(frame.open.iloc[0])
-    return (opening / max(prior_close, 1e-9) - 1.0) * 100
+    return (opening / previous_close - 1.0) * 100
 
 
 def _has_conflict(ids: Iterable[int]) -> list[str]:
@@ -136,6 +135,7 @@ def evaluate_ensemble(
     upper_rejection: bool,
     opening_range_breakout: bool = False,
     event_direction: str | None = None,
+    previous_close: float | None = None,
 ) -> EnsembleResult:
     """Classify one mutually compatible intraday strategy cluster.
 
@@ -155,10 +155,11 @@ def evaluate_ensemble(
     pullback = bool(trend_ready and float(latest.close) <= float(frame.close.tail(min(8, len(frame))).max()) * 0.998 and float(latest.close) >= float(latest.vwap))
     retest = bool(trend_ready and float(latest.low) <= float(latest.ema9) <= float(latest.close))
     compression = _compression(frame) and breakout
-    gap = _gap_pct(frame)
+    gap = _gap_pct(frame, previous_close)
     gap_continue = gap >= 0.5 and trend_ready and momentum
     gap_revert = gap <= -0.5 and regime in {Regime.RANGE, Regime.TRANSITION} and float(latest.close) >= float(latest.vwap)
-    mean_revert = box_valid and regime == Regime.RANGE and float(latest.close) >= float(latest.vwap)
+    range_context = box_valid and regime == Regime.RANGE
+    mean_revert = range_context and float(latest.close) >= float(latest.vwap)
     exhaustion = bool(upper_rejection and slope < 0.15)
     false_break_reversal = bool(fake_breakout and regime in {Regime.RANGE, Regime.TRANSITION})
     relative_strength = bool(rvol >= 1.25 and notional_rvol >= 1.10)
@@ -176,7 +177,7 @@ def evaluate_ensemble(
         active.add(5)
     if false_break_reversal:
         active.add(6)
-    if box_valid:
+    if range_context:
         active.add(7)
     if mean_revert:
         active.add(8)

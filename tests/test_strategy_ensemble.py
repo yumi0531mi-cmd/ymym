@@ -66,7 +66,7 @@ def test_range_reversal_cluster_is_not_scored_as_trend_continuation():
     assert not set(result.active_ids).intersection({1, 2, 3, 4, 5, 9, 15})
 
 
-def test_trend_and_box_conflict_never_add_scores_together():
+def test_trend_mode_does_not_activate_box_reversal_strategies_when_box_is_present():
     frame = _frame(True)
     result = evaluate_ensemble(
         frame,
@@ -81,6 +81,26 @@ def test_trend_and_box_conflict_never_add_scores_together():
         upper_rejection=False,
     )
 
-    assert result.cluster == "CONFLICT"
-    assert result.score == 0
-    assert result.conflicts
+    assert result.cluster != "CONFLICT"
+    assert 7 not in result.active_ids
+    assert not result.conflicts
+
+
+def test_gap_uses_previous_session_close_not_first_intraday_close():
+    frame = _frame(True)
+    frame.loc[frame.index[0], "open"] = 101.0
+    result = evaluate_ensemble(
+        frame,
+        regime=Regime.UP,
+        box_valid=False,
+        price=float(frame.close.iloc[-1]),
+        vwap_ok=True,
+        ema_ok=True,
+        rvol=1.5,
+        notional_rvol=1.4,
+        fake_breakout=False,
+        upper_rejection=False,
+        previous_close=100.0,
+    )
+
+    assert 11 in result.active_ids

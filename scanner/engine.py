@@ -276,6 +276,7 @@ def analyze(
         fake_breakout=bool(flags["fake_breakout"]),
         upper_rejection=bool(flags["upper_rejection"]),
         opening_range_breakout=opening_range_breakout,
+        previous_close=quote.previous_close,
     )
     execution_ok = (
         spread_ok and rvol_ok and notional_ok and not flags["fake_breakout"]
