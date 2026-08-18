@@ -74,6 +74,37 @@ def _plan(*_args, **_kwargs) -> TradePlan:
     )
 
 
+def test_actionable_levels_use_ordered_mechanical_fallback_for_upward_path():
+    from app import actionable_display_levels
+
+    plan = _plan()
+    plan.entry = 69000
+    plan.target = 69500
+    plan.target2 = 69900
+    plan.stop = None
+    plan.soft_stop = None
+    plan.hard_stop = None
+    plan.diagnostics.update({"long_price_path_confirmed": True, "atr": 500})
+
+    levels = actionable_display_levels(plan, _quote())
+
+    assert levels["available"] is True
+    assert levels["stop"] < levels["support"] < levels["entry"] < levels["target1"] < levels["target2"]
+    assert levels["target1"] >= levels["entry"] * 1.012
+    assert levels["target2"] >= levels["entry"] * 1.020
+
+
+def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():
+    from app import actionable_display_levels
+
+    plan = _plan()
+    plan.diagnostics["long_price_path_confirmed"] = False
+
+    levels = actionable_display_levels(plan, _quote())
+
+    assert levels["available"] is False
+
+
 def test_missing_kis_credentials_shows_safe_waiting_screen_without_buttons():
     st.cache_resource.clear()
     st.cache_data.clear()

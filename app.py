@@ -23,7 +23,7 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
-APP_VERSION = "5.8-live-data-recovery"
+APP_VERSION = "5.9-actionable-levels"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
 CLIENT_CACHE_VERSION = "client-contract-v11-us-day-bars"
@@ -160,7 +160,7 @@ def _quote_from_cache_record(record: dict[str, object]) -> Quote:
     )
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=12, show_spinner=False)
 def _load_quote_record(symbol: str, market_value: str, exchange: str) -> dict[str, object]:
     # KIS REST is the only fallback when the official WebSocket is unavailable.
     # Five visible cards at this interval remain below the 30-call/minute ceiling.
@@ -448,6 +448,45 @@ def buy_range_text(plan: Any, quote: Quote) -> str:
     return price_text(low) if abs(high - low) < 0.01 else f"{price_text(low)} ~ {price_text(high)}"
 
 
+def actionable_display_levels(plan: Any, quote: Quote) -> dict[str, float | str | bool]:
+    """Return executable reference levels even when observed resistance is stale.
+
+    Structural levels remain the first choice. If a fast market has already
+    traded through them, use an explicitly mechanical ATR/percentage fallback
+    while leaving the engine's BUY/WAIT/BLOCK decision unchanged.
+    """
+    upward = bool(plan.diagnostics.get("long_price_path_confirmed"))
+    if not upward or quote.price <= 0:
+        return {"available": False, "basis": "하방·혼조 경로 · 신규 진입 금지"}
+
+    atr = float(plan.diagnostics.get("atr") or 0.0)
+    entry = float(plan.entry) if isinstance(plan.entry, (int, float)) and 0 < float(plan.entry) <= quote.price * 1.002 else quote.price
+    risk_distance = max(entry * 0.008, atr * 0.80, entry * 0.0001)
+    stop = float(plan.hard_stop or plan.stop or 0.0)
+    if not 0 < stop < entry:
+        stop = entry - risk_distance
+    else:
+        risk_distance = max(entry - stop, entry * 0.004)
+
+    target1 = max(float(plan.target or 0.0), entry * 1.012, entry + risk_distance * 1.50)
+    target2 = max(float(plan.target2 or 0.0), entry * 1.020, entry + risk_distance * 2.20)
+    if target2 <= target1:
+        target2 = max(target1 + risk_distance * 0.50, target1 * 1.008)
+
+    support = float(plan.soft_stop or 0.0)
+    if not stop < support < entry:
+        support = entry - risk_distance * 0.60
+    return {
+        "available": True,
+        "entry": entry,
+        "target1": target1,
+        "target2": target2,
+        "support": support,
+        "stop": stop,
+        "basis": "구조 우선 · 미확인 시 ATR/진입가 대비 +1.2%·+2.0%·-0.8% 기계적 보완",
+    }
+
+
 def regime_text(regime: Regime) -> str:
     return {
         Regime.UP: "상승 추세",
@@ -690,13 +729,12 @@ def render_plan_fields(item: dict[str, Any]) -> None:
     plan = item["plan"]
     structure = dashboard_structure(item)
     chart_aligned = bool(item.get("chart_aligned", True))
-    price_structure_valid = bool(plan.diagnostics.get("price_structure_valid"))
-    long_price_path_confirmed = bool(plan.diagnostics.get("long_price_path_confirmed"))
-    show_price_structure = chart_aligned and price_structure_valid and long_price_path_confirmed
-    target_1 = plan.target if show_price_structure else None
-    target_2 = plan.target2 if show_price_structure else None
-    support = plan.soft_stop if show_price_structure else None
-    stop = (plan.hard_stop or plan.invalidation or plan.stop) if show_price_structure else None
+    levels = actionable_display_levels(plan, quote)
+    show_price_structure = chart_aligned and bool(levels.get("available"))
+    target_1 = float(levels["target1"]) if show_price_structure else None
+    target_2 = float(levels["target2"]) if show_price_structure else None
+    support = float(levels["support"]) if show_price_structure else None
+    stop = float(levels["stop"]) if show_price_structure else None
     has_downward_forecast = bool(plan.diagnostics.get("has_downward_forecast"))
     forecast_path_ready = bool(plan.diagnostics.get("forecast_path_ready"))
     if chart_aligned and has_downward_forecast:
@@ -719,13 +757,15 @@ def render_plan_fields(item: dict[str, Any]) -> None:
     prices = st.columns(2)
     prices[0].metric(
         "추천 매수가",
-        buy_range_text(plan, quote) if show_price_structure else (observation_text if chart_aligned else "완료 분봉 확인 중"),
+        price_text(float(levels["entry"])) if show_price_structure else (observation_text if chart_aligned else "완료 분봉 확인 중"),
     )
     prices[1].metric("추천 매도가 1차", price_text(target_1) if show_price_structure else observation_text)
     exits = st.columns(3)
     exits[0].metric("추천 매도가 2차", price_text(target_2) if show_price_structure else observation_text)
     exits[1].metric("현재 차트 지지", price_text(support) if show_price_structure else observation_text)
     exits[2].metric("손절가", price_text(stop) if show_price_structure else observation_text)
+    if show_price_structure:
+        st.caption(str(levels["basis"]))
 
 
 @st.fragment(run_every=60.0)
@@ -847,7 +887,7 @@ with st.sidebar:
         st.caption("검증 성과 저장: 영구 보관 연결됨")
     else:
         st.caption("검증 성과 저장: 앱 재시작 시 초기화될 수 있음 · [한 번만 설정하는 안내](https://github.com/yumi0531mi-cmd/ymym/blob/main/docs/supabase_persistent_validation_setup.md)")
-    st.caption("상승 후보 목록 5분 · KIS WebSocket 또는 REST 현재가 15초 · 완료봉 구조 1분 · 호가 재확인 15분")
+    st.caption("상승 후보 목록 5분 · KIS WebSocket 또는 REST 현재가 12초 · 완료봉 구조 1분 · 호가 재확인 15분")
 
 kis_connected = client.ready
 # KIS ticks are redrawn by each card's independent Streamlit fragment.  Do not

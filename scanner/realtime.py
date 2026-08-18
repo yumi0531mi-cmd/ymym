@@ -86,7 +86,7 @@ class KISRealtimeHub:
         if self.connected:
             return "KIS 실시간 체결 연결됨 · 1초 화면 갱신"
         if self.last_error:
-            return "KIS WebSocket 미연결 · REST 현재가 15초 안전 대체"
+            return "KIS WebSocket 미연결 · REST 현재가 12초 안전 대체"
         return "KIS 실시간 체결 연결 준비 중 · REST 현재가 임시 사용"
 
     def configure(self, symbols: Iterable[tuple[Market, str, str]]) -> None:
