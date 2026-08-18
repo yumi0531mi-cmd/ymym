@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from copy import deepcopy
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -87,7 +88,7 @@ def _plan(*_args, **_kwargs) -> TradePlan:
     )
 
 
-def test_actionable_levels_use_ordered_mechanical_fallback_for_upward_path():
+def test_actionable_levels_hide_card_prices_without_completed_chart_stop_structure():
     from app import actionable_display_levels
 
     plan = _plan()
@@ -101,10 +102,8 @@ def test_actionable_levels_use_ordered_mechanical_fallback_for_upward_path():
 
     levels = actionable_display_levels(plan, _quote())
 
-    assert levels["available"] is True
-    assert levels["stop"] < levels["support"] < levels["entry"] < levels["target1"] < levels["target2"]
-    assert levels["target1"] >= levels["entry"] * 1.012
-    assert levels["target2"] >= levels["entry"] * 1.020
+    assert levels["available"] is False
+    assert "완료 차트" in str(levels["basis"])
 
 
 def test_default_market_uses_active_us_session_after_korean_close():
@@ -216,6 +215,23 @@ def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():
     levels = actionable_display_levels(plan, _quote())
 
     assert levels["available"] is False
+
+
+def test_visible_trade_cards_keep_up_to_five_ready_candidates():
+    from app import visible_trade_cards
+
+    items = []
+    for index in range(6):
+        plan = deepcopy(_plan())
+        quote = _quote()
+        quote.symbol = f"T{index}"
+        plan.symbol = quote.symbol
+        items.append({"quote": quote, "plan": plan, "chart_aligned": True})
+
+    visible = visible_trade_cards(items)
+
+    assert len(visible) == 5
+    assert {item["quote"].symbol for item in visible}.issubset({f"T{index}" for index in range(6)})
 
 
 def test_card_trade_status_separates_buy_wait_and_downward_candidates():

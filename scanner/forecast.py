@@ -25,6 +25,44 @@ def _direction_basis(latest: pd.Series, regime: Regime, flow_score: float) -> st
     return f"완료봉 박스·전환 구조 · {flow}"
 
 
+def cap_upside_forecast_path(
+    points: list[ForecastPoint],
+    reference_price: float,
+    primary_resistance: float | None,
+    next_resistance: float | None,
+    extension_confirmed: bool,
+) -> list[ForecastPoint]:
+    """Bound upside scenarios by observed structure, extending only after confirmation.
+
+    The five-percent ceiling is a safety ceiling for the whole 30-minute path, not a
+    required return. A smaller observed resistance always wins.
+    """
+    if reference_price <= 0:
+        return points
+    chosen_cap = next_resistance if extension_confirmed and next_resistance else primary_resistance
+    ceiling = reference_price * 1.05
+    if chosen_cap is not None and chosen_cap > reference_price:
+        ceiling = min(float(chosen_cap), ceiling)
+    progress = {5: 0.35, 10: 0.55, 15: 0.75, 30: 1.00}
+    label = (
+        "다음 저항 확장" if extension_confirmed and next_resistance
+        else "기본 구조 저항 상한" if chosen_cap is not None and chosen_cap > reference_price
+        else "30분 단타 상한"
+    )
+    result: list[ForecastPoint] = []
+    for point in points:
+        if point.direction != Regime.UP:
+            result.append(point)
+            continue
+        horizon_cap = reference_price + (ceiling - reference_price) * progress.get(point.minutes, 1.0)
+        base = min(float(point.base), horizon_cap)
+        high = min(max(base, float(point.high)), ceiling)
+        low = min(float(point.low), base)
+        direction = Regime.UP if base > reference_price * 1.0005 else Regime.RANGE
+        result.append(ForecastPoint(point.minutes, max(0.0, low), base, high, direction, f"{point.basis} · {label}"))
+    return result
+
+
 def forecast_path(
     frame: pd.DataFrame,
     regime: Regime,

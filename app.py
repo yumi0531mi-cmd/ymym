@@ -32,7 +32,7 @@ CLIENT_CACHE_VERSION = "client-contract-v12-ranked-100-pages"
 REALTIME_HUB_CACHE_VERSION = "realtime-hub-v4-ranked-five"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 MAX_LIVE_CARDS = 5
-MAX_ANALYSIS_CANDIDATES = 5
+MAX_ANALYSIS_CANDIDATES = 8
 MAX_CANDIDATE_LIST = 100
 MAX_FAST_SHORTLIST = 15
 # KIS WebSocket이 재연결 중일 때 REST 보조 경로는 한 표본만 이어 기록한다.
@@ -472,33 +472,21 @@ def buy_range_text(plan: Any, quote: Quote) -> str:
 
 
 def actionable_display_levels(plan: Any, quote: Quote) -> dict[str, float | str | bool]:
-    """Return executable reference levels even when observed resistance is stale.
-
-    Structural levels remain the first choice. If a fast market has already
-    traded through them, use an explicitly mechanical ATR/percentage fallback
-    while leaving the engine's BUY/WAIT/BLOCK decision unchanged.
-    """
+    """Return only completed-chart structural reference levels; never invent percentage targets."""
     upward = bool(plan.diagnostics.get("long_price_path_confirmed"))
     if not upward or quote.price <= 0:
         return {"available": False, "basis": "하방·혼조 경로 · 신규 진입 금지"}
 
-    atr = float(plan.diagnostics.get("atr") or 0.0)
     entry = float(plan.entry) if isinstance(plan.entry, (int, float)) and 0 < float(plan.entry) <= quote.price * 1.002 else quote.price
-    risk_distance = max(entry * 0.008, atr * 0.80, entry * 0.0001)
     stop = float(plan.hard_stop or plan.stop or 0.0)
-    if not 0 < stop < entry:
-        stop = entry - risk_distance
-    else:
-        risk_distance = max(entry - stop, entry * 0.004)
-
-    target1 = max(float(plan.target or 0.0), entry * 1.012, entry + risk_distance * 1.50)
-    target2 = max(float(plan.target2 or 0.0), entry * 1.020, entry + risk_distance * 2.20)
-    if target2 <= target1:
-        target2 = max(target1 + risk_distance * 0.50, target1 * 1.008)
+    target1 = float(plan.target or 0.0)
+    target2 = float(plan.target2 or 0.0)
+    if not 0 < stop < entry < target1 < target2:
+        return {"available": False, "basis": "완료 차트의 지지·저항 목표 구조 재확인 중"}
 
     support = float(plan.soft_stop or 0.0)
     if not stop < support < entry:
-        support = entry - risk_distance * 0.60
+        return {"available": False, "basis": "완료 차트의 지지 구조 재확인 중"}
     return {
         "available": True,
         "entry": entry,
@@ -506,7 +494,7 @@ def actionable_display_levels(plan: Any, quote: Quote) -> dict[str, float | str 
         "target2": target2,
         "support": support,
         "stop": stop,
-        "basis": "구조 우선 · 미확인 시 ATR/진입가 대비 +1.2%·+2.0%·-0.8% 기계적 보완",
+        "basis": "완료 차트 지지·저항 구조 · 세 조건 충족 때만 다음 저항 확장",
     }
 
 
@@ -1168,9 +1156,9 @@ if candidates:
 
 if cards:
     analyzed_count = len(cards)
-    analysis_cards = list(cards)
     blocked_cards = [card for card in cards if card_trade_status(card) == "하방 제외"]
     cards = visible_trade_cards(cards, candidate_card_count)
+    analysis_cards = list(cards)
 else:
     analysis_cards = []
 

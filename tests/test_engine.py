@@ -4,8 +4,10 @@ import numpy as np
 import pandas as pd
 
 from scanner.engine import analyze
+from scanner.forecast import cap_upside_forecast_path
 from scanner.indicators import resample
 from scanner.models import Market, Quote, Regime, Signal
+from scanner.models import ForecastPoint
 from scanner.persistence import EventStore, ManualTrade
 from scanner.strategy import confirmed_levels, fake_signal_flags, repeat_box, trade_levels
 from scanner.validation import ValidationCase
@@ -61,6 +63,34 @@ def test_repeat_box_width_is_bounded():
     box = repeat_box(bars(slope=0), 100)
     if box:
         assert .5 <= (box[1] / box[0] - 1) * 100 <= 3.0
+
+
+def test_upside_forecast_is_capped_by_primary_structure_before_breakout_confirmation():
+    raw = [ForecastPoint(minutes, 100.0, 120.0, 125.0, Regime.UP, "raw") for minutes in (5, 10, 15, 30)]
+
+    capped = cap_upside_forecast_path(raw, 100.0, 103.0, 108.0, False)
+
+    assert capped[-1].base <= 103.0
+    assert capped[-1].high <= 103.0
+    assert capped[-1].direction == Regime.UP
+
+
+def test_upside_forecast_uses_next_resistance_only_after_all_breakout_conditions_are_confirmed():
+    raw = [ForecastPoint(minutes, 100.0, 120.0, 125.0, Regime.UP, "raw") for minutes in (5, 10, 15, 30)]
+
+    extended = cap_upside_forecast_path(raw, 100.0, 103.0, 104.5, True)
+
+    assert extended[-1].base == 104.5
+    assert extended[-1].high <= 104.5
+
+
+def test_upside_forecast_without_resistance_still_stops_at_five_percent_total_path_ceiling():
+    raw = [ForecastPoint(minutes, 100.0, 150.0, 160.0, Regime.UP, "raw") for minutes in (5, 10, 15, 30)]
+
+    capped = cap_upside_forecast_path(raw, 100.0, None, None, False)
+
+    assert capped[-1].base == 105.0
+    assert capped[-1].high == 105.0
 
 
 def test_korean_limit_up_is_not_candidate():

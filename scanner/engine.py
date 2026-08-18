@@ -5,7 +5,7 @@ from datetime import datetime
 import pandas as pd
 
 from .calibration import MIN_COMPLETE_PATH_SAMPLES
-from .forecast import forecast_path
+from .forecast import cap_upside_forecast_path, forecast_path
 from .indicators import enrich
 from .models import Market, Quote, Regime, Signal, TradePlan
 from .persistence_engine import final_buy_decision, persistence_score, risk_state
@@ -25,6 +25,16 @@ US_SESSION_LIQUIDITY = {
     "US_REGULAR": {"rvol": 1.00, "notional_rvol": 0.85, "max_spread": 0.25},
     "US_AFTER": {"rvol": 1.60, "notional_rvol": 1.50, "max_spread": 0.15},
 }
+
+
+def _breakout_retest_confirmed(completed: pd.DataFrame, resistance: float | None) -> bool:
+    """Require completed-bar breakout, retest, and hold; an intrabar spike is insufficient."""
+    if resistance is None or resistance <= 0 or len(completed) < 3:
+        return False
+    recent = completed.tail(3)
+    closes_hold = bool((recent.close >= resistance * 0.998).all())
+    retest_seen = bool((recent.low <= resistance * 1.004).any())
+    return closes_hold and retest_seen and float(recent.close.iloc[-1]) >= resistance
 
 
 def _max_spread(quote: Quote) -> float:
@@ -182,44 +192,7 @@ def analyze(
     entry, entry_basis = chart_entry_level(df, quote.price, regime, box)
     entry = entry or quote.price
     target1, target2, support, target1_basis, target2_basis, support_basis = trade_levels(df, entry, box)
-    forecast_points = forecast_path(completed, regime, reference_price=quote.price)
-    forecast_by_minutes = {point.minutes: point for point in forecast_points}
-    # A card may present an upward entry/target ladder only when every displayed
-    # 5/10/15/30-minute forecast is upward and its base estimate is above live price.
-    # A single downward horizon turns the card into observation-only rather than
-    # mixing a bearish forecast with an upward price recommendation.
-    has_downward_forecast = any(point.direction == Regime.DOWN for point in forecast_points)
-    forecast_path_ready = {point.minutes for point in forecast_points} == {5, 10, 15, 30}
-    long_price_path_confirmed = forecast_path_ready and all(
-        point.direction == Regime.UP and float(point.base) > quote.price
-        for point in forecast_points
-    )
-    # A forecast is never allowed to become an upside target below the intended entry.
-    # If completed five-minute resistance is unavailable, display no target instead of
-    # presenting a directionally invalid price level.
-    forecast_target1 = forecast_by_minutes.get(5)
-    if target1 is None and forecast_target1 is not None and float(forecast_target1.base) > entry:
-        target1 = float(forecast_target1.base)
-        target1_basis = "5분 완료봉 모멘텀·VWAP·EMA·거래량·거래대금·ATR 계산"
-    forecast_target2 = forecast_by_minutes.get(15)
-    minimum_target2 = float(target1) if target1 is not None else entry
-    if target2 is None and forecast_target2 is not None and float(forecast_target2.base) > minimum_target2:
-        target2 = float(forecast_target2.base)
-        target2_basis = "15분 완료봉 모멘텀·VWAP·EMA·거래량·거래대금·ATR 계산"
-    # A structural target that has already been passed by the live quote cannot guide
-    # a fresh entry. Likewise, any downward forecast disables upward price guidance.
-    targets_ahead_of_quote = bool(
-        long_price_path_confirmed and target1 is not None and target2 is not None
-        and float(target1) > quote.price and float(target2) > float(target1)
-    )
-    if not targets_ahead_of_quote:
-        target1, target2 = None, None
-        if has_downward_forecast:
-            target1_basis, target2_basis = "하방 경로 관찰 중", "하방 경로 관찰 중"
-        elif not forecast_path_ready:
-            target1_basis, target2_basis = "방향 재계산 중", "방향 재계산 중"
-        else:
-            target1_basis, target2_basis = "현재가 위 1차 목표 재확인 중", "현재가 위 2차 목표 재확인 중"
+    raw_forecast_points = forecast_path(completed, regime, reference_price=quote.price)
     entry_resistance_1m, _, _, _ = confirmed_levels(df, entry)
     flags = fake_signal_flags(completed, support, entry_resistance_1m)
     risk = risk_state(df, current_price=quote.price, support=support, fake_breakdown=flags["fake_breakdown"])
@@ -238,6 +211,35 @@ def analyze(
     rvol_ok = float(latest.rvol) >= rvol_threshold
     notional_threshold = _minimum_notional_rvol(quote)
     notional_ok = float(latest.notional_rvol) >= notional_threshold
+    breakout_flow_confirmed = rvol_ok and notional_ok
+    breakout_trade_confirmed = quote.source == "KIS_WEBSOCKET" and spread_ok and quote.price >= float(target1 or float("inf"))
+    breakout_retest_confirmed = _breakout_retest_confirmed(completed, target1)
+    breakout_extension_confirmed = bool(
+        target1 is not None and target2 is not None
+        and breakout_flow_confirmed and breakout_trade_confirmed and breakout_retest_confirmed
+    )
+    forecast_points = cap_upside_forecast_path(
+        raw_forecast_points, quote.price, target1, target2, breakout_extension_confirmed
+    )
+    forecast_by_minutes = {point.minutes: point for point in forecast_points}
+    has_downward_forecast = any(point.direction == Regime.DOWN for point in forecast_points)
+    forecast_path_ready = {point.minutes for point in forecast_points} == {5, 10, 15, 30}
+    long_price_path_confirmed = forecast_path_ready and all(
+        point.direction == Regime.UP and float(point.base) > quote.price
+        for point in forecast_points
+    )
+    targets_ahead_of_quote = bool(
+        long_price_path_confirmed and target1 is not None and target2 is not None
+        and float(target1) > quote.price and float(target2) > float(target1)
+    )
+    if not targets_ahead_of_quote:
+        target1, target2 = None, None
+        if has_downward_forecast:
+            target1_basis, target2_basis = "하방 경로 관찰 중", "하방 경로 관찰 중"
+        elif not forecast_path_ready:
+            target1_basis, target2_basis = "방향 재계산 중", "방향 재계산 중"
+        else:
+            target1_basis, target2_basis = "현재가 위 구조 목표 재확인 중", "다음 구조 목표 재확인 중"
     remaining = remaining_session_minutes(quote.market, quote.timestamp)
     persistence = persistence_score(
         df,
@@ -372,6 +374,10 @@ def analyze(
         "rvol_threshold": rvol_threshold,
         "notional_rvol": float(latest.notional_rvol),
         "notional_rvol_threshold": notional_threshold,
+        "breakout_flow_confirmed": breakout_flow_confirmed,
+        "breakout_trade_confirmed": breakout_trade_confirmed,
+        "breakout_retest_confirmed": breakout_retest_confirmed,
+        "breakout_extension_confirmed": breakout_extension_confirmed,
         "reward_risk_net": reward_risk,
         "price_structure_valid": structure_ok,
         "long_price_path_confirmed": long_price_path_confirmed,
