@@ -297,13 +297,22 @@ class KISClient:
                 pass
             return token
 
-    def _get(self, path: str, tr_id: str, params: dict[str, Any]) -> dict[str, Any]:
+    def _get_page(
+        self,
+        path: str,
+        tr_id: str,
+        params: dict[str, Any],
+        tr_cont: str = "",
+    ) -> tuple[dict[str, Any], str]:
+        """Fetch one KIS page and return its continuation marker without exposing headers."""
         headers = {
             "authorization": f"Bearer {self._token()}",
             "appkey": self.app_key,
             "appsecret": self.app_secret,
             "tr_id": tr_id,
         }
+        if tr_cont:
+            headers["tr_cont"] = tr_cont
         response = self._request("GET", path, headers=headers, params=params)
         if not response.ok:
             raise KISError(f"KIS 시세 요청 실패(HTTP {response.status_code}): {response.text[:200]}")
@@ -313,7 +322,78 @@ class KISClient:
             raise KISError("KIS 시세 응답이 JSON 형식이 아닙니다.") from exc
         if str(payload.get("rt_cd", "0")) not in ("0", ""):
             raise KISError(str(payload.get("msg1") or payload))
-        return payload
+        return payload, str(response.headers.get("tr_cont", "")).strip().upper()
+
+    def _get(self, path: str, tr_id: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Return one KIS JSON response for ordinary non-paginated requests."""
+        return self._get_page(path, tr_id, params)[0]
+
+    def _ranking_pages(
+        self,
+        path: str,
+        tr_id: str,
+        params: dict[str, Any],
+        output_key: str,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Collect only the shallow rank pages needed for up to 100 candidates."""
+        rows: list[dict[str, Any]] = []
+        continuation = ""
+        while len(rows) < max(1, int(limit)):
+            payload, next_marker = self._get_page(path, tr_id, params, continuation)
+            page_rows = [row for row in list(payload.get(output_key) or []) if isinstance(row, dict)]
+            rows.extend(page_rows)
+            if next_marker not in {"M", "F"} or not page_rows:
+                break
+            continuation = "N"
+        return rows[:max(1, int(limit))]
+
+    def _us_ranking_pages(
+        self,
+        path: str,
+        tr_id: str,
+        base_params: dict[str, Any],
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Interleave U.S. exchange rank pages and retain the KIS continuation key."""
+        maximum = max(1, int(limit))
+        states = [
+            {
+                "exchange": exchange,
+                "params": {**base_params, "EXCD": exchange},
+                "tr_cont": "",
+                "active": True,
+            }
+            for exchange in ("NAS", "NYS", "AMS")
+        ]
+        rows: list[dict[str, Any]] = []
+        while len(rows) < maximum:
+            progressed = False
+            for state in states:
+                if not state["active"]:
+                    continue
+                payload, next_marker = self._get_page(
+                    path,
+                    tr_id,
+                    dict(state["params"]),
+                    str(state["tr_cont"]),
+                )
+                page_rows = [row for row in list(payload.get("output2") or []) if isinstance(row, dict)]
+                rows.extend([{**row, "_exchange": str(state["exchange"])} for row in page_rows])
+                progressed = True
+                if next_marker in {"M", "F"} and page_rows:
+                    state["tr_cont"] = "N"
+                    continuation_key = str(payload.get("keyb") or "")
+                    state["params"] = {**dict(state["params"]), "KEYB": continuation_key}
+                else:
+                    state["active"] = False
+                if len(rows) >= maximum:
+                    break
+            if not progressed:
+                break
+        return rows[:maximum]
 
     @staticmethod
     def _number(data: dict[str, Any], *keys: str) -> float:
@@ -468,24 +548,20 @@ class KISClient:
         return df[~df.index.duplicated(keep="last")]
 
 
-    def market_rankings(self, market: Market) -> dict[str, list[dict[str, Any]]]:
-        """Fetch only first-page market rankings for a low-call candidate screen.
-
-        Returned rows are candidates, not tradable signals. Per-symbol quote,
-        orderbook and intraday calls remain deferred until the user selects one.
-        """
+    def market_rankings(self, market: Market, limit: int = 100) -> dict[str, list[dict[str, Any]]]:
+        """Fetch up to ``limit`` shallow rank rows without per-symbol details."""
         if market == Market.KR:
             # Domestic rank endpoints can have different availability by session or
             # account entitlement. Keep a successful rank source rather than
             # discarding it because the paired source is temporarily unavailable.
-            volume: dict[str, Any] = {}
-            fluctuation: dict[str, Any] = {}
+            volume_rows: list[dict[str, Any]] = []
+            fluctuation_rows: list[dict[str, Any]] = []
             failures: list[KISError] = []
             try:
-                volume = self._get(
-                    "/uapi/domestic-stock/v1/quotations/volume-rank",
-                    "FHPST01710000",
-                    {
+                volume_rows = self._ranking_pages(
+                "/uapi/domestic-stock/v1/quotations/volume-rank",
+                "FHPST01710000",
+                {
                         "FID_COND_MRKT_DIV_CODE": "J",
                         "FID_COND_SCR_DIV_CODE": "20171",
                         "FID_INPUT_ISCD": "0000",
@@ -495,17 +571,19 @@ class KISClient:
                         "FID_TRGT_EXLS_CLS_CODE": "0000000000",
                         "FID_INPUT_PRICE_1": "0",
                         "FID_INPUT_PRICE_2": "10000000",
-                        "FID_VOL_CNT": "0",
-                        "FID_INPUT_DATE_1": "",
-                    },
+                    "FID_VOL_CNT": "0",
+                    "FID_INPUT_DATE_1": "",
+                },
+                "output",
+                limit=limit,
                 )
             except KISError as exc:
                 failures.append(exc)
             try:
-                fluctuation = self._get(
-                    "/uapi/domestic-stock/v1/ranking/fluctuation",
-                    "FHPST01700000",
-                    {
+                fluctuation_rows = self._ranking_pages(
+                "/uapi/domestic-stock/v1/ranking/fluctuation",
+                "FHPST01700000",
+                {
                         "fid_rsfl_rate2": "30",
                         "fid_cond_mrkt_div_code": "J",
                         "fid_cond_scr_div_code": "20170",
@@ -518,36 +596,33 @@ class KISClient:
                         "fid_vol_cnt": "0",
                         "fid_trgt_cls_code": "0",
                         "fid_trgt_exls_cls_code": "0",
-                        "fid_div_cls_code": "0",
-                        "fid_rsfl_rate1": "0",
-                    },
+                    "fid_div_cls_code": "0",
+                    "fid_rsfl_rate1": "0",
+                },
+                "output",
+                limit=limit,
                 )
             except KISError as exc:
                 failures.append(exc)
             rows = {
-                "거래대금·거래량 순위": list(volume.get("output") or []),
-                "상승률 순위": list(fluctuation.get("output") or []),
+                "거래대금·거래량 순위": volume_rows,
+                "상승률 순위": fluctuation_rows,
             }
             if not any(rows.values()) and failures:
                 raise failures[0]
             return rows
 
-        rankings: dict[str, list[dict[str, Any]]] = {"거래대금·거래량 순위": [], "상승률 순위": []}
-        for exchange in ("NAS", "NYS", "AMS"):
-            turnover = self._get(
+        return {
+            "거래대금·거래량 순위": self._us_ranking_pages(
                 "/uapi/overseas-stock/v1/ranking/trade-pbmn",
                 "HHDFS76320010",
-                {"EXCD": exchange, "NDAY": "0", "VOL_RANG": "0", "AUTH": "", "KEYB": "", "PRC1": "", "PRC2": ""},
-            )
-            updown = self._get(
+                {"NDAY": "0", "VOL_RANG": "0", "AUTH": "", "KEYB": "", "PRC1": "", "PRC2": ""},
+                limit=limit,
+            ),
+            "상승률 순위": self._us_ranking_pages(
                 "/uapi/overseas-stock/v1/ranking/updown-rate",
                 "HHDFS76290000",
-                {"EXCD": exchange, "NDAY": "0", "GUBN": "1", "VOL_RANG": "0", "AUTH": "", "KEYB": ""},
-            )
-            rankings["거래대금·거래량 순위"].extend(
-                [{**row, "_exchange": exchange} for row in list(turnover.get("output2") or []) if isinstance(row, dict)]
-            )
-            rankings["상승률 순위"].extend(
-                [{**row, "_exchange": exchange} for row in list(updown.get("output2") or []) if isinstance(row, dict)]
-            )
-        return rankings
+                {"NDAY": "0", "GUBN": "1", "VOL_RANG": "0", "AUTH": "", "KEYB": ""},
+                limit=limit,
+            ),
+        }

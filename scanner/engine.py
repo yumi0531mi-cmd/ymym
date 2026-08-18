@@ -16,21 +16,34 @@ from .strategy_ensemble import evaluate_ensemble
 
 ACTIVE_SESSIONS = {"KR_REGULAR", "US_DAY", "US_PRE", "US_REGULAR", "US_AFTER"}
 
+# Relative-volume and notional thresholds are screening gates, not predicted
+# outcomes. U.S. sessions have materially different depth, so the same 1-minute
+# activity score must not be treated as equally liquid outside regular trading.
+US_SESSION_LIQUIDITY = {
+    "US_DAY": {"rvol": 1.55, "notional_rvol": 1.45, "max_spread": 0.18},
+    "US_PRE": {"rvol": 1.40, "notional_rvol": 1.30, "max_spread": 0.18},
+    "US_REGULAR": {"rvol": 1.00, "notional_rvol": 0.85, "max_spread": 0.25},
+    "US_AFTER": {"rvol": 1.60, "notional_rvol": 1.50, "max_spread": 0.15},
+}
+
 
 def _max_spread(quote: Quote) -> float:
     if quote.market == Market.KR:
         return 0.15
-    return 0.25 if quote.session == "US_REGULAR" else 0.15
+    return float(US_SESSION_LIQUIDITY.get(quote.session, US_SESSION_LIQUIDITY["US_AFTER"])["max_spread"])
 
 
 def _minimum_rvol(quote: Quote, regime: Regime) -> float:
-    if quote.session in {"US_PRE", "US_AFTER"}:
-        return 1.35
+    if quote.market == Market.US:
+        base = float(US_SESSION_LIQUIDITY.get(quote.session, US_SESSION_LIQUIDITY["US_AFTER"])["rvol"])
+        return max(0.80, base - 0.20) if regime == Regime.RANGE else base
     return 0.80 if regime == Regime.RANGE else 1.00
 
 
 def _minimum_notional_rvol(quote: Quote) -> float:
-    return 1.20 if quote.session in {"US_PRE", "US_AFTER"} else 0.85
+    if quote.market == Market.US:
+        return float(US_SESSION_LIQUIDITY.get(quote.session, US_SESSION_LIQUIDITY["US_AFTER"])["notional_rvol"])
+    return 0.85
 
 
 def _round_trip_cost_pct(market: Market) -> float:

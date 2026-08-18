@@ -22,7 +22,7 @@ def test_merge_rankings_prioritizes_symbols_in_both_rankings():
     assert candidates[1].screen_score == 45
 
 
-def test_merge_rankings_excludes_us_directional_products():
+def test_merge_rankings_keeps_us_leveraged_and_inverse_products():
     rankings = {
         "거래대금·거래량 순위": [{"symb": "SOXL", "ovrs_item_name": "DIREXION SEMICONDUCTOR BULL 3X", "last": "20.1"}],
         "상승률 순위": [{"symb": "SOXL", "ovrs_item_name": "DIREXION SEMICONDUCTOR BULL 3X", "rate": "4.0"}],
@@ -30,7 +30,8 @@ def test_merge_rankings_excludes_us_directional_products():
 
     candidates = merge_rankings(Market.US, rankings)
 
-    assert candidates == []
+    assert [candidate.symbol for candidate in candidates] == ["SOXL"]
+    assert candidates[0].screen_score == 100
 
 
 def test_merge_rankings_keeps_plain_us_stock():

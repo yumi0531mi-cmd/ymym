@@ -170,11 +170,11 @@ def test_kr_market_rankings_use_two_first_page_requests(tmp_path):
     responses = [{"output": [{"mksc_shrn_iscd": "005930"}]}, {"output": [{"mksc_shrn_iscd": "000660"}]}]
     calls = []
 
-    def fake_get(path, tr_id, params):
-        calls.append((path, tr_id, params))
-        return responses.pop(0)
+    def fake_get_page(path, tr_id, params, tr_cont=""):
+        calls.append((path, tr_id, params, tr_cont))
+        return responses.pop(0), ""
 
-    client._get = fake_get  # type: ignore[method-assign]
+    client._get_page = fake_get_page  # type: ignore[method-assign]
     rankings = client.market_rankings(Market.KR)
 
     assert len(calls) == 2
@@ -191,11 +191,11 @@ def test_us_market_rankings_use_two_requests_per_exchange(tmp_path):
     responses = [{"output2": [{"symb": "TEST"}]} for _ in range(6)]
     calls = []
 
-    def fake_get(path, tr_id, params):
-        calls.append((path, tr_id, params))
-        return responses.pop(0)
+    def fake_get_page(path, tr_id, params, tr_cont=""):
+        calls.append((path, tr_id, params, tr_cont))
+        return responses.pop(0), ""
 
-    client._get = fake_get  # type: ignore[method-assign]
+    client._get_page = fake_get_page  # type: ignore[method-assign]
     rankings = client.market_rankings(Market.US)
 
     assert len(calls) == 6
@@ -239,15 +239,36 @@ def test_domestic_rankings_keeps_successful_source_when_paired_rank_fails(tmp_pa
     client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
     calls = []
 
-    def fake_get(path, _tr_id, _params):
+    def fake_get_page(path, _tr_id, _params, _tr_cont=""):
         calls.append(path)
         if path.endswith("volume-rank"):
-            return {"output": [{"mksc_shrn_iscd": "005930", "stck_prpr": "70000"}]}
+            return {"output": [{"mksc_shrn_iscd": "005930", "stck_prpr": "70000"}]}, ""
         raise KISError("temporary fluctuation rank failure")
 
-    client._get = fake_get  # type: ignore[method-assign]
+    client._get_page = fake_get_page  # type: ignore[method-assign]
     rankings = client.market_rankings(Market.KR)
 
     assert len(calls) == 2
     assert rankings["거래대금·거래량 순위"]
     assert rankings["상승률 순위"] == []
+
+
+def test_kr_market_rankings_collects_next_page_until_limit(tmp_path):
+    client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
+    pages = [
+        ({"output": [{"mksc_shrn_iscd": "000001"}, {"mksc_shrn_iscd": "000002"}]}, "M"),
+        ({"output": [{"mksc_shrn_iscd": "000003"}]}, ""),
+        ({"output": [{"mksc_shrn_iscd": "000004"}]}, ""),
+    ]
+    calls = []
+
+    def fake_get_page(path, _tr_id, _params, tr_cont=""):
+        calls.append((path, tr_cont))
+        return pages.pop(0)
+
+    client._get_page = fake_get_page  # type: ignore[method-assign]
+    rankings = client.market_rankings(Market.KR, limit=3)
+
+    assert [item[1] for item in calls] == ["", "N", ""]
+    assert [row["mksc_shrn_iscd"] for row in rankings["거래대금·거래량 순위"]] == ["000001", "000002", "000003"]
+    assert [row["mksc_shrn_iscd"] for row in rankings["상승률 순위"]] == ["000004"]

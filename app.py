@@ -15,7 +15,7 @@ from scanner.cycle import CycleStore
 from scanner.engine import analyze
 from scanner.indicators import resample
 from scanner.kis_client import KISClient, KISError, secrets_fingerprint
-from scanner.market_screener import is_kr_directional_product, is_us_directional_product, merge_rankings
+from scanner.market_screener import is_kr_directional_product, merge_rankings
 from scanner.models import Market, Quote, Regime, Signal
 from scanner.persistence import EventStore
 from scanner.realtime import KISRealtimeHub
@@ -31,11 +31,12 @@ CLIENT_CACHE_VERSION = "client-contract-v11-us-day-bars"
 # WebSocket protocol or recovery contract changes, without issuing a new REST token.
 REALTIME_HUB_CACHE_VERSION = "realtime-hub-v3-visible-fallback"
 VALIDATION_ROOT = Path(".scanner_data/validation")
-MAX_LIVE_CARDS = 3
-MAX_ANALYSIS_CANDIDATES = 10
-MAX_CANDIDATE_LIST = 20
+MAX_LIVE_CARDS = 5
+MAX_ANALYSIS_CANDIDATES = 5
+MAX_CANDIDATE_LIST = 100
+MAX_FAST_SHORTLIST = 15
 KR_PRICE_CEILING = 300_000.0
-US_PRICE_CEILING = 170.0
+US_PRICE_CEILING = 200.0
 KR_SEARCH_INDEX_PATH = Path("data/kr_stock_index.json")
 
 st.set_page_config(
@@ -252,9 +253,6 @@ def eligible_price(candidate: dict[str, Any], market: Market) -> bool:
         change_pct = float(candidate.get("change_pct") or 0.0)
     except (TypeError, ValueError):
         return False
-    name = str(candidate.get("name") or "")
-    if market == Market.US and is_us_directional_product(name):
-        return False
     # A scalp screen must not promote an already vertical move as a fresh entry.
     # Larger gainers can still be inspected by direct symbol search.
     max_change = 12.0
@@ -275,13 +273,19 @@ def sort_rising_candidates(candidates: list[dict[str, Any]], market: Market) -> 
     )
 
 
+def fast_shortlist_candidates(candidates: list[dict[str, Any]], market: Market) -> list[dict[str, Any]]:
+    """Narrow a 100-name KIS ranking universe before any symbol-level REST calls."""
+    shortlisted = sort_rising_candidates(candidates, market)[:MAX_FAST_SHORTLIST]
+    return [{**candidate, "candidate_stage": "순위·유동성 빠른 선별"} for candidate in shortlisted]
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_dashboard_candidates(market_value: str, cache_version: str) -> list[dict[str, Any]]:
-    """Return up to 20 rising price-eligible candidates without detailed analysis yet."""
+    """Return up to 100 rising price-eligible candidates without detailed analysis yet."""
     market = Market(market_value)
     client = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint())
     try:
-        rankings = client.market_rankings(market)
+        rankings = client.market_rankings(market, limit=MAX_CANDIDATE_LIST)
         candidates = [candidate.to_dict() for candidate in merge_rankings(market, rankings, limit=MAX_CANDIDATE_LIST)]
         for candidate in candidates:
             candidate["candidate_source"] = "시장 실시간 순위"
@@ -936,7 +940,8 @@ with st.sidebar:
     cost_pct = st.number_input("왕복비용 가정(%)", min_value=0.0, max_value=5.0, value=cost_default, step=0.01)
     min_score = st.slider("최소 신호 점수", min_value=60, max_value=100, value=80, step=5)
     refresh_seconds = int(st.radio("현재가 화면 갱신", [1, 3, 5], horizontal=True, format_func=lambda value: f"{value}초"))
-    candidate_card_count = int(st.slider("상승·반복단타 후보 수", min_value=5, max_value=10, value=5, step=1))
+    candidate_card_count = MAX_LIVE_CARDS
+    st.caption("시장 후보 100개 → 빠른 선별 15개 → 정밀 분석·실시간 체결 5개")
     if client.ready:
         st.success("실시간 후보 자동 분석 중")
     else:
@@ -993,20 +998,13 @@ else:
             requests: list[dict[str, Any]] = []
             if direct_request is not None:
                 requests.append({**direct_request, "candidate_source": "관심 종목 직접 검색"})
-            analysis_limit = min(MAX_ANALYSIS_CANDIDATES, candidate_card_count + 2)
-            for candidate in candidates[:analysis_limit]:
+            fast_shortlist = fast_shortlist_candidates(candidates, market)
+            auto_slots = max(0, MAX_ANALYSIS_CANDIDATES - (1 if direct_request is not None else 0))
+            for candidate in fast_shortlist[:auto_slots]:
                 if direct_request is not None and str(candidate["symbol"]) == direct_request["symbol"]:
                     continue
                 requests.append(candidate)
-            visible_requests = requests[:analysis_limit]
-            realtime_hub.configure(
-                (
-                    market,
-                    str(candidate["symbol"]),
-                    str(candidate.get("exchange") or ("NAS" if market == Market.US else "")),
-                )
-                for candidate in visible_requests
-            )
+            visible_requests = requests[:MAX_ANALYSIS_CANDIDATES]
             for candidate in visible_requests:
                 symbol = str(candidate["symbol"])
                 exchange = str(candidate.get("exchange") or ("NAS" if market == Market.US else ""))
@@ -1037,6 +1035,15 @@ if cards:
     blocked_cards = [card for card in cards if card_trade_status(card) == "하방 제외"]
     cards = visible_trade_cards(cards, candidate_card_count)
 
+realtime_hub.configure(
+    (
+        card["quote"].market,
+        str(card["quote"].symbol),
+        str(card.get("exchange") or ("NAS" if card["quote"].market == Market.US else "")),
+    )
+    for card in cards
+)
+
 if cards:
     updated_at = max(card["quote"].timestamp for card in cards)
     source_labels = {str(card.get("candidate_source") or "시장 실시간 순위") for card in cards}
@@ -1044,11 +1051,11 @@ if cards:
     actionable_count = sum(card_trade_status(card) == "매수 조건 충족" for card in cards)
     waiting_count = sum(card_trade_status(card) == "눌림목 대기" for card in cards)
     st.subheader(f"실시간 상방 후보 · 매수 {actionable_count} · 눌림 대기 {waiting_count}")
-    st.caption(f"상위 {analyzed_count}개 분석 · 하방/진입금지 {len(blocked_cards)}개 자동 제외 · {updated_at.strftime('%H:%M:%S')} · {realtime_hub.status_label()} · {source_text}")
+    st.caption(f"시장 순위 100개 → 빠른 선별 {MAX_FAST_SHORTLIST}개 → 정밀 분석 {analyzed_count}개 → 실시간 체결 {len(cards)}개 · 하방/진입금지 {len(blocked_cards)}개 자동 제외 · {updated_at.strftime('%H:%M:%S')} · {realtime_hub.status_label()} · {source_text}")
     for card_item in cards:
         render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds)
 elif kis_connected and not errors and not candidates:
-    limit_text = "30만 원 미만" if market == Market.KR else "170달러 미만"
+    limit_text = "30만 원 미만" if market == Market.KR else "200달러 미만"
     st.info(f"현재 {limit_text} 가격 조건과 상승 후보 기준을 함께 통과한 종목이 없습니다.")
 
 if candidates and not cards:
