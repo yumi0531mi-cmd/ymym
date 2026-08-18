@@ -38,6 +38,7 @@ MAX_FAST_SHORTLIST = 15
 # KIS WebSocket이 재연결 중일 때 REST 보조 경로는 한 표본만 이어 기록한다.
 # 후보 분석 호출과 합쳐도 분당 30건 제한을 넘기지 않기 위한 안전 장치다.
 MAX_PENDING_FORECAST_WATCHES = 1
+MAX_DAILY_RISE_PCT = 12.0
 KR_PRICE_CEILING = 300_000.0
 US_PRICE_CEILING = 200.0
 KR_SEARCH_INDEX_PATH = Path("data/kr_stock_index.json")
@@ -268,8 +269,7 @@ def eligible_price(candidate: dict[str, Any], market: Market) -> bool:
         return False
     # A scalp screen must not promote an already vertical move as a fresh entry.
     # Larger gainers can still be inspected by direct symbol search.
-    max_change = 12.0
-    return 0 < price < price_ceiling(market) and 0 < change_pct <= max_change
+    return 0 < price < price_ceiling(market) and 0 < change_pct <= MAX_DAILY_RISE_PCT
 
 
 def sort_rising_candidates(candidates: list[dict[str, Any]], market: Market) -> list[dict[str, Any]]:
@@ -776,7 +776,7 @@ def render_realtime_price(refresh_seconds: int, *args) -> None:
 
 def mixed_card_priority(item: dict[str, Any]) -> tuple[int, int, int]:
     plan = item["plan"]
-    decision_rank = {"매수 조건 충족": 3, "눌림목 대기": 2, "관찰": 1, "하방 제외": 0}[card_trade_status(item)]
+    decision_rank = {"매수 조건 충족": 3, "눌림목 대기": 2, "관찰": 1, "하방 제외": 0, "급등 과열 제외": 0}[card_trade_status(item)]
     trend_rank = 2 if plan.regime == Regime.UP else (1 if plan.regime == Regime.RANGE else 0)
     repeat_rank = 1 if repeat_band_pct(plan) is not None else 0
     return (decision_rank, trend_rank + repeat_rank, plan.score)
@@ -785,6 +785,9 @@ def mixed_card_priority(item: dict[str, Any]) -> tuple[int, int, int]:
 def card_trade_status(item: dict[str, Any]) -> str:
     """Map analysis output to one unambiguous live-trading state."""
     plan = item["plan"]
+    quote: Quote = item["quote"]
+    if quote.change_pct > MAX_DAILY_RISE_PCT:
+        return "급등 과열 제외"
     diagnostics = plan.diagnostics
     if bool(diagnostics.get("has_downward_forecast")) or plan.regime == Regime.DOWN:
         return "하방 제외"
@@ -799,6 +802,8 @@ def card_ready_for_display(item: dict[str, Any]) -> bool:
     """Show automatic cards only after the complete short-horizon reference set exists."""
     quote = item.get("quote")
     if not isinstance(quote, Quote) or quote.session not in ACTIVE_CARD_SESSIONS:
+        return False
+    if quote.change_pct > MAX_DAILY_RISE_PCT:
         return False
     if not bool(item.get("chart_aligned")):
         return False

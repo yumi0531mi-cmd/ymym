@@ -234,6 +234,19 @@ def test_visible_trade_cards_keep_up_to_five_ready_candidates():
     assert {item["quote"].symbol for item in visible}.issubset({f"T{index}" for index in range(6)})
 
 
+def test_live_card_hides_candidate_that_turns_into_daily_overheat_after_selection():
+    from app import card_ready_for_display, card_trade_status
+
+    plan = _plan()
+    quote = _quote()
+    quote.previous_close = 60000
+    item = {"quote": quote, "plan": plan, "chart_aligned": True}
+
+    assert quote.change_pct > 12.0
+    assert card_trade_status(item) == "급등 과열 제외"
+    assert card_ready_for_display(item) is False
+
+
 def test_card_trade_status_separates_buy_wait_and_downward_candidates():
     from app import card_ready_for_display, card_trade_status, visible_trade_cards
 
