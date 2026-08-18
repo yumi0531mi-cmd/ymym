@@ -118,13 +118,14 @@ def current_realtime_hub() -> KISRealtimeHub:
 
 
 @st.cache_resource
-def get_event_store() -> EventStore:
+def get_event_store(secret_fingerprint: str) -> EventStore:
+    """Recreate the persistent event store whenever Streamlit Secrets change."""
     return EventStore(st.secrets)
 
 
 @st.cache_resource
-def get_cycle_store() -> CycleStore:
-    return CycleStore(get_event_store())
+def get_cycle_store(secret_fingerprint: str) -> CycleStore:
+    return CycleStore(get_event_store(secret_fingerprint))
 
 
 def _quote_to_cache_record(quote: Quote) -> dict[str, object]:
@@ -789,8 +790,9 @@ def render_chart(bars: pd.DataFrame, plan: Any, key: str) -> None:
 
 client = current_client()
 realtime_hub = current_realtime_hub()
-event_store = get_event_store()
-cycle_store = get_cycle_store()
+active_secret_fingerprint = current_secret_fingerprint()
+event_store = get_event_store(active_secret_fingerprint)
+cycle_store = get_cycle_store(active_secret_fingerprint)
 store = ValidationStore(VALIDATION_ROOT, event_store=event_store)
 
 with st.sidebar:
