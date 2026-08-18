@@ -23,7 +23,7 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
-APP_VERSION = "6.1-ranked-100-final-5"
+APP_VERSION = "6.2-single-path-audit"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
 CLIENT_CACHE_VERSION = "client-contract-v12-ranked-100-pages"
@@ -674,8 +674,10 @@ def record_forecast_accuracy_audit(
     price_source = "KIS 체결" if live_tick is not None else "KIS REST"
     if live_tick is None:
         scored_cases += store.capture_rest_snapshot_and_score(
-            quote.symbol, quote.market.value, observed_time, observed_price, price_source
+            quote.symbol, quote.market.value, observed_time, observed_price, price_source, APP_VERSION
         )
+    if store.has_pending_forecast_audit(quote.market.value, APP_VERSION):
+        return scored_cases, False
     case = ValidationCase.from_plan(
         plan,
         observed_price,
@@ -927,11 +929,13 @@ def run_hidden_forecast_validation(items: list[dict[str, Any]], cost_pct: float,
 def capture_pending_forecast_paths(store: ValidationStore, market_value: str) -> None:
     """Continue one REST-backed forecast, or a live-tick path, after card rotation."""
     market = Market(market_value)
-    for case in store.pending_forecast_audits(market.value, MAX_PENDING_FORECAST_WATCHES):
+    for case in store.pending_forecast_audits(
+        market.value, version=APP_VERSION, limit=MAX_PENDING_FORECAST_WATCHES
+    ):
         tick = display_tick(market, case.symbol)
         if tick is not None:
             store.capture_rest_snapshot_and_score(
-                case.symbol, market.value, tick.timestamp, tick.price, "KIS 체결"
+                case.symbol, market.value, tick.timestamp, tick.price, "KIS 체결", APP_VERSION
             )
             continue
         try:
@@ -939,7 +943,7 @@ def capture_pending_forecast_paths(store: ValidationStore, market_value: str) ->
         except (KISError, OSError, ValueError, KeyError):
             continue
         store.capture_rest_snapshot_and_score(
-            case.symbol, market.value, quote.timestamp, quote.price, "KIS REST"
+            case.symbol, market.value, quote.timestamp, quote.price, "KIS REST", APP_VERSION
         )
 
 

@@ -144,7 +144,11 @@ def test_live_validation_records_only_actionable_buy_signal():
 def test_forecast_audit_records_complete_watch_path_separately():
     from app import record_forecast_accuracy_audit
 
-    store = SimpleNamespace(score_ready=Mock(return_value=0), save_once=Mock(return_value=(Path("case.json"), True)))
+    store = SimpleNamespace(
+        score_ready=Mock(return_value=0),
+        has_pending_forecast_audit=Mock(return_value=False),
+        save_once=Mock(return_value=(Path("case.json"), True)),
+    )
     tick = RealtimeTick("005930", Market.KR, 70000, 1.2, datetime(2026, 8, 17, 10, 0))
     hub = SimpleNamespace(tick=Mock(return_value=tick))
     watch_plan = _plan()
@@ -168,6 +172,7 @@ def test_forecast_audit_uses_labeled_kis_rest_snapshot_while_trade_tick_reconnec
     store = SimpleNamespace(
         score_ready=Mock(return_value=0),
         capture_rest_snapshot_and_score=Mock(return_value=0),
+        has_pending_forecast_audit=Mock(return_value=False),
         save_once=Mock(return_value=(Path("case.json"), True)),
     )
     hub = SimpleNamespace(tick=Mock(return_value=None))
@@ -181,6 +186,25 @@ def test_forecast_audit_uses_labeled_kis_rest_snapshot_while_trade_tick_reconnec
     saved_case = store.save_once.call_args.args[0]
     assert saved_case.latest_trade_price == 70000
     assert saved_case.price_source == "KIS REST"
+
+
+def test_forecast_audit_starts_only_one_pending_path_per_market(tmp_path):
+    from app import record_forecast_accuracy_audit
+    from scanner.validation import ValidationStore
+
+    store = ValidationStore(tmp_path)
+    tick = RealtimeTick("005930", Market.KR, 70000, 1.2, datetime(2026, 8, 17, 10, 0))
+    hub = SimpleNamespace(tick=Mock(return_value=tick))
+    watch_plan = _plan()
+    watch_plan.signal = Signal.WAIT
+
+    with patch("app.current_realtime_hub", return_value=hub):
+        _, first_recorded = record_forecast_accuracy_audit(store, watch_plan, _quote(), _bars(), True, 0.05)
+        _, second_recorded = record_forecast_accuracy_audit(store, watch_plan, _quote(), _bars(), True, 0.05)
+
+    assert first_recorded is True
+    assert second_recorded is False
+    assert len(store.pending_forecast_audits("KR", version="6.2-single-path-audit")) == 1
 
 
 def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():

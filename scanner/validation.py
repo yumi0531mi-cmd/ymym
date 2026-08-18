@@ -361,13 +361,16 @@ class ValidationStore:
     def pending(self, market: str | None = None) -> list[ValidationCase]:
         return [case for case in self.cases() if case.full_path_pass is None and (market is None or case.market == market)]
 
-    def pending_forecast_audits(self, market: str, limit: int = 5) -> list[ValidationCase]:
-        """Return the oldest incomplete full-path audits so candidate rotation cannot drop them."""
+    def pending_forecast_audits(self, market: str, version: str | None = None, limit: int = 5) -> list[ValidationCase]:
+        """Return incomplete full-path audits for the active rule version."""
         pending = [
             case for case in self.pending(market)
-            if case.validation_kind == "FORECAST_AUDIT"
+            if case.validation_kind == "FORECAST_AUDIT" and (version is None or case.version == version)
         ]
         return sorted(pending, key=lambda case: case.signal_time)[:max(1, min(int(limit), 5))]
+
+    def has_pending_forecast_audit(self, market: str, version: str) -> bool:
+        return bool(self.pending_forecast_audits(market, version=version, limit=1))
 
     def score_ready(self, symbol: str, market: str, bars: pd.DataFrame, cost_pct: float) -> int:
         """Score pending same-symbol cases after a complete 30-minute future path exists."""
@@ -400,6 +403,7 @@ class ValidationStore:
         observed_at: datetime,
         price: float,
         source: str = "KIS REST",
+        version: str | None = None,
     ) -> int:
         """Append one KIS REST snapshot to pending forecast audits and score mature paths."""
         if price <= 0:
@@ -407,7 +411,11 @@ class ValidationStore:
         observed = pd.Timestamp(observed_at)
         scored = 0
         for case in self.pending(market):
-            if case.symbol != symbol or case.validation_kind != "FORECAST_AUDIT":
+            if (
+                case.symbol != symbol
+                or case.validation_kind != "FORECAST_AUDIT"
+                or (version is not None and case.version != version)
+            ):
                 continue
             signal_at = pd.Timestamp(case.signal_time)
             comparable_observed = observed
