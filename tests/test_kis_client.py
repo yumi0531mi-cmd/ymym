@@ -55,7 +55,7 @@ def test_us_intraday_keeps_official_exchange_code():
     assert calls[0][2]["EXCD"] == "NAS"
 
 
-def test_kr_intraday_requests_one_previous_page_when_current_page_is_full(tmp_path):
+def test_kr_intraday_uses_official_120_record_daily_minute_endpoint(tmp_path):
     client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
     calls = []
 
@@ -68,7 +68,7 @@ def test_kr_intraday_requests_one_previous_page_when_current_page_is_full(tmp_pa
             for offset in range(30)
         ]
 
-    responses = [{"output2": rows(0)}, {"output2": rows(30)}]
+    responses = [{"output2": rows(0)}]
 
     def fake_get(path, tr_id, params):
         calls.append((path, tr_id, params))
@@ -77,9 +77,11 @@ def test_kr_intraday_requests_one_previous_page_when_current_page_is_full(tmp_pa
     client._get = fake_get  # type: ignore[method-assign]
     bars = client.intraday("036930", Market.KR)
 
-    assert len(calls) == 2
-    assert calls[1][2]["FID_INPUT_HOUR_1"] == "120000"
-    assert len(bars) == 60
+    assert len(calls) == 1
+    assert calls[0][0].endswith("inquire-time-dailychartprice")
+    assert calls[0][1] == "FHKST03010230"
+    assert calls[0][2]["FID_PW_DATA_INCU_YN"] == "Y"
+    assert len(bars) == 30
 
 
 def test_missing_live_price_is_an_error_not_a_fake_plan():

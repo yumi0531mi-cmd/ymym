@@ -15,7 +15,7 @@ from scanner.cycle import CycleStore
 from scanner.engine import analyze
 from scanner.indicators import resample
 from scanner.kis_client import KISClient, KISError, secrets_fingerprint
-from scanner.market_screener import is_kr_directional_product, merge_rankings
+from scanner.market_screener import is_kr_directional_product, is_us_directional_product, merge_rankings
 from scanner.models import Market, Quote, Regime, Signal
 from scanner.persistence import EventStore
 from scanner.realtime import KISRealtimeHub
@@ -23,13 +23,13 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
-APP_VERSION = "5.7-kis-source-only"
+APP_VERSION = "5.8-live-data-recovery"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
-CLIENT_CACHE_VERSION = "client-contract-v9-kis-source-only"
+CLIENT_CACHE_VERSION = "client-contract-v10-120bar"
 # The market-data connection has its own lifecycle. Bump this only when the
 # WebSocket protocol or recovery contract changes, without issuing a new REST token.
-REALTIME_HUB_CACHE_VERSION = "realtime-hub-v2-heartbeat-recovery"
+REALTIME_HUB_CACHE_VERSION = "realtime-hub-v3-visible-fallback"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 MAX_LIVE_CARDS = 5
 MAX_CANDIDATE_LIST = 20
@@ -160,7 +160,7 @@ def _quote_from_cache_record(record: dict[str, object]) -> Quote:
     )
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=15, show_spinner=False)
 def _load_quote_record(symbol: str, market_value: str, exchange: str) -> dict[str, object]:
     # KIS REST is the only fallback when the official WebSocket is unavailable.
     # Five visible cards at this interval remain below the 30-call/minute ceiling.
@@ -251,7 +251,11 @@ def eligible_price(candidate: dict[str, Any], market: Market) -> bool:
         change_pct = float(candidate.get("change_pct") or 0.0)
     except (TypeError, ValueError):
         return False
-    return 0 < price < price_ceiling(market) and change_pct > 0
+    name = str(candidate.get("name") or "")
+    if market == Market.US and is_us_directional_product(name):
+        return False
+    max_change = 20.0 if market == Market.US else 15.0
+    return 0 < price < price_ceiling(market) and 0 < change_pct <= max_change
 
 
 def sort_rising_candidates(candidates: list[dict[str, Any]], market: Market) -> list[dict[str, Any]]:
@@ -458,9 +462,9 @@ def dashboard_structure(item: dict[str, Any]) -> dict[str, str]:
     plan = item["plan"]
     bars: pd.DataFrame = item["bars"]
     timeframes = plan.diagnostics.get("timeframes") or {}
-    trend_60 = str(timeframes.get(60) or timeframes.get("60") or plan.regime.value)
-    trend_label = regime_text(Regime(trend_60)) if trend_60 in {item.value for item in Regime} else regime_text(plan.regime)
-    completed_60 = max(0, len(resample(bars, 60)) - 1) if not bars.empty else 0
+    trend_30 = str(timeframes.get(30) or timeframes.get("30") or plan.regime.value)
+    trend_label = regime_text(Regime(trend_30)) if trend_30 in {item.value for item in Regime} else regime_text(plan.regime)
+    completed_30 = max(0, len(resample(bars, 30)) - 1) if not bars.empty else 0
     box = plan.repeat_box
     if plan.regime == Regime.UP and box:
         kind = "우상향 반복단타"
@@ -490,8 +494,8 @@ def dashboard_structure(item: dict[str, Any]) -> dict[str, str]:
     return {
         "유형": kind,
         "큰 추세": trend_label,
-        "60분봉 구조": trend_label,
-        "60분봉 수": str(completed_60),
+        "30분봉 구조": trend_label,
+        "30분봉 수": str(completed_30),
         "박스 판정": box_text,
         "현재 상태": current_state,
     }
@@ -617,7 +621,7 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
     }
 
 
-@st.fragment(run_every=1.0)
+@st.fragment(run_every=3.0)
 def render_realtime_price(symbol: str, market_value: str, exchange: str, base_price: float, previous_close: float, initial_timestamp: str) -> None:
     """Redraw only a card's live price area once per second.
 
@@ -731,7 +735,7 @@ def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int, stor
     """Render a price-first card with 1-second tick and 1-minute structure refreshes."""
     quote: Quote = item["quote"]
     title = f"{quote.symbol} · {item.get('name') or quote.market.value}"
-    with st.container(border=True):
+    with st.container(border=True, key=f"card_{quote.market.value}_{quote.symbol}"):
         st.subheader(title)
         render_realtime_price(
             quote.symbol,
@@ -832,11 +836,13 @@ with st.sidebar:
     budget = client.budget_status
     st.caption(f"호출 보호: 1분 {budget.minute_used}/{budget.minute_limit} · 5시간 {budget.five_hour_used}/{budget.five_hour_limit}")
     st.caption(realtime_hub.status_label())
+    if realtime_hub.last_error:
+        st.caption(f"실시간 연결 원인: {realtime_hub.last_error[:160]}")
     if event_store.configured:
         st.caption("검증 성과 저장: 영구 보관 연결됨")
     else:
         st.caption("검증 성과 저장: 앱 재시작 시 초기화될 수 있음 · [한 번만 설정하는 안내](https://github.com/yumi0531mi-cmd/ymym/blob/main/docs/supabase_persistent_validation_setup.md)")
-    st.caption("상승 후보 목록 30분 · KIS 체결 현재가 1초 · 완료봉 구조 1~5분 · 호가 재확인 15분")
+    st.caption("상승 후보 목록 5분 · KIS WebSocket 또는 REST 현재가 15초 · 완료봉 구조 1분 · 호가 재확인 15분")
 
 kis_connected = client.ready
 # KIS ticks are redrawn by each card's independent Streamlit fragment.  Do not

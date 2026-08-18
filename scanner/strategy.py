@@ -48,7 +48,7 @@ def multi_timeframe(frame: pd.DataFrame) -> dict[int, TimeframeState]:
     The newest KIS minute can still be forming, so callers should pass a frame
     without that observation when creating a tradable signal.
     """
-    return {minutes: classify(frame, minutes) for minutes in (1, 5, 15, 60)}
+    return {minutes: classify(frame, minutes) for minutes in (1, 5, 15, 30)}
 
 
 def confirmed_levels(frame: pd.DataFrame, entry: float) -> tuple[float | None, float | None, str, str]:

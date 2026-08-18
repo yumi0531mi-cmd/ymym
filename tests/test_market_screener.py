@@ -22,7 +22,7 @@ def test_merge_rankings_prioritizes_symbols_in_both_rankings():
     assert candidates[1].screen_score == 45
 
 
-def test_merge_rankings_reads_overseas_symbol_shape():
+def test_merge_rankings_excludes_us_directional_products():
     rankings = {
         "거래대금·거래량 순위": [{"symb": "SOXL", "ovrs_item_name": "DIREXION SEMICONDUCTOR BULL 3X", "last": "20.1"}],
         "상승률 순위": [{"symb": "SOXL", "ovrs_item_name": "DIREXION SEMICONDUCTOR BULL 3X", "rate": "4.0"}],
@@ -30,9 +30,13 @@ def test_merge_rankings_reads_overseas_symbol_shape():
 
     candidates = merge_rankings(Market.US, rankings)
 
-    assert len(candidates) == 1
-    assert candidates[0].symbol == "SOXL"
-    assert candidates[0].screen_score == 100
+    assert candidates == []
+
+
+def test_merge_rankings_keeps_plain_us_stock():
+    rankings = {"상승률 순위": [{"symb": "NVDA", "ovrs_item_name": "NVIDIA", "last": "120", "rate": "4.0"}]}
+    candidates = merge_rankings(Market.US, rankings)
+    assert [candidate.symbol for candidate in candidates] == ["NVDA"]
 
 
 def test_merge_rankings_excludes_kr_directional_products_but_keeps_plain_etfs():

@@ -11,11 +11,20 @@ from .models import Market
 KR_DIRECTIONAL_PRODUCT_TOKENS = (
     "레버리지", "인버스", "곱버스", "LEVERAGE", "INVERSE",
 )
+US_DIRECTIONAL_PRODUCT_TOKENS = (
+    "2X", "3X", "ULTRA", "BULL 2", "BULL 3", "BEAR 2", "BEAR 3",
+    "LEVERAGED", "LEVERAGE", "INVERSE", "SHORT DAILY", "DAILY SHORT",
+)
 
 
 def is_kr_directional_product(name: str) -> bool:
     normalized = str(name or "").upper().replace(" ", "")
     return any(token.replace(" ", "") in normalized for token in KR_DIRECTIONAL_PRODUCT_TOKENS)
+
+
+def is_us_directional_product(name: str) -> bool:
+    normalized = str(name or "").upper().replace(" ", "")
+    return any(token.replace(" ", "") in normalized for token in US_DIRECTIONAL_PRODUCT_TOKENS)
 
 
 @dataclass
@@ -68,6 +77,8 @@ def _candidate_from_row(row: dict[str, Any], market: Market, source: str) -> Mar
         return None
     name = _first_text(row, ("hts_kor_isnm", "hts_kor_isnm", "ovrs_item_name", "name", "ename", "item_name")) or symbol
     if market == Market.KR and is_kr_directional_product(name):
+        return None
+    if market == Market.US and is_us_directional_product(name):
         return None
     return MarketCandidate(
         symbol=symbol.upper(),
