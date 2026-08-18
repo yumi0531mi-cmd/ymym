@@ -4,7 +4,7 @@ from datetime import datetime
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pandas as pd
 import pytest
@@ -13,6 +13,7 @@ from streamlit.testing.v1 import AppTest
 
 from scanner.kis_client import KISClient, KISError
 from scanner.models import ForecastPoint, Market, Quote, Regime, Signal, TradePlan
+from scanner.realtime import RealtimeTick
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
@@ -113,6 +114,30 @@ def test_default_market_uses_active_us_session_after_korean_close():
 
     with patch("app.market_session", return_value="KR_REGULAR"):
         assert default_market_label() == "국내"
+
+
+def test_live_validation_records_only_actionable_buy_signal():
+    from app import record_and_score_live_validation
+
+    store = SimpleNamespace(score_ready=Mock(return_value=0), save_once=Mock(return_value=(Path("case.json"), True)))
+    tick = RealtimeTick("005930", Market.KR, 70000, 1.2, datetime(2026, 8, 17, 10, 0))
+    hub = SimpleNamespace(tick=Mock(return_value=tick))
+    wait_plan = _plan()
+    wait_plan.signal = Signal.WAIT
+
+    with patch("app.current_realtime_hub", return_value=hub):
+        scored, recorded = record_and_score_live_validation(store, wait_plan, _quote(), _bars(), True, 0.05)
+
+    assert scored == 0
+    assert recorded is False
+    store.save_once.assert_not_called()
+
+    buy_plan = _plan()
+    with patch("app.current_realtime_hub", return_value=hub):
+        _, recorded = record_and_score_live_validation(store, buy_plan, _quote(), _bars(), True, 0.05)
+
+    assert recorded is True
+    store.save_once.assert_called_once()
 
 
 def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():

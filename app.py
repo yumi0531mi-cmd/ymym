@@ -627,7 +627,14 @@ def record_and_score_live_validation(
     """Persist only real KIS-trade-backed plans and score mature cases from completed bars."""
     scored_cases = store.score_ready(quote.symbol, quote.market.value, bars, float(cost_pct))
     live_tick = current_realtime_hub().tick(quote.market, quote.symbol)
-    if not (live_tick and chart_aligned and plan.entry and plan.target and plan.hard_stop):
+    if not (
+        plan.signal == Signal.BUY
+        and live_tick
+        and chart_aligned
+        and plan.entry
+        and plan.target
+        and plan.hard_stop
+    ):
         return scored_cases, False
     case = ValidationCase.from_plan(
         plan,
