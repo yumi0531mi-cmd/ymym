@@ -75,6 +75,7 @@ def _plan(*_args, **_kwargs) -> TradePlan:
         stop_basis="1분봉 구조 무효화", entry_basis="완료봉 EMA9 지지", score=87, reasons=["완료봉 확인"], risk_state="NORMAL",
         forecasts=[
             ForecastPoint(5, 70000, 71000, 71500, Regime.UP, "EMA9·VWAP 위 · 거래량 강화"),
+            ForecastPoint(10, 70200, 71500, 72200, Regime.UP, "EMA9·VWAP 위 · 거래량 강화"),
             ForecastPoint(15, 70500, 72000, 73000, Regime.UP, "EMA9·VWAP 위 · 거래량 강화"),
             ForecastPoint(30, 71000, 73500, 75000, Regime.UP, "EMA9·VWAP 위 · 거래량 강화"),
         ],
@@ -138,6 +139,26 @@ def test_live_validation_records_only_actionable_buy_signal():
 
     assert recorded is True
     store.save_once.assert_called_once()
+
+
+def test_forecast_audit_records_complete_watch_path_separately():
+    from app import record_forecast_accuracy_audit
+
+    store = SimpleNamespace(score_ready=Mock(return_value=0), save_once=Mock(return_value=(Path("case.json"), True)))
+    tick = RealtimeTick("005930", Market.KR, 70000, 1.2, datetime(2026, 8, 17, 10, 0))
+    hub = SimpleNamespace(tick=Mock(return_value=tick))
+    watch_plan = _plan()
+    watch_plan.signal = Signal.WAIT
+
+    with patch("app.current_realtime_hub", return_value=hub):
+        scored, recorded = record_forecast_accuracy_audit(store, watch_plan, _quote(), _bars(), True, 0.05)
+
+    assert scored == 0
+    assert recorded is True
+    saved_case = store.save_once.call_args.args[0]
+    assert saved_case.signal == Signal.WAIT.value
+    assert saved_case.validation_kind == "FORECAST_AUDIT"
+    assert saved_case.forecast_path_direction == Regime.UP.value
 
 
 def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():

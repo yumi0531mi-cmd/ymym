@@ -647,6 +647,37 @@ def record_and_score_live_validation(
     return scored_cases, recorded_case
 
 
+def record_forecast_accuracy_audit(
+    store: ValidationStore,
+    plan: Any,
+    quote: Quote,
+    bars: pd.DataFrame,
+    chart_aligned: bool,
+    cost_pct: float,
+) -> tuple[int, bool]:
+    """Record every complete forecast path, including down and watch cards, for prediction auditing."""
+    scored_cases = store.score_ready(quote.symbol, quote.market.value, bars, float(cost_pct))
+    live_tick = current_realtime_hub().tick(quote.market, quote.symbol)
+    forecast_minutes = {point.minutes for point in getattr(plan, "forecasts", [])}
+    if not (
+        live_tick
+        and chart_aligned
+        and bool(plan.diagnostics.get("forecast_path_ready"))
+        and forecast_minutes == {5, 10, 15, 30}
+    ):
+        return scored_cases, False
+    case = ValidationCase.from_plan(
+        plan,
+        live_tick.price,
+        quote.session,
+        version=APP_VERSION,
+        latest_trade_time=live_tick.timestamp,
+        validation_kind="FORECAST_AUDIT",
+    )
+    _, recorded_case = store.save_once(case, cooldown_seconds=300)
+    return scored_cases, recorded_case
+
+
 def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
     """Fetch and analyze one automatic dashboard card from REST history plus live completed bars."""
     rest_quote = load_rest_dashboard_quote(symbol, market.value, exchange)
@@ -673,7 +704,10 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
     )
     # Complete earlier same-symbol signals first, then persist a real KIS-trade-backed
     # plan. The same path also runs from the one-minute card structure refresh.
-    scored_cases, recorded_case = record_and_score_live_validation(
+    actionable_scored, actionable_recorded = record_and_score_live_validation(
+        store, plan, quote, bars, chart_aligned, float(cost_pct)
+    )
+    forecast_scored, forecast_recorded = record_forecast_accuracy_audit(
         store, plan, quote, bars, chart_aligned, float(cost_pct)
     )
     if event_store.configured:
@@ -684,7 +718,9 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
         "calibration": calibration.to_dict() if hasattr(calibration, "to_dict") else {
             "samples": calibration.samples, "probability_pct": calibration.probability_pct,
         },
-        "validation_recorded": recorded_case, "validation_scored": scored_cases,
+        "validation_recorded": actionable_recorded,
+        "validation_scored": actionable_scored + forecast_scored,
+        "forecast_validation_recorded": forecast_recorded,
         "chart_aligned": chart_aligned, "chart_alignment_reason": chart_alignment_reason,
     }
 
@@ -803,12 +839,17 @@ def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, st
         calibration_samples=previous_plan.calibration_samples,
         calibration_expectancy_pct=previous_plan.diagnostics.get("calibration_expectancy_pct"),
     )
-    scored_cases, recorded_case = record_and_score_live_validation(
+    actionable_scored, actionable_recorded = record_and_score_live_validation(
+        store, plan, quote, bars, chart_aligned, float(cost_pct)
+    )
+    forecast_scored, forecast_recorded = record_forecast_accuracy_audit(
         store, plan, quote, bars, chart_aligned, float(cost_pct)
     )
     return {
         **item, "quote": quote, "bars": bars, "plan": plan,
-        "validation_scored": scored_cases, "validation_recorded": recorded_case,
+        "validation_scored": actionable_scored + forecast_scored,
+        "validation_recorded": actionable_recorded,
+        "forecast_validation_recorded": forecast_recorded,
         "chart_aligned": chart_aligned, "chart_alignment_reason": chart_alignment_reason,
     }
 
@@ -861,6 +902,13 @@ def render_plan_fields(item: dict[str, Any]) -> None:
 @st.fragment(run_every=60.0)
 def render_live_plan_fields(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore) -> None:
     render_plan_fields(live_card_snapshot(item, cost_pct, min_score, store))
+
+
+@st.fragment(run_every=60.0)
+def run_hidden_forecast_validation(items: list[dict[str, Any]], cost_pct: float, min_score: int, store: ValidationStore) -> None:
+    """Keep all five final analysis cards in the forecast audit without exposing blocked cards."""
+    for item in items:
+        live_card_snapshot(item, cost_pct, min_score, store)
 
 
 def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore, refresh_seconds: int) -> None:
@@ -1084,8 +1132,11 @@ if candidates:
 
 if cards:
     analyzed_count = len(cards)
+    analysis_cards = list(cards)
     blocked_cards = [card for card in cards if card_trade_status(card) == "하방 제외"]
     cards = visible_trade_cards(cards, candidate_card_count)
+else:
+    analysis_cards = []
 
 realtime_hub.configure(
     (
@@ -1093,8 +1144,11 @@ realtime_hub.configure(
         str(card["quote"].symbol),
         str(card.get("exchange") or ("NAS" if card["quote"].market == Market.US else "")),
     )
-    for card in cards
+    for card in analysis_cards
 )
+
+if analysis_cards:
+    run_hidden_forecast_validation(analysis_cards, float(cost_pct), int(min_score), store)
 
 if cards:
     updated_at = max(card["quote"].timestamp for card in cards)

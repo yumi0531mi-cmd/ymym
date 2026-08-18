@@ -81,6 +81,7 @@ def calibration_for(
         and row.get("entry_executable") is True
         and row.get("structural_target_confirmed") is True
         and row.get("complete_four_area_pass") is not None
+        and row.get("validation_kind", "ACTIONABLE") == "ACTIONABLE"
         and (version is None or row.get("version") == version)
     ]
     matches = sorted(matches, key=lambda row: str(row.get("signal_time", "")))

@@ -71,6 +71,8 @@ class ValidationCase:
     structural_target_confirmed: bool | None = None
     data_completeness: str = "PENDING"
     target_outcome: str | None = None
+    validation_kind: str = "ACTIONABLE"
+    forecast_path_direction: str = "MIXED"
 
     @classmethod
     def from_plan(
@@ -80,8 +82,11 @@ class ValidationCase:
         session: str,
         version: str = "1.0.0",
         latest_trade_time: datetime | None = None,
+        validation_kind: str = "ACTIONABLE",
     ):
-        case_id = f"{plan.market.value}-{plan.symbol}-{plan.created_at.strftime('%Y%m%dT%H%M%S%f')}"
+        directions = {point.direction.value for point in plan.forecasts}
+        forecast_path_direction = directions.pop() if len(directions) == 1 else "MIXED"
+        case_id = f"{plan.market.value}-{plan.symbol}-{plan.created_at.strftime('%Y%m%dT%H%M%S%f')}-{validation_kind.lower()}"
         tick_tolerance = max(plan.current_price * 0.0002, 0.01 if plan.market.value == "US" else 1)
         quote_pass = None if latest_trade_price is None else abs(plan.current_price - latest_trade_price) <= tick_tolerance
         quote_age = None if latest_trade_time is None else max(0.0, (plan.created_at - latest_trade_time).total_seconds())
@@ -125,6 +130,8 @@ class ValidationCase:
             spread_pct=float(spread_pct) if isinstance(spread_pct, (int, float)) else None,
             entry_executable=entry_executable,
             structural_target_confirmed=structural_target_confirmed,
+            validation_kind=validation_kind,
+            forecast_path_direction=forecast_path_direction,
         )
 
     def score_path(self, actual_prices: dict[int, float], actual_regime: Regime | None = None) -> None:
@@ -257,7 +264,11 @@ class ValidationStore:
                 row = json.loads(existing.read_text(encoding="utf-8"))
                 old_time = datetime.fromisoformat(row["signal_time"])
                 new_time = datetime.fromisoformat(case.signal_time)
-                same_event = row.get("version") == case.version and row.get("predicted_regime") == case.predicted_regime
+                same_event = (
+                    row.get("version") == case.version
+                    and row.get("predicted_regime") == case.predicted_regime
+                    and row.get("validation_kind", "ACTIONABLE") == case.validation_kind
+                )
                 if same_event and abs((new_time - old_time).total_seconds()) < cooldown_seconds:
                     return existing, False
             except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
@@ -325,8 +336,62 @@ class ValidationStore:
             scored += 1
         return scored
 
+    @staticmethod
+    def _forecast_audit_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        """Summarize direction and price-path accuracy without mixing it with trade outcomes."""
+        complete = [row for row in rows if row.get("data_completeness") == "COMPLETE"]
+        strict_passes = [row for row in complete if row.get("full_path_pass") is True]
+        direction_passes = []
+        by_direction: dict[str, list[dict[str, Any]]] = {}
+        horizon_stats = {
+            str(minutes): {"complete": 0, "range_pass": 0, "direction_pass": 0, "strict_pass": 0}
+            for minutes in (5, 10, 15, 30)
+        }
+        for row in complete:
+            horizons = [item for item in row.get("horizons", []) if item.get("actual") is not None]
+            if horizons and all(item.get("direction_pass") is True for item in horizons):
+                direction_passes.append(row)
+            direction = str(row.get("forecast_path_direction") or "MIXED")
+            by_direction.setdefault(direction, []).append(row)
+            for horizon in horizons:
+                minutes = str(horizon.get("minutes"))
+                if minutes not in horizon_stats:
+                    continue
+                stats = horizon_stats[minutes]
+                stats["complete"] += 1
+                stats["range_pass"] += int(horizon.get("range_pass") is True)
+                stats["direction_pass"] += int(horizon.get("direction_pass") is True)
+                stats["strict_pass"] += int(horizon.get("pass_all") is True)
+        for stats in horizon_stats.values():
+            denominator = stats["complete"]
+            stats["range_rate"] = stats["range_pass"] / denominator * 100 if denominator else None
+            stats["direction_rate"] = stats["direction_pass"] / denominator * 100 if denominator else None
+            stats["strict_rate"] = stats["strict_pass"] / denominator * 100 if denominator else None
+        by_direction_summary = {
+            direction: {
+                "complete": len(group),
+                "strict_full_path_pass": sum(row.get("full_path_pass") is True for row in group),
+                "strict_full_path_rate": (
+                    sum(row.get("full_path_pass") is True for row in group) / len(group) * 100 if group else None
+                ),
+            }
+            for direction, group in by_direction.items()
+        }
+        return {
+            "records": len(rows),
+            "complete_paths": len(complete),
+            "strict_full_path_pass": len(strict_passes),
+            "strict_full_path_rate": len(strict_passes) / len(complete) * 100 if complete else None,
+            "direction_full_path_pass": len(direction_passes),
+            "direction_full_path_rate": len(direction_passes) / len(complete) * 100 if complete else None,
+            "horizons": horizon_stats,
+            "by_prediction_direction": by_direction_summary,
+        }
+
     def summary(self) -> dict[str, Any]:
-        rows = self.load_all()
+        all_rows = self.load_all()
+        rows = [row for row in all_rows if row.get("validation_kind", "ACTIONABLE") == "ACTIONABLE"]
+        forecast_audit_rows = [row for row in all_rows if row.get("validation_kind") == "FORECAST_AUDIT"]
         complete = [row for row in rows if row.get("complete_four_area_pass") is not None]
         passed = [row for row in complete if row.get("complete_four_area_pass") is True]
         net = [float(row["net_return_pct"]) for row in complete if row.get("net_return_pct") is not None]
@@ -386,6 +451,7 @@ class ValidationStore:
             "average_net_return_pct": sum(net) / len(net) if net else None,
             "worst_net_return_pct": min(net) if net else None,
             "by_strategy_session": by_strategy_session,
+            "forecast_audit": self._forecast_audit_summary(forecast_audit_rows),
         }
 
     def export_csv(self, output: str | Path) -> Path:

@@ -105,3 +105,37 @@ def test_strategy_summary_includes_expectancy_and_profit_factor(tmp_path):
     assert report["average_win_pct"] == 0.5
     assert report["average_loss_pct"] == -0.2
     assert report["profit_factor"] == 5.0
+
+
+def test_forecast_audit_summary_separates_all_direction_paths_from_trade_metrics(tmp_path):
+    complete_down = [
+        {"minutes": minutes, "actual": 99.0, "range_pass": True, "direction_pass": True, "pass_all": True}
+        for minutes in (5, 10, 15, 30)
+    ]
+    complete_up_miss = [
+        {"minutes": minutes, "actual": 101.0, "range_pass": minutes != 30, "direction_pass": True, "pass_all": minutes != 30}
+        for minutes in (5, 10, 15, 30)
+    ]
+    rows = [
+        {
+            "validation_kind": "FORECAST_AUDIT", "data_completeness": "COMPLETE",
+            "forecast_path_direction": "DOWN", "full_path_pass": True, "horizons": complete_down,
+        },
+        {
+            "validation_kind": "FORECAST_AUDIT", "data_completeness": "COMPLETE",
+            "forecast_path_direction": "UP", "full_path_pass": False, "horizons": complete_up_miss,
+        },
+    ]
+    store = ValidationStore(tmp_path)
+    store.load_all = lambda: rows  # type: ignore[method-assign]
+
+    report = store.summary()
+    audit = report["forecast_audit"]
+
+    assert report["signals"] == 0
+    assert audit["records"] == 2
+    assert audit["complete_paths"] == 2
+    assert audit["strict_full_path_pass"] == 1
+    assert audit["direction_full_path_pass"] == 2
+    assert audit["horizons"]["30"]["strict_rate"] == 50.0
+    assert audit["by_prediction_direction"]["DOWN"]["strict_full_path_rate"] == 100.0
