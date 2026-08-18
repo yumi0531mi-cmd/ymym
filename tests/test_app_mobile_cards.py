@@ -78,5 +78,5 @@ def test_automatic_candidate_renders_mobile_trade_card_without_user_selection():
 
     assert not app.exception
     assert not app.button
-    assert any("005930" in str(item.value) for item in app.subheader)
+    assert any("005930" in str(item.value) for item in app.markdown)
     assert {metric.label for metric in app.metric} >= {"현재가", "추천 매수가", "추천 매도가 1차", "추천 매도가 2차", "손절가"}

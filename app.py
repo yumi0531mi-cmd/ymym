@@ -738,7 +738,10 @@ def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int, stor
     quote: Quote = item["quote"]
     title = f"{quote.symbol} · {item.get('name') or quote.market.value}"
     with st.container(border=True, key=f"card_{quote.market.value}_{quote.symbol}"):
-        st.subheader(title)
+        # Streamlit heading anchors may be recycled when switching markets,
+        # producing links to a previous card. A keyed plain title has no anchor
+        # state and remains bound to the correct symbol.
+        st.markdown(f"<div class='ticker'>{html.escape(title)}</div>", unsafe_allow_html=True)
         render_realtime_price(
             quote.symbol,
             quote.market.value,
