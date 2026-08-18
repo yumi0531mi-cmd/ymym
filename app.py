@@ -197,7 +197,7 @@ def load_rest_dashboard_quote(symbol: str, market_value: str, exchange: str) -> 
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def load_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
+def load_bars(symbol: str, market_value: str, exchange: str, cache_version: str) -> pd.DataFrame:
     # Historical completed bars seed the analysis. Live KIS trades are merged below
     # so the trailing structure does not wait for another REST refresh.
     return get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).intraday(
@@ -273,7 +273,7 @@ def sort_rising_candidates(candidates: list[dict[str, Any]], market: Market) -> 
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_dashboard_candidates(market_value: str) -> list[dict[str, Any]]:
+def load_dashboard_candidates(market_value: str, cache_version: str) -> list[dict[str, Any]]:
     """Return up to 20 rising price-eligible candidates without detailed analysis yet."""
     market = Market(market_value)
     client = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint())
@@ -585,7 +585,9 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
     """Fetch and analyze one automatic dashboard card from REST history plus live completed bars."""
     rest_quote = load_rest_dashboard_quote(symbol, market.value, exchange)
     quote = quote_with_live_tick(rest_quote)
-    bars = merge_live_completed_bars(load_bars(symbol, market.value, exchange), symbol, market)
+    bars = merge_live_completed_bars(
+        load_bars(symbol, market.value, exchange, CLIENT_CACHE_VERSION), symbol, market
+    )
     chart_aligned, chart_alignment_reason = completed_bar_alignment(quote, bars)
     cycle = cycle_store.get(symbol, market, quote.timestamp)
     preliminary = analyze(
@@ -770,7 +772,7 @@ def render_new_candidate_watchlist(market_value: str, fixed_symbols: tuple[str, 
     """Refresh only replacement candidates; open cards and direct searches remain fixed."""
     market = Market(market_value)
     try:
-        fresh_candidates = load_dashboard_candidates(market.value)
+        fresh_candidates = load_dashboard_candidates(market.value, APP_VERSION)
     except KISError:
         st.caption("새 후보 감시 목록은 다음 갱신 때 다시 확인합니다.")
         return
@@ -880,7 +882,7 @@ if not kis_connected:
 else:
     try:
         with st.spinner("시장 전체에서 가격 조건을 통과한 상승 후보를 자동으로 찾는 중…"):
-            candidates = load_dashboard_candidates(market.value)
+            candidates = load_dashboard_candidates(market.value, APP_VERSION)
             requests: list[dict[str, Any]] = []
             if direct_request is not None:
                 requests.append({**direct_request, "candidate_source": "관심 종목 직접 검색"})
