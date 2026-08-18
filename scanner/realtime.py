@@ -98,6 +98,10 @@ class KISRealtimeHub:
         message = str(error).upper()
         if "ALREADY IN USE" in message or "APPKEY" in message and "USE" in message:
             return max(current_delay, 30.0)
+        # An approval-key 403 cannot be cured by retrying every second.  Leave the
+        # REST card path enough shared request budget and retry only periodically.
+        if "HTTP 403" in message or "APPROVAL" in message and "403" in message:
+            return max(current_delay, 120.0)
         return current_delay
 
     def configure(self, symbols: Iterable[tuple[Market, str, str]]) -> None:
