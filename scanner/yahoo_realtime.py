@@ -33,6 +33,45 @@ def choose_display_tick(kis_tick: RealtimeTick | None, yahoo_tick: RealtimeTick 
     return kis_tick or yahoo_tick
 
 
+def normalize_yahoo_bars(raw, market: Market):
+    """Normalize Yahoo one-minute history into the scanner's OHLCV contract."""
+    import pandas as pd
+
+    if raw is None or getattr(raw, "empty", True):
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    frame = raw.copy()
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = frame.columns.get_level_values(0)
+    names = {str(column).lower(): column for column in frame.columns}
+    required = {"open", "high", "low", "close", "volume"}
+    if not required.issubset(names):
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    frame = frame.rename(columns={names[name]: name for name in required})
+    frame = frame[["open", "high", "low", "close", "volume"]].apply(pd.to_numeric, errors="coerce").dropna()
+    index = pd.to_datetime(frame.index, errors="coerce")
+    if getattr(index, "tz", None) is None:
+        index = index.tz_localize(KST if market == Market.KR else ET, ambiguous="NaT", nonexistent="shift_forward")
+    frame.index = index
+    return frame.loc[frame.index.notna()].sort_index()[~frame.index.duplicated(keep="last")]
+
+
+def yahoo_intraday_bars(market: Market, symbol: str, exchange: str = ""):
+    """Fetch a bounded 1-minute display/analysis fallback only when KIS bars are absent."""
+    import pandas as pd
+
+    if yf is None:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    for yahoo_symbol in YahooRealtimeHub.yahoo_symbols(market, symbol, exchange):
+        try:
+            raw = yf.Ticker(yahoo_symbol).history(period="1d", interval="1m", prepost=market == Market.US, auto_adjust=False)
+            bars = normalize_yahoo_bars(raw, market)
+            if len(bars) >= 31:
+                return bars.tail(360)
+        except Exception as exc:  # pragma: no cover - live provider route
+            LOGGER.warning("Yahoo 1-minute history failed for %s: %s", yahoo_symbol, type(exc).__name__)
+    return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+
 class YahooRealtimeHub:
     """Free Yahoo Finance streaming quote backup for the visible card prices.
 

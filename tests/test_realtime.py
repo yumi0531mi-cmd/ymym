@@ -1,6 +1,7 @@
 from scanner.models import Market
 from scanner.realtime import KISRealtimeHub, KR_TRADE_TR_ID, US_TRADE_TR_ID, RealtimeTick
 from scanner.yahoo_realtime import YahooRealtimeHub, choose_display_tick
+from scanner.yahoo_realtime import normalize_yahoo_bars
 
 
 class ApprovalOnlyClient:
@@ -144,3 +145,16 @@ def test_card_display_prefers_kis_tick_and_uses_yahoo_only_when_kis_is_missing()
 
     assert choose_display_tick(kis_tick, yahoo_tick) is kis_tick
     assert choose_display_tick(None, yahoo_tick) is yahoo_tick
+
+
+def test_yahoo_one_minute_bars_normalize_to_scanner_ohlcv_contract():
+    import pandas as pd
+
+    raw = pd.DataFrame(
+        {"Open": [100, 101], "High": [101, 102], "Low": [99, 100], "Close": [100.5, 101.5], "Volume": [1000, 1200]},
+        index=pd.date_range("2026-08-18 09:00", periods=2, freq="min", tz="Asia/Seoul"),
+    )
+    bars = normalize_yahoo_bars(raw, Market.KR)
+    assert list(bars.columns) == ["open", "high", "low", "close", "volume"]
+    assert len(bars) == 2
+    assert float(bars.close.iloc[-1]) == 101.5

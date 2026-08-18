@@ -22,7 +22,7 @@ from scanner.realtime import KISRealtimeHub
 from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
-from scanner.yahoo_realtime import YahooRealtimeHub, choose_display_tick
+from scanner.yahoo_realtime import YahooRealtimeHub, choose_display_tick, yahoo_intraday_bars
 
 APP_VERSION = "5.6-kis-realtime"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
@@ -217,6 +217,12 @@ def load_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def load_yahoo_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
+    """Fetch bounded Yahoo 1-minute bars only when KIS history cannot build a card."""
+    return yahoo_intraday_bars(Market(market_value), symbol, exchange)
+
+
 def merge_live_completed_bars(base: pd.DataFrame, symbol: str, market: Market) -> pd.DataFrame:
     """Overlay locally completed one-minute KIS trade bars onto cached REST history."""
     rows = current_realtime_hub().completed_bar_rows(market, symbol)
@@ -244,6 +250,19 @@ def quote_with_live_tick(base: Quote) -> Quote:
         bid=tick.bid if tick.bid is not None else base.bid,
         ask=tick.ask if tick.ask is not None else base.ask,
         volume=tick.volume if tick.volume is not None else base.volume,
+        turnover=base.turnover, session=base.session, source=tick.source,
+    )
+
+
+def quote_with_yahoo_tick(base: Quote) -> Quote:
+    """Use a Yahoo tick only with Yahoo bars; never merge it into KIS analysis."""
+    tick = current_yahoo_realtime_hub().tick(base.market, base.symbol)
+    if tick is None:
+        return base
+    return Quote(
+        symbol=base.symbol, market=base.market, price=tick.price,
+        previous_close=base.previous_close, timestamp=tick.timestamp,
+        bid=tick.bid, ask=tick.ask, volume=tick.volume,
         turnover=base.turnover, session=base.session, source=tick.source,
     )
 
@@ -600,9 +619,15 @@ def record_and_score_live_validation(
 def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
     """Fetch and analyze one automatic dashboard card from REST history plus live completed bars."""
     rest_quote = load_rest_dashboard_quote(symbol, market.value, exchange)
-    live_tick = current_realtime_hub().tick(market, symbol)
     quote = quote_with_live_tick(rest_quote)
     bars = merge_live_completed_bars(load_bars(symbol, market.value, exchange), symbol, market)
+    bar_source = "KIS_1M"
+    if len(bars) < 31:
+        yahoo_bars = load_yahoo_bars(symbol, market.value, exchange)
+        if len(yahoo_bars) >= 31:
+            bars = yahoo_bars
+            quote = quote_with_yahoo_tick(rest_quote)
+            bar_source = "YAHOO_1M"
     chart_aligned, chart_alignment_reason = completed_bar_alignment(quote, bars)
     cycle = cycle_store.get(symbol, market, quote.timestamp)
     preliminary = analyze(
@@ -634,7 +659,7 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
             "samples": calibration.samples, "probability_pct": calibration.probability_pct,
         },
         "validation_recorded": recorded_case, "validation_scored": scored_cases,
-        "chart_aligned": chart_aligned, "chart_alignment_reason": chart_alignment_reason,
+        "chart_aligned": chart_aligned, "chart_alignment_reason": chart_alignment_reason, "bar_source": bar_source,
     }
 
 
@@ -670,10 +695,15 @@ def mixed_card_priority(item: dict[str, Any]) -> tuple[int, int, int]:
 
 
 def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
-    """Recalculate only from cached bars and KIS live trades; no REST request occurs here."""
+    """Recalculate from the selected bounded 1-minute source without KIS polling."""
     base_quote: Quote = item["quote"]
-    quote = quote_with_live_tick(base_quote)
-    bars = merge_live_completed_bars(item["bars"], quote.symbol, quote.market)
+    bar_source = str(item.get("bar_source") or "KIS_1M")
+    if bar_source == "YAHOO_1M":
+        quote = quote_with_yahoo_tick(base_quote)
+        bars = load_yahoo_bars(quote.symbol, quote.market.value, str(item.get("exchange") or ""))
+    else:
+        quote = quote_with_live_tick(base_quote)
+        bars = merge_live_completed_bars(item["bars"], quote.symbol, quote.market)
     chart_aligned, chart_alignment_reason = completed_bar_alignment(quote, bars)
     cycle = cycle_store.get(quote.symbol, quote.market, quote.timestamp)
     previous_plan = item["plan"]
@@ -688,7 +718,7 @@ def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, st
         store, plan, quote, bars, chart_aligned, float(cost_pct)
     )
     return {
-        **item, "quote": quote, "bars": bars, "plan": plan,
+        **item, "quote": quote, "bars": bars, "plan": plan, "bar_source": bar_source,
         "validation_scored": scored_cases, "validation_recorded": recorded_case,
         "chart_aligned": chart_aligned, "chart_alignment_reason": chart_alignment_reason,
     }
