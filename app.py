@@ -714,7 +714,7 @@ def render_realtime_price(refresh_seconds: int, *args) -> None:
 
 def mixed_card_priority(item: dict[str, Any]) -> tuple[int, int, int]:
     plan = item["plan"]
-    decision_rank = {"매수 조건 충족": 3, "눌림목 대기": 2, "관찰": 1, "진입 금지": 0}[card_trade_status(item)]
+    decision_rank = {"매수 조건 충족": 3, "눌림목 대기": 2, "관찰": 1, "하방 제외": 0}[card_trade_status(item)]
     trend_rank = 2 if plan.regime == Regime.UP else (1 if plan.regime == Regime.RANGE else 0)
     repeat_rank = 1 if repeat_band_pct(plan) is not None else 0
     return (decision_rank, trend_rank + repeat_rank, plan.score)
@@ -724,13 +724,8 @@ def card_trade_status(item: dict[str, Any]) -> str:
     """Map analysis output to one unambiguous live-trading state."""
     plan = item["plan"]
     diagnostics = plan.diagnostics
-    if (
-        not bool(item.get("chart_aligned", True))
-        or bool(diagnostics.get("has_downward_forecast"))
-        or not bool(diagnostics.get("forecast_path_ready"))
-        or plan.signal in {Signal.BLOCK, Signal.SELL, Signal.UNVERIFIED}
-    ):
-        return "진입 금지"
+    if bool(diagnostics.get("has_downward_forecast")) or plan.regime == Regime.DOWN:
+        return "하방 제외"
     if plan.signal == Signal.BUY and bool(diagnostics.get("long_price_path_confirmed")):
         return "매수 조건 충족"
     if bool(diagnostics.get("long_price_path_confirmed")):
@@ -740,7 +735,7 @@ def card_trade_status(item: dict[str, Any]) -> str:
 
 def visible_trade_cards(items: list[dict[str, Any]], display_limit: int = MAX_LIVE_CARDS) -> list[dict[str, Any]]:
     """Hide automatic blocked/downward cards while preserving direct searches."""
-    visible = [item for item in items if card_trade_status(item) != "진입 금지"]
+    visible = [item for item in items if card_trade_status(item) != "하방 제외"]
     for item in items:
         if item.get("candidate_source") == "관심 종목 직접 검색" and item not in visible:
             visible.append(item)
@@ -844,7 +839,7 @@ def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int, stor
             st.success("매수 조건 충족 · 표시 진입가와 손절가 확인 후 분할 진입")
         elif status == "눌림목 대기":
             st.warning("눌림목 대기 · 현재가 추격 금지")
-        elif status == "진입 금지":
+        elif status == "하방 제외":
             st.error("진입 금지 · 하방/데이터/위험 조건 확인")
         else:
             st.info("관찰 · 상방 조건이 모두 맞을 때까지 진입 금지")
@@ -1039,7 +1034,7 @@ if candidates:
 
 if cards:
     analyzed_count = len(cards)
-    blocked_cards = [card for card in cards if card_trade_status(card) == "진입 금지"]
+    blocked_cards = [card for card in cards if card_trade_status(card) == "하방 제외"]
     cards = visible_trade_cards(cards, candidate_card_count)
 
 if cards:

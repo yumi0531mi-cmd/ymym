@@ -125,7 +125,7 @@ def test_card_trade_status_separates_buy_wait_and_downward_candidates():
     assert card_trade_status(item) == "눌림목 대기"
 
     plan.diagnostics["has_downward_forecast"] = True
-    assert card_trade_status(item) == "진입 금지"
+    assert card_trade_status(item) == "하방 제외"
     assert visible_trade_cards([item], 10) == []
 
     item["candidate_source"] = "관심 종목 직접 검색"
