@@ -9,6 +9,7 @@ class ApprovalOnlyClient:
 
 def test_kis_realtime_parses_domestic_trade_tick():
     hub = KISRealtimeHub(ApprovalOnlyClient())
+    assert hub.connected is False
     values = ["005930", "101500", "70100", "2", "100", "1.43", "0", "0", "0", "0", "70200", "70000", "10", "12345"]
 
     hub._consume(f"0|{KR_TRADE_TR_ID}|1|{'^'.join(values)}")
@@ -20,6 +21,8 @@ def test_kis_realtime_parses_domestic_trade_tick():
     assert tick.bid == 70000
     assert tick.ask == 70200
     assert tick.volume == 12345
+    assert hub.connected is True
+    assert hub.status_label() == "KIS 실시간 체결 연결됨 · 1초 화면 갱신"
 
 
 def test_kis_realtime_parses_us_trade_tick_and_normalizes_symbol():
@@ -121,3 +124,9 @@ def test_kis_realtime_resets_approval_on_subscription_auth_error():
 
     assert hub._approval_key == ""
     assert hub._approval_expires_monotonic == 0.0
+
+
+def test_kis_realtime_waits_longer_when_same_appkey_is_already_in_use():
+    error = Exception("KIS 실시간 구독 실패: ALREADY IN USE appkey")
+    assert KISRealtimeHub.reconnect_delay_after_error(1.0, error) == 30.0
+    assert KISRealtimeHub.reconnect_delay_after_error(2.0, Exception("network timeout")) == 2.0

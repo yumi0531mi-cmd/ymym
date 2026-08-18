@@ -62,6 +62,7 @@ class KISRealtimeHub:
         self._forming_bars: dict[tuple[Market, str], dict[str, object]] = {}
         self._completed_bars: dict[tuple[Market, str], deque[dict[str, object]]] = defaultdict(lambda: deque(maxlen=360))
         self._connected = False
+        self._socket_open = False
         self._last_error = ""
         self._last_message_at: datetime | None = None
         self._approval_key = ""
@@ -85,9 +86,19 @@ class KISRealtimeHub:
     def status_label(self) -> str:
         if self.connected:
             return "KIS 실시간 체결 연결됨 · 1초 화면 갱신"
+        if self._socket_open:
+            return "KIS 실시간 체결 수신 대기 중"
         if self.last_error:
-            return "KIS WebSocket 미연결 · REST 현재가 12초 안전 대체"
+            return "KIS 실시간 연결 재시도 중 · REST 현재가 임시 사용"
         return "KIS 실시간 체결 연결 준비 중 · REST 현재가 임시 사용"
+
+    @staticmethod
+    def reconnect_delay_after_error(current_delay: float, error: Exception) -> float:
+        """Avoid hammering KIS while the same APPKEY is already used elsewhere."""
+        message = str(error).upper()
+        if "ALREADY IN USE" in message or "APPKEY" in message and "USE" in message:
+            return max(current_delay, 30.0)
+        return current_delay
 
     def configure(self, symbols: Iterable[tuple[Market, str, str]]) -> None:
         """Set the visible symbols and launch the worker without blocking a UI run.
@@ -236,9 +247,11 @@ class KISRealtimeHub:
                             if tr_key:
                                 await ws.send(self._request(approval, US_TRADE_TR_ID, tr_key))
                     with self._lock:
-                        self._connected = True
+                        # A TCP/WebSocket open is not a live market-data connection.
+                        # Confirm the status only after the first official trade tick.
+                        self._connected = False
+                        self._socket_open = True
                         self._last_error = ""
-                    reconnect_delay = 1.0
                     while not self._stop.is_set():
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
@@ -253,15 +266,18 @@ class KISRealtimeHub:
                         self._consume(raw_text)
             except Exception as exc:
                 detail = str(exc).replace("\n", " ")
+                wait_delay = self.reconnect_delay_after_error(reconnect_delay, exc)
                 with self._lock:
                     self._connected = False
+                    self._socket_open = False
                     self._last_error = f"{type(exc).__name__}: {detail[:120]}" if detail else type(exc).__name__
-                LOGGER.warning("KIS WebSocket reconnect in %.0fs: %s", reconnect_delay, self._last_error)
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, 20.0)
+                LOGGER.warning("KIS WebSocket reconnect in %.0fs: %s", wait_delay, self._last_error)
+                await asyncio.sleep(wait_delay)
+                reconnect_delay = min(wait_delay * 2, 60.0)
             finally:
                 with self._lock:
                     self._connected = False
+                    self._socket_open = False
 
     async def _handle_control_message(self, ws, raw: str) -> bool:
         """Handle KIS subscription replies and its application-level PINGPONG heartbeat."""
@@ -357,3 +373,5 @@ class KISRealtimeHub:
             self._ticks[(market, symbol)] = tick
             self._accumulate_bar(tick)
             self._last_message_at = tick.timestamp
+            self._connected = True
+            self._last_error = ""
