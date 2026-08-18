@@ -972,6 +972,40 @@ def capture_pending_forecast_paths(store: ValidationStore, market_value: str) ->
         )
 
 
+def latest_completed_forecast_case(store: ValidationStore, version: str) -> Any | None:
+    """Return the newest fully scored forecast audit for the active rule version only."""
+    completed = [
+        case for case in store.cases()
+        if case.validation_kind == "FORECAST_AUDIT"
+        and case.version == version
+        and case.data_completeness == "COMPLETE"
+        and case.full_path_pass is not None
+    ]
+    return max(completed, key=lambda case: case.signal_time) if completed else None
+
+
+@st.fragment(run_every=60.0)
+def render_latest_forecast_result(store: ValidationStore) -> None:
+    """Keep the latest completed 30-minute path visible without a full dashboard rerun."""
+    case = latest_completed_forecast_case(store, APP_VERSION)
+    if case is None:
+        return
+    outcome = "통과" if case.full_path_pass else "실패"
+    st.subheader(f"최근 30분 실측 결과 · {case.symbol} · {outcome}")
+    st.caption(f"신호 시각 {case.signal_time[11:19]} · 가격 원천 {case.price_source} · {case.forecast_path_direction} 예측")
+    rows = [
+        {
+            "구간": f"{horizon.minutes}분",
+            "예측가": price_text(horizon.predicted_base),
+            "실제가": price_text(horizon.actual),
+            "방향": "맞음" if horizon.direction_pass else "틀림",
+            "예측 범위": "통과" if horizon.range_pass else "범위 이탈",
+        }
+        for horizon in case.horizons
+    ]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+
 def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore, refresh_seconds: int) -> None:
     """Render a price-first card with 1-second tick and 1-minute structure refreshes."""
     quote: Quote = item["quote"]
@@ -1214,6 +1248,7 @@ if analysis_cards:
     run_hidden_forecast_validation(analysis_cards, float(cost_pct), int(min_score), store)
 
 capture_pending_forecast_paths(store, market.value)
+render_latest_forecast_result(store)
 
 if cards:
     updated_at = max(card["quote"].timestamp for card in cards)

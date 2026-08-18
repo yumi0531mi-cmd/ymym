@@ -274,6 +274,21 @@ def test_daily_overheat_guard_uses_refreshed_current_price_against_previous_clos
     assert is_daily_overheated(0.0, 100.0) is False
 
 
+def test_latest_completed_forecast_case_uses_only_active_rule_version_and_complete_paths():
+    from app import latest_completed_forecast_case
+
+    store = SimpleNamespace(cases=lambda: [
+        SimpleNamespace(validation_kind="FORECAST_AUDIT", version="6.2-old", data_completeness="COMPLETE", full_path_pass=True, signal_time="2026-08-18T10:30:00"),
+        SimpleNamespace(validation_kind="FORECAST_AUDIT", version="6.3-structural-cap", data_completeness="PENDING", full_path_pass=None, signal_time="2026-08-18T10:31:00"),
+        SimpleNamespace(validation_kind="FORECAST_AUDIT", version="6.3-structural-cap", data_completeness="COMPLETE", full_path_pass=False, signal_time="2026-08-18T10:32:00"),
+    ])
+
+    latest = latest_completed_forecast_case(store, "6.3-structural-cap")
+
+    assert latest is not None
+    assert latest.signal_time == "2026-08-18T10:32:00"
+
+
 def test_card_trade_status_separates_buy_wait_and_downward_candidates():
     from app import card_ready_for_display, card_trade_status, visible_trade_cards
 
