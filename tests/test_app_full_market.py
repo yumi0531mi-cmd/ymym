@@ -121,7 +121,7 @@ def test_connected_app_automatically_renders_live_candidate_card_without_user_se
     assert not app.exception
     assert not app.button
     assert any("실시간 상승·반복단타 혼합 스캐너" in str(item.value) for item in app.markdown)
-    assert any("005930" in str(item.value) for item in app.subheader)
+    assert any("005930" in str(item.value) for item in app.markdown)
     assert {metric.label for metric in app.metric} >= {"현재가", "추천 매수가", "추천 매도가 1차", "추천 매도가 2차", "손절가"}
     assert {metric.label for metric in app.metric} >= {"5분 예상", "10분 예상", "15분 예상", "30분 예상", "현재 차트 지지"}
     assert any("상세 카드 1개" in str(item.value) for item in app.caption)
@@ -152,7 +152,7 @@ def test_ranking_error_falls_back_to_liquid_candidates_and_still_renders_cards()
         app.run(timeout=30)
 
     assert not app.exception
-    assert any("005930" in str(item.value) for item in app.subheader)
+    assert any("005930" in str(item.value) for item in app.markdown)
     assert {metric.label for metric in app.metric} >= {"현재가", "추천 매수가", "추천 매도가 1차", "추천 매도가 2차", "손절가"}
 
 
@@ -183,5 +183,5 @@ def test_korean_name_direct_search_adds_requested_stock_card():
         app.run(timeout=30)
 
     assert not app.exception
-    assert any("005380" in str(item.value) and "현대차" in str(item.value) for item in app.subheader)
+    assert any("005380" in str(item.value) and "현대차" in str(item.value) for item in app.markdown)
     assert {metric.label for metric in app.metric} >= {"현재가", "추천 매수가", "추천 매도가 1차", "추천 매도가 2차", "손절가"}
