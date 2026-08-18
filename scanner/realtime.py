@@ -217,15 +217,14 @@ class KISRealtimeHub:
                 continue
             try:
                 approval = self._approval()
-                # KIS uses its official raw WebSocket endpoint on port 21000.  Do not
-                # route this market-data stream through an automatically discovered
-                # HTTP proxy, which can time out before the KIS handshake completes.
+                # In Streamlit Cloud, websocket-client's default network route is
+                # required for KIS's raw production endpoint.  Forcing a direct
+                # connection produces an invalid HTTP handshake in that environment.
                 async with websockets.connect(
                     self.websocket_url,
                     ping_interval=20,
                     ping_timeout=20,
                     open_timeout=8,
-                    proxy=None,
                 ) as ws:
                     for (market, symbol), exchange in desired.items():
                         if market == Market.KR:
