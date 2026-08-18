@@ -466,8 +466,10 @@ def dashboard_structure(item: dict[str, Any]) -> dict[str, str]:
     }.get(plan.risk_state, "구조 확인 중")
     if not item.get("chart_aligned", True):
         current_state = str(item.get("chart_alignment_reason") or "완료 분봉 확인 중")
-    elif not bool(plan.diagnostics.get("long_price_path_confirmed")):
+    elif bool(plan.diagnostics.get("has_downward_forecast")):
         current_state = "하방 경로 관찰"
+    elif not bool(plan.diagnostics.get("forecast_path_ready")):
+        current_state = "방향 재계산 중"
     return {
         "유형": kind,
         "큰 추세": trend_label,
@@ -668,7 +670,14 @@ def render_plan_fields(item: dict[str, Any]) -> None:
     target_2 = plan.target2 if show_price_structure else None
     support = plan.soft_stop if show_price_structure else None
     stop = (plan.hard_stop or plan.invalidation or plan.stop) if show_price_structure else None
-    observation_text = "하방 예상 · 상방 가격 추천 없음" if chart_aligned and not long_price_path_confirmed else "현재가 위 목표 구조 재확인 중"
+    has_downward_forecast = bool(plan.diagnostics.get("has_downward_forecast"))
+    forecast_path_ready = bool(plan.diagnostics.get("forecast_path_ready"))
+    if chart_aligned and has_downward_forecast:
+        observation_text = "하방 예상 · 상방 가격 추천 없음"
+    elif chart_aligned and not forecast_path_ready:
+        observation_text = "방향 재계산 중"
+    else:
+        observation_text = "현재가 위 목표 구조 재확인 중"
     st.markdown(structure_strip_html(structure), unsafe_allow_html=True)
     forecast_columns = st.columns(4)
     for column, minutes in zip(forecast_columns, (5, 10, 15, 30)):

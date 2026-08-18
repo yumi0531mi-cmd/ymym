@@ -175,7 +175,9 @@ def analyze(
     # 5/10/15/30-minute forecast is upward and its base estimate is above live price.
     # A single downward horizon turns the card into observation-only rather than
     # mixing a bearish forecast with an upward price recommendation.
-    long_price_path_confirmed = bool(forecast_points) and all(
+    has_downward_forecast = any(point.direction == Regime.DOWN for point in forecast_points)
+    forecast_path_ready = {point.minutes for point in forecast_points} == {5, 10, 15, 30}
+    long_price_path_confirmed = forecast_path_ready and all(
         point.direction == Regime.UP and float(point.base) > quote.price
         for point in forecast_points
     )
@@ -199,8 +201,10 @@ def analyze(
     )
     if not targets_ahead_of_quote:
         target1, target2 = None, None
-        if not long_price_path_confirmed:
+        if has_downward_forecast:
             target1_basis, target2_basis = "하방 경로 관찰 중", "하방 경로 관찰 중"
+        elif not forecast_path_ready:
+            target1_basis, target2_basis = "방향 재계산 중", "방향 재계산 중"
         else:
             target1_basis, target2_basis = "현재가 위 1차 목표 재확인 중", "현재가 위 2차 목표 재확인 중"
     entry_resistance_1m, _, _, _ = confirmed_levels(df, entry)
@@ -317,8 +321,12 @@ def analyze(
         reasons.append("호가 스프레드가 확인되지 않았거나 세션 허용 한도를 넘었습니다.")
     if not rr_ok:
         reasons.append("1차 목표 기준 비용 반영 순손익비가 1.10 미만입니다.")
-    if not long_price_path_confirmed:
-        reasons.append("5·10·15·30분 예상에 하방 또는 박스 경로가 있어 상승 가격 추천을 표시하지 않습니다.")
+    if has_downward_forecast:
+        reasons.append("5·10·15·30분 예상에 하방 경로가 있어 상승 가격 추천을 표시하지 않습니다.")
+    elif not forecast_path_ready:
+        reasons.append("5·10·15·30분 방향을 계산할 완료 분봉이 아직 충분하지 않습니다.")
+    elif not long_price_path_confirmed:
+        reasons.append("5·10·15·30분 상방 경로가 모두 확인되기 전에는 상승 가격 추천을 표시하지 않습니다.")
     if flags["fake_breakout"]:
         reasons.append("가짜 돌파 경고: 저항 위 고가 뒤 종가가 저항 아래로 복귀했습니다.")
     if flags["upper_rejection"]:
@@ -353,6 +361,8 @@ def analyze(
         "reward_risk_net": reward_risk,
         "price_structure_valid": structure_ok,
         "long_price_path_confirmed": long_price_path_confirmed,
+        "has_downward_forecast": has_downward_forecast,
+        "forecast_path_ready": forecast_path_ready,
         "raw_hard_stop": raw_hard_stop,
         "round_trip_cost_pct": cost_pct,
         "target1_window_minutes": 5,
