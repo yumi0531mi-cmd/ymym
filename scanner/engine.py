@@ -171,18 +171,39 @@ def analyze(
     target1, target2, support, target1_basis, target2_basis, support_basis = trade_levels(df, entry, box)
     forecast_points = forecast_path(completed, regime, reference_price=quote.price)
     forecast_by_minutes = {point.minutes: point for point in forecast_points}
-    if target1 is None and forecast_by_minutes.get(5) is not None:
-        target1 = float(forecast_by_minutes[5].base)
+    # A forecast is never allowed to become an upside target below the intended entry.
+    # If completed five-minute resistance is unavailable, display no target instead of
+    # presenting a directionally invalid price level.
+    forecast_target1 = forecast_by_minutes.get(5)
+    if target1 is None and forecast_target1 is not None and float(forecast_target1.base) > entry:
+        target1 = float(forecast_target1.base)
         target1_basis = "5분 완료봉 모멘텀·VWAP·EMA·거래량·거래대금·ATR 계산"
-    if target2 is None and forecast_by_minutes.get(15) is not None:
-        target2 = float(forecast_by_minutes[15].base)
+    forecast_target2 = forecast_by_minutes.get(15)
+    minimum_target2 = float(target1) if target1 is not None else entry
+    if target2 is None and forecast_target2 is not None and float(forecast_target2.base) > minimum_target2:
+        target2 = float(forecast_target2.base)
         target2_basis = "15분 완료봉 모멘텀·VWAP·EMA·거래량·거래대금·ATR 계산"
+    # A structural target that has already been passed by the live quote cannot guide
+    # a fresh entry. Hide the whole target ladder until new completed-bar resistance
+    # is formed above the current price.
+    targets_ahead_of_quote = bool(
+        target1 is not None and target2 is not None
+        and float(target1) > quote.price and float(target2) > float(target1)
+    )
+    if not targets_ahead_of_quote:
+        target1, target2 = None, None
+        target1_basis, target2_basis = "현재가 위 1차 목표 재확인 중", "현재가 위 2차 목표 재확인 중"
     entry_resistance_1m, _, _, _ = confirmed_levels(df, entry)
     flags = fake_signal_flags(completed, support, entry_resistance_1m)
     risk = risk_state(df, current_price=quote.price, support=support, fake_breakdown=flags["fake_breakdown"])
     fallback_stop = max(0.0, entry - max(float(latest.atr) * 1.20, 0.01))
-    displayed_stop = risk.hard_stop or fallback_stop
-    stop_basis = f"{support_basis} 기반 Hard Stop" if risk.hard_stop else "완료봉 ATR 기반 구조 손절"
+    raw_hard_stop = risk.hard_stop
+    # A long-entry stop must always be below the entry. If a stale or inconsistent
+    # structural candidate violates that relationship, use the completed-bar ATR
+    # fallback rather than displaying a stop above the suggested buy level.
+    displayed_stop = float(raw_hard_stop) if raw_hard_stop is not None and 0 < float(raw_hard_stop) < entry else fallback_stop
+    soft_stop = float(risk.soft_stop) if risk.soft_stop is not None and 0 < float(risk.soft_stop) < entry else displayed_stop
+    stop_basis = f"{support_basis} 기반 Hard Stop" if raw_hard_stop is not None and 0 < float(raw_hard_stop) < entry else "완료봉 ATR 기반 구조 손절"
     spread = quote.spread_pct
     max_spread = _max_spread(quote)
     spread_ok = spread is not None and spread <= max_spread
@@ -204,10 +225,14 @@ def analyze(
     cost_pct = _round_trip_cost_pct(quote.market) if round_trip_cost_pct is None else max(round_trip_cost_pct, 0.0)
     cost_amount = entry * cost_pct / 100
     reward_risk: float | None = None
-    structure_ok = bool(target1 and target2 and risk.hard_stop and risk.hard_stop < entry < target1 < target2)
+    structure_ok = bool(
+        target1 and target2 and displayed_stop
+        and displayed_stop < entry < target1 < target2
+        and quote.price < target1
+    )
     if structure_ok:
         reward = float(target1) - entry - cost_amount
-        risk_amount = entry - float(risk.hard_stop) + cost_amount
+        risk_amount = entry - displayed_stop + cost_amount
         reward_risk = reward / risk_amount if risk_amount > 0 else None
     rr_ok = reward_risk is not None and reward_risk >= 1.10
 
@@ -313,6 +338,8 @@ def analyze(
         "notional_rvol": float(latest.notional_rvol),
         "notional_rvol_threshold": notional_threshold,
         "reward_risk_net": reward_risk,
+        "price_structure_valid": structure_ok,
+        "raw_hard_stop": raw_hard_stop,
         "round_trip_cost_pct": cost_pct,
         "target1_window_minutes": 5,
         "entry_resistance_1m": entry_resistance_1m,
@@ -344,7 +371,7 @@ def analyze(
         verified=data_verified,
         diagnostics=diagnostics,
         forecasts=forecast_points,
-        soft_stop=risk.soft_stop or displayed_stop,
+        soft_stop=soft_stop,
         hard_stop=displayed_stop,
         risk_status=risk.state,
         persistence=persistence,

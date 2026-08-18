@@ -404,14 +404,24 @@ def forecast_range_text(point: Any | None) -> str:
 
 
 def buy_range_text(plan: Any, quote: Quote) -> str:
-    """Format a buy zone from chart levels rather than an arbitrary percentage."""
+    """Format only an executable buy zone whose stop and targets have valid ordering."""
     entry = plan.entry
-    if entry is None or entry <= 0:
-        return "계산 대기"
+    stop = plan.hard_stop or plan.invalidation or plan.stop
+    target1 = plan.target
+    if not (
+        bool(plan.diagnostics.get("price_structure_valid"))
+        and isinstance(entry, (int, float)) and isinstance(stop, (int, float))
+        and isinstance(target1, (int, float)) and 0 < float(stop) < float(entry) < float(target1)
+    ):
+        return "현재가 위 목표 구조 재확인 중"
     candidates = [float(entry)]
     for key in ("vwap", "ema9"):
         value = plan.diagnostics.get(key)
-        if isinstance(value, (int, float)) and 0 < float(value) <= quote.price * 1.002:
+        if (
+            isinstance(value, (int, float))
+            and float(stop) < float(value) < float(target1)
+            and float(value) <= quote.price * 1.002
+        ):
             candidates.append(float(value))
     low, high = min(candidates), max(candidates)
     return price_text(low) if abs(high - low) < 0.01 else f"{price_text(low)} ~ {price_text(high)}"
@@ -607,7 +617,8 @@ def render_realtime_price(symbol: str, market_value: str, base_price: float, pre
         source = "KIS 체결"
     change_pct = ((price / previous_close) - 1.0) * 100.0 if previous_close > 0 else 0.0
     st.metric("현재가", price_text(price), f"{change_pct:+.2f}%")
-    st.caption(f"{source} · 마지막 체결 시각 {timestamp.strftime('%H:%M:%S')}")
+    refresh_at = datetime.now(timestamp.tzinfo).strftime("%H:%M:%S")
+    st.caption(f"{source} · 마지막 체결 {timestamp.strftime('%H:%M:%S')} · 1초 확인 {refresh_at}")
 
 
 def mixed_card_priority(item: dict[str, Any]) -> tuple[int, int, int]:
@@ -648,12 +659,12 @@ def render_plan_fields(item: dict[str, Any]) -> None:
     plan = item["plan"]
     structure = dashboard_structure(item)
     chart_aligned = bool(item.get("chart_aligned", True))
-    target_1 = plan.target or (forecast_point_for(plan, 5).base if forecast_point_for(plan, 5) else None)
-    target_2 = plan.target2 or (forecast_point_for(plan, 15).base if forecast_point_for(plan, 15) else None)
-    support = plan.soft_stop
-    stop = plan.hard_stop or plan.invalidation or plan.stop
-    if not chart_aligned:
-        target_1 = target_2 = support = stop = None
+    price_structure_valid = bool(plan.diagnostics.get("price_structure_valid"))
+    show_price_structure = chart_aligned and price_structure_valid
+    target_1 = plan.target if show_price_structure else None
+    target_2 = plan.target2 if show_price_structure else None
+    support = plan.soft_stop if show_price_structure else None
+    stop = (plan.hard_stop or plan.invalidation or plan.stop) if show_price_structure else None
     st.markdown(structure_strip_html(structure), unsafe_allow_html=True)
     forecast_columns = st.columns(4)
     for column, minutes in zip(forecast_columns, (5, 10, 15, 30)):

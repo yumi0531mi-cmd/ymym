@@ -178,3 +178,46 @@ def test_event_store_is_inert_without_supabase_secrets():
 def test_manual_trade_calculates_realized_pnl_after_fees():
     trade = ManualTrade.create("TEST", "US", "매수", 100, 2, exit_price=110, fees=1)
     assert trade.realized_pnl == 19
+
+
+def test_targets_below_live_quote_are_hidden(monkeypatch):
+    from scanner import engine as engine_module
+
+    frame = bars()
+    monkeypatch.setattr(engine_module, "chart_entry_level", lambda *_args, **_kwargs: (100.0, "test entry"))
+    monkeypatch.setattr(
+        engine_module,
+        "trade_levels",
+        lambda *_args, **_kwargs: (110.0, 115.0, 90.0, "test target 1", "test target 2", "test support"),
+    )
+
+    plan = engine_module.analyze(quote(120.0), frame)
+
+    assert plan.target is None
+    assert plan.target2 is None
+    assert plan.diagnostics["price_structure_valid"] is False
+
+
+def test_invalid_structural_stop_falls_back_below_entry(monkeypatch):
+    from scanner import engine as engine_module
+    from scanner.persistence_engine import RiskResult
+
+    frame = bars()
+    monkeypatch.setattr(engine_module, "chart_entry_level", lambda *_args, **_kwargs: (100.0, "test entry"))
+    monkeypatch.setattr(
+        engine_module,
+        "trade_levels",
+        lambda *_args, **_kwargs: (130.0, 140.0, 95.0, "test target 1", "test target 2", "test support"),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "risk_state",
+        lambda *_args, **_kwargs: RiskResult("NORMAL_SWING", 102.0, 105.0, 1, []),
+    )
+
+    plan = engine_module.analyze(quote(120.0), frame)
+
+    assert plan.entry == 100.0
+    assert plan.hard_stop is not None and plan.hard_stop < plan.entry
+    assert plan.soft_stop is not None and plan.soft_stop < plan.entry
+    assert plan.diagnostics["raw_hard_stop"] == 105.0
