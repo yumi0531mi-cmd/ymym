@@ -25,8 +25,8 @@ def test_kis_realtime_parses_domestic_trade_tick():
 def test_kis_realtime_parses_us_trade_tick_and_normalizes_symbol():
     hub = KISRealtimeHub(ApprovalOnlyClient())
     values = [
-        "DNASAAPL", "N", "20260817", "20260817", "101500", "191500", "0", "0", "0", "0",
-        "165.25", "2", "1.15", "0.70", "165.24", "165.26", "0", "0", "0", "123456",
+        "DNASAAPL", "AAPL", "2", "20260817", "101500", "20260817", "231500", "164.00", "166.00", "163.50",
+        "165.25", "2", "1.15", "0.70", "123456", "20392140", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0",
     ]
 
     hub._consume(f"0|{US_TRADE_TR_ID}|1|{'^'.join(values)}")
@@ -35,9 +35,18 @@ def test_kis_realtime_parses_us_trade_tick_and_normalizes_symbol():
     assert tick is not None
     assert tick.price == 165.25
     assert tick.change_pct == 0.70
-    assert tick.bid == 165.24
-    assert tick.ask == 165.26
+    assert tick.bid is None
+    assert tick.ask is None
     assert tick.volume == 123456
+
+
+def test_kis_realtime_parses_every_trade_in_batched_frame():
+    hub = KISRealtimeHub(ApprovalOnlyClient())
+    first = ["005930", "101500", "70100", "2", "100", "1.43", "0", "0", "0", "0", "70200", "70000", "10", "12345"] + [""] * 32
+    second = ["000660", "101501", "201000", "2", "200", "1.00", "0", "0", "0", "0", "201500", "200500", "5", "23456"] + [""] * 32
+    hub._consume(f"0|{KR_TRADE_TR_ID}|2|{'^'.join(first + second)}")
+    assert hub.tick(Market.KR, "005930").price == 70100
+    assert hub.tick(Market.KR, "000660").price == 201000
 
 
 def test_kis_realtime_subscription_uses_official_market_keys():

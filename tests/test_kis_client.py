@@ -44,6 +44,17 @@ def test_us_intraday_uses_exchange_date_not_today():
     assert str(bars.index.tz) in ("Asia/Seoul", "UTC+09:00")
 
 
+def test_us_intraday_keeps_official_exchange_code():
+    client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=".test_cache")
+    calls = []
+    def fake_get(path, tr_id, params):
+        calls.append((path, tr_id, params))
+        return {"output2": []}
+    client._get = fake_get  # type: ignore[method-assign]
+    client.intraday("AAPL", Market.US, "NAS")
+    assert calls[0][2]["EXCD"] == "NAS"
+
+
 def test_kr_intraday_requests_one_previous_page_when_current_page_is_full(tmp_path):
     client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
     calls = []

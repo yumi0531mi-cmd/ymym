@@ -25,6 +25,8 @@ LOGGER = logging.getLogger(__name__)
 KIS_WS_PROD = "ws://ops.koreainvestment.com:21000"
 KR_TRADE_TR_ID = "H0STCNT0"
 US_TRADE_TR_ID = "HDFSCNT0"
+KR_TRADE_FIELD_COUNT = 46
+US_TRADE_FIELD_COUNT = 26
 
 
 @dataclass(frozen=True)
@@ -296,6 +298,22 @@ class KISRealtimeHub:
         tr_id = parts[1]
         values = parts[3].split("^")
         try:
+            record_count = max(int(parts[2]), 1)
+        except ValueError:
+            record_count = 1
+        field_count = KR_TRADE_FIELD_COUNT if tr_id == KR_TRADE_TR_ID else US_TRADE_FIELD_COUNT
+        # KIS may batch multiple trades in one frame. Parsing only the first
+        # record leaves the dashboard stale during busy periods.
+        records = [
+            values[offset:offset + field_count]
+            for offset in range(0, min(len(values), record_count * field_count), field_count)
+            if len(values[offset:offset + field_count]) >= (14 if tr_id == KR_TRADE_TR_ID else 16)
+        ]
+        for record in records:
+            self._consume_record(tr_id, record)
+
+    def _consume_record(self, tr_id: str, values: list[str]) -> None:
+        try:
             if tr_id == KR_TRADE_TR_ID and len(values) >= 14:
                 symbol = values[0].strip().upper()
                 price = float(values[2])
@@ -305,14 +323,18 @@ class KISRealtimeHub:
                 volume = float(values[13]) if values[13] else None
                 market = Market.KR
                 timestamp = datetime.now(KST)
-            elif tr_id == US_TRADE_TR_ID and len(values) >= 20:
+            elif tr_id == US_TRADE_TR_ID and len(values) >= 16:
                 raw_symbol = values[0].strip().upper()
-                symbol = raw_symbol[4:] if raw_symbol.startswith(("DNAS", "DNYS", "DAMS")) else raw_symbol
+                symbol = values[1].strip().upper() if values[1].strip() else (
+                    raw_symbol[4:] if raw_symbol.startswith(("DNAS", "DNYS", "DAMS")) else raw_symbol
+                )
                 price = float(values[10])
                 change_pct = float(values[13])
-                bid = float(values[14]) if values[14] else None
-                ask = float(values[15]) if values[15] else None
-                volume = float(values[19]) if values[19] else None
+                # HDFSCNT0 is a trade channel; fields 14/15 are cumulative
+                # volume/turnover and must never be presented as bid/ask.
+                bid = None
+                ask = None
+                volume = float(values[14]) if values[14] else None
                 market = Market.US
                 timestamp = datetime.now(ET)
             else:

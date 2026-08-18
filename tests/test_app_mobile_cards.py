@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -12,7 +13,7 @@ from scanner.kis_client import KISClient
 from scanner.models import ForecastPoint, Market, Quote, Regime, Signal, TradePlan
 
 
-APP_PATH = "/home/ubuntu/ymym_review/app.py"
+APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
 
 
 def _quote(*_args, **_kwargs) -> Quote:

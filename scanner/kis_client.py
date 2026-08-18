@@ -436,13 +436,10 @@ class KISClient:
                 "low": "stck_lwpr", "close": "stck_prpr", "volume": "cntg_vol",
             }
         else:
-            session_name = market_session(market, now)
-            day_exchange = {"NAS": "BAQ", "NYS": "BAY", "AMS": "BAA"}
-            request_exchange = day_exchange.get(exchange, exchange) if session_name == "US_REGULAR" else exchange
             payload = self._get(
                 "/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice",
                 "HHDFS76950200",
-                {"AUTH": "", "EXCD": request_exchange, "SYMB": symbol, "NMIN": "1", "PINC": "1", "NEXT": "", "NREC": "120", "FILL": "", "KEYB": ""},
+                {"AUTH": "", "EXCD": exchange, "SYMB": symbol, "NMIN": "1", "PINC": "1", "NEXT": "", "NREC": "120", "FILL": "", "KEYB": ""},
             )
             rows = payload.get("output2") or []
             mapping = {"date": "xymd", "time": "xhms", "open": "open", "high": "high", "low": "low", "close": "last", "volume": "evol"}

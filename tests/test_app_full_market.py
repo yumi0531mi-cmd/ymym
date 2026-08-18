@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -13,7 +14,7 @@ from scanner.kis_client import KISClient, KISError
 from scanner.models import ForecastPoint, Market, Quote, Regime, Signal, TradePlan
 
 
-APP_PATH = "/home/ubuntu/ymym_review/app.py"
+APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
 MOCK_RANKINGS = {
     "거래대금·거래량 순위": [
         {"mksc_shrn_iscd": "005930", "hts_kor_isnm": "삼성전자", "stck_prpr": "70000", "acml_vol": "100000"},
@@ -22,6 +23,23 @@ MOCK_RANKINGS = {
         {"mksc_shrn_iscd": "005930", "hts_kor_isnm": "삼성전자", "prdy_ctrt": "2.0"},
     ],
 }
+
+
+def test_quote_survives_orderbook_endpoint_failure():
+    from app import load_rest_dashboard_quote
+    quote = _quote("005930", Market.KR)
+    with (
+        patch("app._load_quote_record", return_value={
+            "symbol": quote.symbol, "market": quote.market.value, "price": quote.price,
+            "previous_close": quote.previous_close, "timestamp": quote.timestamp.isoformat(),
+            "bid": None, "ask": None, "volume": quote.volume, "turnover": quote.turnover,
+            "session": quote.session, "source": quote.source,
+        }),
+        patch("app._load_orderbook", side_effect=KISError("orderbook unavailable")),
+    ):
+        result = load_rest_dashboard_quote("005930", "KR", "")
+    assert result.price == 70000
+    assert result.bid is None and result.ask is None
 
 
 def _quote(*_args, **_kwargs) -> Quote:

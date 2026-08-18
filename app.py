@@ -181,7 +181,13 @@ def _load_orderbook(symbol: str, market_value: str, exchange: str) -> tuple[floa
 
 def load_rest_dashboard_quote(symbol: str, market_value: str, exchange: str) -> Quote:
     quote = _quote_from_cache_record(_load_quote_record(symbol, market_value, exchange))
-    bid, ask = _load_orderbook(symbol, market_value, exchange)
+    try:
+        bid, ask = _load_orderbook(symbol, market_value, exchange)
+    except KISError:
+        # Preserve price visibility when an entitlement/session-specific
+        # orderbook endpoint is unavailable. Missing bid/ask safely keeps the
+        # engine's execution gate in WAIT.
+        bid, ask = None, None
     return Quote(
         symbol=quote.symbol, market=quote.market, price=quote.price,
         previous_close=quote.previous_close, timestamp=quote.timestamp,
@@ -893,7 +899,9 @@ else:
                     card["name"] = str(candidate.get("name") or symbol)
                     card["candidate_source"] = str(candidate.get("candidate_source") or "시장 실시간 순위")
                     cards.append(card)
-                except (KISError, ValueError, KeyError, OSError) as exc:
+                except KISError as exc:
+                    errors.append(f"{symbol}: {str(exc)[:180]}")
+                except (ValueError, KeyError, OSError) as exc:
                     errors.append(f"{symbol}: {type(exc).__name__}")
                 except Exception as exc:
                     errors.append(f"{symbol}: {type(exc).__name__}")
