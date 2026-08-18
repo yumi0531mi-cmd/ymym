@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import time
 from collections import defaultdict, deque
@@ -18,6 +19,8 @@ from .kis_client import KISClient, KISError
 from .models import Market
 from .sessions import ET, KST
 
+
+LOGGER = logging.getLogger(__name__)
 
 KIS_WS_PROD = "ws://ops.koreainvestment.com:21000"
 KR_TRADE_TR_ID = "H0STCNT0"
@@ -243,6 +246,7 @@ class KISRealtimeHub:
                 with self._lock:
                     self._connected = False
                     self._last_error = f"{type(exc).__name__}: {detail[:120]}" if detail else type(exc).__name__
+                LOGGER.warning("KIS WebSocket reconnect in %.0fs: %s", reconnect_delay, self._last_error)
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 20.0)
             finally:
