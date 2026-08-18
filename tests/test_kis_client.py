@@ -44,7 +44,9 @@ def test_us_intraday_uses_exchange_date_not_today():
     assert str(bars.index.tz) in ("Asia/Seoul", "UTC+09:00")
 
 
-def test_us_intraday_keeps_official_exchange_code():
+def test_us_intraday_keeps_regular_session_exchange_code(monkeypatch):
+    import scanner.kis_client as kis_module
+    monkeypatch.setattr(kis_module, "market_session", lambda *_args, **_kwargs: "US_REGULAR")
     client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=".test_cache")
     calls = []
     def fake_get(path, tr_id, params):
@@ -53,6 +55,16 @@ def test_us_intraday_keeps_official_exchange_code():
     client._get = fake_get  # type: ignore[method-assign]
     client.intraday("AAPL", Market.US, "NAS")
     assert calls[0][2]["EXCD"] == "NAS"
+
+
+def test_us_intraday_uses_daytime_exchange_code_only_in_us_day(monkeypatch):
+    import scanner.kis_client as kis_module
+    monkeypatch.setattr(kis_module, "market_session", lambda *_args, **_kwargs: "US_DAY")
+    client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=".test_cache")
+    calls = []
+    client._get = lambda path, tr_id, params: calls.append((path, tr_id, params)) or {"output2": []}  # type: ignore[method-assign]
+    client.intraday("AAPL", Market.US, "NAS")
+    assert calls[0][2]["EXCD"] == "BAQ"
 
 
 def test_kr_intraday_uses_official_120_record_daily_minute_endpoint(tmp_path):

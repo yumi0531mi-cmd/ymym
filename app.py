@@ -26,7 +26,7 @@ from scanner.validation import ValidationCase, ValidationStore
 APP_VERSION = "5.8-live-data-recovery"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
-CLIENT_CACHE_VERSION = "client-contract-v10-120bar"
+CLIENT_CACHE_VERSION = "client-contract-v11-us-day-bars"
 # The market-data connection has its own lifecycle. Bump this only when the
 # WebSocket protocol or recovery contract changes, without issuing a new REST token.
 REALTIME_HUB_CACHE_VERSION = "realtime-hub-v3-visible-fallback"
