@@ -1,7 +1,5 @@
 from scanner.models import Market
 from scanner.realtime import KISRealtimeHub, KR_TRADE_TR_ID, US_TRADE_TR_ID, RealtimeTick
-from scanner.yahoo_realtime import YahooRealtimeHub, choose_display_tick
-from scanner.yahoo_realtime import normalize_yahoo_bars
 
 
 class ApprovalOnlyClient:
@@ -114,47 +112,3 @@ def test_kis_realtime_resets_approval_on_subscription_auth_error():
 
     assert hub._approval_key == ""
     assert hub._approval_expires_monotonic == 0.0
-
-
-def test_yahoo_realtime_normalizes_market_symbols_and_stores_display_tick():
-    hub = YahooRealtimeHub()
-    assert hub.yahoo_symbol(Market.US, "aapl", "NAS") == "AAPL"
-    assert hub.yahoo_symbol(Market.KR, "005930", "KOSPI") == "005930.KS"
-    assert hub.yahoo_symbol(Market.KR, "035900", "KOSDAQ") == "035900.KQ"
-    assert hub.yahoo_symbols(Market.KR, "950260") == ("950260.KS", "950260.KQ")
-
-    hub._consume(
-        {"id": "AAPL", "price": "210.25", "time": "1787047200000", "change_percent": "1.5", "bid": "210.24", "ask": "210.26", "day_volume": "12345"},
-        {"AAPL": (Market.US, "AAPL")},
-    )
-
-    tick = hub.tick(Market.US, "AAPL")
-    assert tick is not None
-    assert tick.price == 210.25
-    assert tick.change_pct == 1.5
-    assert tick.source == "YAHOO_WEBSOCKET"
-
-
-def test_card_display_prefers_kis_tick_and_uses_yahoo_only_when_kis_is_missing():
-    from datetime import datetime
-    from scanner.sessions import KST
-
-    moment = datetime(2026, 8, 18, 12, 40, tzinfo=KST)
-    kis_tick = RealtimeTick("005930", Market.KR, 70000, 1.0, moment, source="KIS_WEBSOCKET")
-    yahoo_tick = RealtimeTick("005930", Market.KR, 69950, 0.9, moment, source="YAHOO_WEBSOCKET")
-
-    assert choose_display_tick(kis_tick, yahoo_tick) is kis_tick
-    assert choose_display_tick(None, yahoo_tick) is yahoo_tick
-
-
-def test_yahoo_one_minute_bars_normalize_to_scanner_ohlcv_contract():
-    import pandas as pd
-
-    raw = pd.DataFrame(
-        {"Open": [100, 101], "High": [101, 102], "Low": [99, 100], "Close": [100.5, 101.5], "Volume": [1000, 1200]},
-        index=pd.date_range("2026-08-18 09:00", periods=2, freq="min", tz="Asia/Seoul"),
-    )
-    bars = normalize_yahoo_bars(raw, Market.KR)
-    assert list(bars.columns) == ["open", "high", "low", "close", "volume"]
-    assert len(bars) == 2
-    assert float(bars.close.iloc[-1]) == 101.5

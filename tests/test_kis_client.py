@@ -44,6 +44,33 @@ def test_us_intraday_uses_exchange_date_not_today():
     assert str(bars.index.tz) in ("Asia/Seoul", "UTC+09:00")
 
 
+def test_kr_intraday_requests_one_previous_page_when_current_page_is_full(tmp_path):
+    client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
+    calls = []
+
+    def rows(start_minute: int):
+        return [
+            {
+                "stck_bsop_date": "20260818", "stck_cntg_hour": f"{12 - ((start_minute + offset) // 60):02d}{(start_minute + offset) % 60:02d}00",
+                "stck_oprc": "100", "stck_hgpr": "101", "stck_lwpr": "99", "stck_prpr": "100", "cntg_vol": "1000",
+            }
+            for offset in range(30)
+        ]
+
+    responses = [{"output2": rows(0)}, {"output2": rows(30)}]
+
+    def fake_get(path, tr_id, params):
+        calls.append((path, tr_id, params))
+        return responses.pop(0)
+
+    client._get = fake_get  # type: ignore[method-assign]
+    bars = client.intraday("036930", Market.KR)
+
+    assert len(calls) == 2
+    assert calls[1][2]["FID_INPUT_HOUR_1"] == "120000"
+    assert len(bars) == 60
+
+
 def test_missing_live_price_is_an_error_not_a_fake_plan():
     client = client_with([{"output": {"last": "0"}}, {"output1": []}])
     try:

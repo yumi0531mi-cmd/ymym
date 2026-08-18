@@ -406,18 +406,31 @@ class KISClient:
         symbol = symbol.strip().upper()
         now = datetime.now(tz=KST)
         if market == Market.KR:
+            params = {
+                "FID_ETC_CLS_CODE": "",
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": symbol,
+                "FID_INPUT_HOUR_1": now.strftime("%H%M%S"),
+                "FID_PW_DATA_INCU_YN": "Y",
+            }
             payload = self._get(
                 "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
                 "FHKST03010200",
-                {
-                    "FID_ETC_CLS_CODE": "",
-                    "FID_COND_MRKT_DIV_CODE": "J",
-                    "FID_INPUT_ISCD": symbol,
-                    "FID_INPUT_HOUR_1": now.strftime("%H%M%S"),
-                    "FID_PW_DATA_INCU_YN": "Y",
-                },
+                params,
             )
-            rows = payload.get("output2") or []
+            rows = list(payload.get("output2") or [])
+            # KIS domestic time-price responses contain about 30 bars. One bounded
+            # earlier-page request supplies enough completed 1-minute bars for the
+            # 5/10/15/30-minute hybrid structure without broad polling.
+            times = [str(row.get("stck_cntg_hour") or "").replace(":", "") for row in rows if isinstance(row, dict)]
+            cursor = min((time.zfill(6)[:6] for time in times if time.isdigit()), default="")
+            if len(rows) >= 30 and cursor:
+                previous = self._get(
+                    "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+                    "FHKST03010200",
+                    {**params, "FID_INPUT_HOUR_1": cursor},
+                )
+                rows.extend(list(previous.get("output2") or []))
             mapping = {
                 "date": "stck_bsop_date", "time": "stck_cntg_hour", "open": "stck_oprc", "high": "stck_hgpr",
                 "low": "stck_lwpr", "close": "stck_prpr", "volume": "cntg_vol",

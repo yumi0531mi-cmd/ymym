@@ -22,16 +22,14 @@ from scanner.realtime import KISRealtimeHub
 from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
-from scanner.yahoo_realtime import YahooRealtimeHub, choose_display_tick, yahoo_intraday_bars
 
-APP_VERSION = "5.6-kis-realtime"
+APP_VERSION = "5.7-kis-source-only"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
-CLIENT_CACHE_VERSION = "client-contract-v8-live-card-targets"
+CLIENT_CACHE_VERSION = "client-contract-v9-kis-source-only"
 # The market-data connection has its own lifecycle. Bump this only when the
 # WebSocket protocol or recovery contract changes, without issuing a new REST token.
 REALTIME_HUB_CACHE_VERSION = "realtime-hub-v2-heartbeat-recovery"
-YAHOO_REALTIME_HUB_CACHE_VERSION = "yahoo-realtime-hub-v1-display-only"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 MAX_LIVE_CARDS = 5
 MAX_CANDIDATE_LIST = 20
@@ -120,19 +118,6 @@ def current_realtime_hub() -> KISRealtimeHub:
 
 
 @st.cache_resource
-def get_yahoo_realtime_hub(cache_version: str) -> YahooRealtimeHub:
-    return YahooRealtimeHub()
-
-
-def current_yahoo_realtime_hub() -> YahooRealtimeHub:
-    hub = get_yahoo_realtime_hub(YAHOO_REALTIME_HUB_CACHE_VERSION)
-    if not isinstance(hub, YahooRealtimeHub):
-        get_yahoo_realtime_hub.clear()
-        hub = get_yahoo_realtime_hub(YAHOO_REALTIME_HUB_CACHE_VERSION)
-    return hub
-
-
-@st.cache_resource
 def get_event_store(secret_fingerprint: str) -> EventStore:
     """Recreate the persistent event store whenever Streamlit Secrets change."""
     return EventStore(st.secrets)
@@ -175,9 +160,10 @@ def _quote_from_cache_record(record: dict[str, object]) -> Quote:
     )
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def _load_quote_record(symbol: str, market_value: str, exchange: str) -> dict[str, object]:
-    # Last price is the only per-card request made every minute.
+    # KIS REST is the only fallback when the official WebSocket is unavailable.
+    # Five visible cards at this interval remain below the 30-call/minute ceiling.
     quote = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).quote(
         symbol, Market(market_value), exchange, include_orderbook=False
     )
@@ -217,12 +203,6 @@ def load_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
     )
 
 
-@st.cache_data(ttl=120, show_spinner=False)
-def load_yahoo_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
-    """Fetch bounded Yahoo 1-minute bars only when KIS history cannot build a card."""
-    return yahoo_intraday_bars(Market(market_value), symbol, exchange)
-
-
 def merge_live_completed_bars(base: pd.DataFrame, symbol: str, market: Market) -> pd.DataFrame:
     """Overlay locally completed one-minute KIS trade bars onto cached REST history."""
     rows = current_realtime_hub().completed_bar_rows(market, symbol)
@@ -254,30 +234,9 @@ def quote_with_live_tick(base: Quote) -> Quote:
     )
 
 
-def quote_with_yahoo_tick(base: Quote) -> Quote:
-    """Use a Yahoo tick only with Yahoo bars; never merge it into KIS analysis."""
-    tick = current_yahoo_realtime_hub().tick(base.market, base.symbol)
-    if tick is None:
-        return base
-    return Quote(
-        symbol=base.symbol, market=base.market, price=tick.price,
-        previous_close=base.previous_close, timestamp=tick.timestamp,
-        bid=tick.bid, ask=tick.ask, volume=tick.volume,
-        turnover=base.turnover, session=base.session, source=tick.source,
-    )
-
-
 def display_tick(market: Market, symbol: str):
-    """Return a live price for the card only, preferring KIS over Yahoo.
-
-    KIS ticks remain the only live source allowed to alter structural analysis and
-    validation. Yahoo is a display backup, so its quote can never change VWAP,
-    completed bars, targets, stops, or KIS-based validation outcomes.
-    """
-    return choose_display_tick(
-        current_realtime_hub().tick(market, symbol),
-        current_yahoo_realtime_hub().tick(market, symbol),
-    )
+    """Return only an official KIS trade tick; never substitute another provider."""
+    return current_realtime_hub().tick(market, symbol)
 
 
 def price_ceiling(market: Market) -> float:
@@ -622,12 +581,6 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
     quote = quote_with_live_tick(rest_quote)
     bars = merge_live_completed_bars(load_bars(symbol, market.value, exchange), symbol, market)
     bar_source = "KIS_1M"
-    if len(bars) < 31:
-        yahoo_bars = load_yahoo_bars(symbol, market.value, exchange)
-        if len(yahoo_bars) >= 31:
-            bars = yahoo_bars
-            quote = quote_with_yahoo_tick(rest_quote)
-            bar_source = "YAHOO_1M"
     chart_aligned, chart_alignment_reason = completed_bar_alignment(quote, bars)
     cycle = cycle_store.get(symbol, market, quote.timestamp)
     preliminary = analyze(
@@ -664,27 +617,32 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
 
 
 @st.fragment(run_every=1.0)
-def render_realtime_price(symbol: str, market_value: str, base_price: float, previous_close: float, initial_timestamp: str) -> None:
+def render_realtime_price(symbol: str, market_value: str, exchange: str, base_price: float, previous_close: float, initial_timestamp: str) -> None:
     """Redraw only a card's live price area once per second.
 
-    This fragment reads the in-memory KIS WebSocket tick and never reruns candidate
-    ranking, chart analysis, or strategy calculations.  A REST snapshot is used only
-    until the first real-time trade arrives or while the stream reconnects.
+    This fragment reads only the official KIS WebSocket tick. If that connection is
+    unavailable, a KIS REST snapshot is refreshed at a rate-limit-safe interval.
     """
     market = Market(market_value)
     tick = display_tick(market, symbol)
-    if tick is None:
-        price = base_price
-        timestamp = datetime.fromisoformat(initial_timestamp)
-        source = "현재가 수신 대기"
-    else:
+    if tick is not None:
         price = tick.price
         timestamp = tick.timestamp
-        source = "KIS 체결" if tick.source == "KIS_WEBSOCKET" else "Yahoo 보조 시세"
+        source = "KIS 체결"
+    else:
+        try:
+            rest_quote = _quote_from_cache_record(_load_quote_record(symbol, market.value, exchange))
+            price = rest_quote.price
+            timestamp = rest_quote.timestamp
+            source = "KIS REST 기준"
+        except (KISError, OSError, ValueError):
+            price = base_price
+            timestamp = datetime.fromisoformat(initial_timestamp)
+            source = "KIS 현재가 재수신 대기"
     change_pct = ((price / previous_close) - 1.0) * 100.0 if previous_close > 0 else 0.0
     st.metric("현재가", price_text(price), f"{change_pct:+.2f}%")
     refresh_at = datetime.now(timestamp.tzinfo).strftime("%H:%M:%S")
-    st.caption(f"{source} · 마지막 체결 {timestamp.strftime('%H:%M:%S')} · 1초 확인 {refresh_at}")
+    st.caption(f"{source} · KIS 시각 {timestamp.strftime('%H:%M:%S')} · 화면 확인 {refresh_at}")
 
 
 def mixed_card_priority(item: dict[str, Any]) -> tuple[int, int, int]:
@@ -698,12 +656,8 @@ def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, st
     """Recalculate from the selected bounded 1-minute source without KIS polling."""
     base_quote: Quote = item["quote"]
     bar_source = str(item.get("bar_source") or "KIS_1M")
-    if bar_source == "YAHOO_1M":
-        quote = quote_with_yahoo_tick(base_quote)
-        bars = load_yahoo_bars(quote.symbol, quote.market.value, str(item.get("exchange") or ""))
-    else:
-        quote = quote_with_live_tick(base_quote)
-        bars = merge_live_completed_bars(item["bars"], quote.symbol, quote.market)
+    quote = quote_with_live_tick(base_quote)
+    bars = merge_live_completed_bars(item["bars"], quote.symbol, quote.market)
     chart_aligned, chart_alignment_reason = completed_bar_alignment(quote, bars)
     cycle = cycle_store.get(quote.symbol, quote.market, quote.timestamp)
     previous_plan = item["plan"]
@@ -782,6 +736,7 @@ def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int, stor
         render_realtime_price(
             quote.symbol,
             quote.market.value,
+            str(item.get("exchange") or ""),
             quote.price,
             quote.previous_close,
             quote.timestamp.isoformat(),
@@ -853,7 +808,6 @@ def render_chart(bars: pd.DataFrame, plan: Any, key: str) -> None:
 
 client = current_client()
 realtime_hub = current_realtime_hub()
-yahoo_realtime_hub = current_yahoo_realtime_hub()
 active_secret_fingerprint = current_secret_fingerprint()
 event_store = get_event_store(active_secret_fingerprint)
 cycle_store = get_cycle_store(active_secret_fingerprint)
@@ -878,8 +832,6 @@ with st.sidebar:
     budget = client.budget_status
     st.caption(f"호출 보호: 1분 {budget.minute_used}/{budget.minute_limit} · 5시간 {budget.five_hour_used}/{budget.five_hour_limit}")
     st.caption(realtime_hub.status_label())
-    if not realtime_hub.connected:
-        st.caption(yahoo_realtime_hub.status_label())
     if event_store.configured:
         st.caption("검증 성과 저장: 영구 보관 연결됨")
     else:
@@ -932,14 +884,6 @@ else:
                 requests.append(candidate)
             visible_requests = requests[:MAX_LIVE_CARDS + 1]
             realtime_hub.configure(
-                (
-                    market,
-                    str(candidate["symbol"]),
-                    str(candidate.get("exchange") or ("NAS" if market == Market.US else "")),
-                )
-                for candidate in visible_requests
-            )
-            yahoo_realtime_hub.configure(
                 (
                     market,
                     str(candidate["symbol"]),
