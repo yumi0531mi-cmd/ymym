@@ -44,7 +44,11 @@ def _plan(*_args, **_kwargs) -> TradePlan:
             ForecastPoint(15, 70500, 72000, 73000, Regime.UP, "EMA9·VWAP 위"),
             ForecastPoint(30, 71000, 73500, 75000, Regime.UP, "EMA9·VWAP 위"),
         ],
-        persistence_score=78, diagnostics={"rvol": 2.4, "spread_pct": 0.14, "reward_risk_net": 1.8, "false_signal_flags": []},
+        persistence_score=78, diagnostics={
+            "rvol": 2.4, "spread_pct": 0.14, "reward_risk_net": 1.8,
+            "false_signal_flags": [], "forecast_path_ready": True,
+            "long_price_path_confirmed": True, "has_downward_forecast": False,
+        },
     )
 
 

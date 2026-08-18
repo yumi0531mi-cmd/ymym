@@ -32,6 +32,7 @@ CLIENT_CACHE_VERSION = "client-contract-v11-us-day-bars"
 REALTIME_HUB_CACHE_VERSION = "realtime-hub-v3-visible-fallback"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 MAX_LIVE_CARDS = 3
+MAX_ANALYSIS_CANDIDATES = 10
 MAX_CANDIDATE_LIST = 20
 KR_PRICE_CEILING = 300_000.0
 US_PRICE_CEILING = 170.0
@@ -664,8 +665,7 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
     }
 
 
-@st.fragment(run_every=1.0)
-def render_realtime_price(symbol: str, market_value: str, exchange: str, base_price: float, previous_close: float, initial_timestamp: str) -> None:
+def _render_realtime_price_content(symbol: str, market_value: str, exchange: str, base_price: float, previous_close: float, initial_timestamp: str) -> None:
     """Redraw only a card's live price area once per second.
 
     This fragment reads only the official KIS WebSocket tick. If that connection is
@@ -690,7 +690,26 @@ def render_realtime_price(symbol: str, market_value: str, exchange: str, base_pr
     change_pct = ((price / previous_close) - 1.0) * 100.0 if previous_close > 0 else 0.0
     st.metric("현재가", price_text(price), f"{change_pct:+.2f}%")
     refresh_at = datetime.now(timestamp.tzinfo).strftime("%H:%M:%S")
-    st.caption(f"{source} · KIS 시각 {timestamp.strftime('%H:%M:%S')} · 화면 1초 확인 {refresh_at}")
+    st.caption(f"{source} · KIS 시각 {timestamp.strftime('%H:%M:%S')} · 화면 확인 {refresh_at}")
+
+
+@st.fragment(run_every=1.0)
+def render_realtime_price_1s(*args) -> None:
+    _render_realtime_price_content(*args)
+
+
+@st.fragment(run_every=3.0)
+def render_realtime_price_3s(*args) -> None:
+    _render_realtime_price_content(*args)
+
+
+@st.fragment(run_every=5.0)
+def render_realtime_price_5s(*args) -> None:
+    _render_realtime_price_content(*args)
+
+
+def render_realtime_price(refresh_seconds: int, *args) -> None:
+    {1: render_realtime_price_1s, 3: render_realtime_price_3s, 5: render_realtime_price_5s}[refresh_seconds](*args)
 
 
 def mixed_card_priority(item: dict[str, Any]) -> tuple[int, int, int]:
@@ -717,6 +736,16 @@ def card_trade_status(item: dict[str, Any]) -> str:
     if bool(diagnostics.get("long_price_path_confirmed")):
         return "눌림목 대기"
     return "관찰"
+
+
+def visible_trade_cards(items: list[dict[str, Any]], display_limit: int = MAX_LIVE_CARDS) -> list[dict[str, Any]]:
+    """Hide automatic blocked/downward cards while preserving direct searches."""
+    visible = [item for item in items if card_trade_status(item) != "진입 금지"]
+    for item in items:
+        if item.get("candidate_source") == "관심 종목 직접 검색" and item not in visible:
+            visible.append(item)
+    visible.sort(key=mixed_card_priority, reverse=True)
+    return visible[:max(1, min(int(display_limit), 10))]
 
 
 def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
@@ -801,7 +830,7 @@ def render_live_plan_fields(item: dict[str, Any], cost_pct: float, min_score: in
     render_plan_fields(live_card_snapshot(item, cost_pct, min_score, store))
 
 
-def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore) -> None:
+def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore, refresh_seconds: int) -> None:
     """Render a price-first card with 1-second tick and 1-minute structure refreshes."""
     quote: Quote = item["quote"]
     title = f"{quote.symbol} · {item.get('name') or quote.market.value}"
@@ -820,6 +849,7 @@ def render_live_card(item: dict[str, Any], cost_pct: float, min_score: int, stor
         else:
             st.info("관찰 · 상방 조건이 모두 맞을 때까지 진입 금지")
         render_realtime_price(
+            refresh_seconds,
             quote.symbol,
             quote.market.value,
             str(item.get("exchange") or ""),
@@ -910,6 +940,8 @@ with st.sidebar:
     cost_default = 0.05 if market == Market.KR else 0.10
     cost_pct = st.number_input("왕복비용 가정(%)", min_value=0.0, max_value=5.0, value=cost_default, step=0.01)
     min_score = st.slider("최소 신호 점수", min_value=60, max_value=100, value=80, step=5)
+    refresh_seconds = int(st.radio("현재가 화면 갱신", [1, 3, 5], horizontal=True, format_func=lambda value: f"{value}초"))
+    candidate_card_count = int(st.slider("상승·반복단타 후보 수", min_value=5, max_value=10, value=5, step=1))
     if client.ready:
         st.success("실시간 후보 자동 분석 중")
     else:
@@ -924,7 +956,7 @@ with st.sidebar:
         st.caption("검증 성과 저장: 영구 보관 연결됨")
     else:
         st.caption("검증 성과 저장: 앱 재시작 시 초기화될 수 있음 · [한 번만 설정하는 안내](https://github.com/yumi0531mi-cmd/ymym/blob/main/docs/supabase_persistent_validation_setup.md)")
-    st.caption("화면 현재가 1초 확인 · KIS WebSocket 체결 우선 · 미연결 시 REST 12초 안전 대체 · 완료봉 구조 1분")
+    st.caption(f"화면 현재가 {refresh_seconds}초 확인 · KIS WebSocket 체결 우선 · 미연결 시 REST 12초 안전 대체 · 완료봉 구조 1분")
 
 kis_connected = client.ready
 # KIS ticks are redrawn by each card's independent Streamlit fragment.  Do not
@@ -966,11 +998,12 @@ else:
             requests: list[dict[str, Any]] = []
             if direct_request is not None:
                 requests.append({**direct_request, "candidate_source": "관심 종목 직접 검색"})
-            for candidate in candidates[:MAX_LIVE_CARDS]:
+            analysis_limit = min(MAX_ANALYSIS_CANDIDATES, candidate_card_count + 2)
+            for candidate in candidates[:analysis_limit]:
                 if direct_request is not None and str(candidate["symbol"]) == direct_request["symbol"]:
                     continue
                 requests.append(candidate)
-            visible_requests = requests[:MAX_LIVE_CARDS]
+            visible_requests = requests[:analysis_limit]
             realtime_hub.configure(
                 (
                     market,
@@ -1005,37 +1038,26 @@ if candidates:
     )
 
 if cards:
-    cards.sort(key=mixed_card_priority, reverse=True)
+    analyzed_count = len(cards)
+    blocked_cards = [card for card in cards if card_trade_status(card) == "진입 금지"]
+    cards = visible_trade_cards(cards, candidate_card_count)
+
+if cards:
     updated_at = max(card["quote"].timestamp for card in cards)
     source_labels = {str(card.get("candidate_source") or "시장 실시간 순위") for card in cards}
     source_text = " · ".join(sorted(source_labels))
     actionable_count = sum(card_trade_status(card) == "매수 조건 충족" for card in cards)
     waiting_count = sum(card_trade_status(card) == "눌림목 대기" for card in cards)
-    blocked_count = sum(card_trade_status(card) == "진입 금지" for card in cards)
-    st.subheader(f"실시간 분석 결과 · 매수 {actionable_count} · 대기 {waiting_count} · 금지 {blocked_count}")
-    st.caption(f"분석 카드 {len(cards)}개 · {updated_at.strftime('%H:%M:%S')} · {realtime_hub.status_label()} · {source_text}")
+    st.subheader(f"실시간 상방 후보 · 매수 {actionable_count} · 눌림 대기 {waiting_count}")
+    st.caption(f"상위 {analyzed_count}개 분석 · 하방/진입금지 {len(blocked_cards)}개 자동 제외 · {updated_at.strftime('%H:%M:%S')} · {realtime_hub.status_label()} · {source_text}")
     for card_item in cards:
-        render_live_card(card_item, float(cost_pct), int(min_score), store)
+        render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds)
 elif kis_connected and not errors and not candidates:
     limit_text = "30만 원 미만" if market == Market.KR else "170달러 미만"
     st.info(f"현재 {limit_text} 가격 조건과 상승 후보 기준을 함께 통과한 종목이 없습니다.")
 
-if candidates:
-    list_rows = []
-    for candidate in candidates[:MAX_CANDIDATE_LIST]:
-        price = candidate.get("price")
-        change = candidate.get("change_pct")
-        list_rows.append({
-            "종목": f"{candidate.get('symbol')} · {candidate.get('name') or ''}",
-            "순위 조회가": price_text(float(price)) if isinstance(price, (int, float)) else "미확인",
-            "등락률": f"{float(change):+.2f}%" if isinstance(change, (int, float)) else "미확인",
-            "거래대금": money(float(candidate.get('turnover') or 0.0)),
-        })
-    limit_text = "30만 원 미만" if market == Market.KR else "170달러 미만"
-    st.subheader(f"1차 시장 순위 후보(상세분석 전) · {len(candidates)}개")
-    st.caption("이 표는 매수 목록이 아닙니다. 위 실시간 분석 카드의 매수·대기·금지 판정을 우선합니다.")
-    st.dataframe(pd.DataFrame(list_rows), hide_index=True, width="stretch")
-    render_new_candidate_watchlist(market.value, fixed_symbols)
+if candidates and not cards:
+    st.warning("현재 상위 후보 중 5·10·15·30분 상방 경로를 통과한 종목이 없습니다. 하락·진입금지 종목은 표시하지 않습니다.")
 
 for error in errors:
     st.warning(f"일부 후보는 분석 데이터를 만들지 못했습니다: {error}")
