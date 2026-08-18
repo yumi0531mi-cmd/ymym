@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
@@ -14,6 +15,12 @@ from scanner.models import ForecastPoint, Market, Quote, Regime, Signal, TradePl
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
+
+
+@pytest.fixture(autouse=True)
+def regular_market_session():
+    with patch("scanner.sessions.market_session", return_value="KR_REGULAR"):
+        yield
 
 
 def _quote(*_args, **_kwargs) -> Quote:

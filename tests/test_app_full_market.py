@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
@@ -23,6 +24,12 @@ MOCK_RANKINGS = {
         {"mksc_shrn_iscd": "005930", "hts_kor_isnm": "삼성전자", "prdy_ctrt": "2.0"},
     ],
 }
+
+
+@pytest.fixture(autouse=True)
+def regular_market_session():
+    with patch("scanner.sessions.market_session", return_value="KR_REGULAR"):
+        yield
 
 
 def test_quote_survives_orderbook_endpoint_failure():
@@ -110,7 +117,7 @@ def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():
 
 
 def test_card_trade_status_separates_buy_wait_and_downward_candidates():
-    from app import card_trade_status, visible_trade_cards
+    from app import card_ready_for_display, card_trade_status, visible_trade_cards
 
     plan = _plan()
     plan.diagnostics.update({
@@ -118,18 +125,21 @@ def test_card_trade_status_separates_buy_wait_and_downward_candidates():
         "long_price_path_confirmed": True,
         "has_downward_forecast": False,
     })
-    item = {"plan": plan, "chart_aligned": True}
+    item = {"quote": _quote(), "plan": plan, "chart_aligned": True}
     assert card_trade_status(item) == "매수 조건 충족"
+    assert card_ready_for_display(item) is True
 
     plan.signal = Signal.WAIT
     assert card_trade_status(item) == "눌림목 대기"
+    assert card_ready_for_display(item) is True
 
     plan.diagnostics["has_downward_forecast"] = True
     assert card_trade_status(item) == "하방 제외"
     assert visible_trade_cards([item], 10) == []
 
-    item["candidate_source"] = "관심 종목 직접 검색"
-    assert visible_trade_cards([item], 10) == [item]
+    plan.diagnostics["has_downward_forecast"] = False
+    plan.diagnostics["forecast_path_ready"] = False
+    assert card_ready_for_display(item) is False
 
 
 def test_missing_kis_credentials_shows_safe_waiting_screen_without_buttons():
@@ -142,6 +152,18 @@ def test_missing_kis_credentials_shows_safe_waiting_screen_without_buttons():
     assert not app.exception
     assert not app.button
     assert any("한국투자증권 연결을 기다리고 있습니다" in str(item.value) for item in app.markdown)
+
+
+def test_closed_korean_session_hides_stale_candidate_cards():
+    st.cache_resource.clear()
+    st.cache_data.clear()
+    with patch("scanner.sessions.market_session", return_value="KR_CLOSED"):
+        app = AppTest.from_file(APP_PATH)
+        app.run(timeout=30)
+
+    assert not app.exception
+    assert any("국내 정규장이 종료되었습니다" in str(item.value) for item in app.info)
+    assert not any("추천 매수가" == metric.label for metric in app.metric)
 
 
 def _quote_for_symbol(symbol, market, *_args, **_kwargs) -> Quote:

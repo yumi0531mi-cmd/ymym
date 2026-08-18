@@ -38,6 +38,7 @@ MAX_FAST_SHORTLIST = 15
 KR_PRICE_CEILING = 300_000.0
 US_PRICE_CEILING = 200.0
 KR_SEARCH_INDEX_PATH = Path("data/kr_stock_index.json")
+ACTIVE_CARD_SESSIONS = {"KR_REGULAR", "US_DAY", "US_PRE", "US_REGULAR", "US_AFTER"}
 
 st.set_page_config(
     page_title="상승·반복단타 혼합 스캐너",
@@ -740,12 +741,26 @@ def card_trade_status(item: dict[str, Any]) -> str:
     return "관찰"
 
 
+def card_ready_for_display(item: dict[str, Any]) -> bool:
+    """Show automatic cards only after the complete short-horizon reference set exists."""
+    quote = item.get("quote")
+    if not isinstance(quote, Quote) or quote.session not in ACTIVE_CARD_SESSIONS:
+        return False
+    if not bool(item.get("chart_aligned")):
+        return False
+    plan = item["plan"]
+    diagnostics = plan.diagnostics
+    if not bool(diagnostics.get("forecast_path_ready")):
+        return False
+    if bool(diagnostics.get("has_downward_forecast")):
+        return False
+    levels = actionable_display_levels(plan, quote)
+    return bool(levels.get("available")) and card_trade_status(item) in {"매수 조건 충족", "눌림목 대기"}
+
+
 def visible_trade_cards(items: list[dict[str, Any]], display_limit: int = MAX_LIVE_CARDS) -> list[dict[str, Any]]:
-    """Hide automatic blocked/downward cards while preserving direct searches."""
-    visible = [item for item in items if card_trade_status(item) != "하방 제외"]
-    for item in items:
-        if item.get("candidate_source") == "관심 종목 직접 검색" and item not in visible:
-            visible.append(item)
+    """Keep the dashboard free of incomplete, stale, downward, or blocked cards."""
+    visible = [item for item in items if card_ready_for_display(item)]
     visible.sort(key=mixed_card_priority, reverse=True)
     return visible[:max(1, min(int(display_limit), 10))]
 
@@ -945,7 +960,10 @@ with st.sidebar:
     refresh_seconds = int(st.radio("현재가 화면 갱신", [1, 3, 5], horizontal=True, format_func=lambda value: f"{value}초"))
     candidate_card_count = MAX_LIVE_CARDS
     st.caption("시장 후보 100개 → 빠른 선별 15개 → 정밀 분석·실시간 체결 5개")
-    if client.ready:
+    sidebar_session = market_session(market)
+    if sidebar_session not in ACTIVE_CARD_SESSIONS:
+        st.info("현재 거래 시간이 아닙니다")
+    elif client.ready:
         st.success("실시간 후보 자동 분석 중")
     else:
         st.warning("한국투자증권 연결 대기 중")
@@ -991,7 +1009,15 @@ if search_query:
             direct_request = {"symbol": ticker, "name": ticker, "exchange": us_exchange_for(ticker)}
         else:
             st.warning("미국 종목은 티커로 입력해 주세요. 예: NVDA, AAPL, SOXL")
-if not kis_connected:
+current_session = market_session(market)
+if current_session not in ACTIVE_CARD_SESSIONS:
+    closed_message = (
+        "국내 정규장이 종료되었습니다. 다음 정규장에는 분석이 완료된 후보 카드만 표시합니다."
+        if market == Market.KR
+        else "현재는 지원하는 미국 거래 세션이 아닙니다. 주간·프리·정규·애프터 시간에 분석 카드가 표시됩니다."
+    )
+    st.info(closed_message)
+elif not kis_connected:
     st.markdown("<div class='connection wait'>한국투자증권 연결을 기다리고 있습니다. 실제 가격과 매매 레벨은 연결된 데이터가 있을 때만 표시합니다.</div>", unsafe_allow_html=True)
     st.info("연결 확인 — " + " · ".join(f"{name}: {value}" for name, value in client.connection_diagnostics.items()))
 else:
