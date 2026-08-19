@@ -357,7 +357,7 @@ def test_boundary_capture_failure_is_saved_as_data_missing_not_forecast_miss(tmp
     assert store.pending_forecast_audits("US") == []
 
 
-def test_elapsed_boundary_window_is_marked_data_missing_immediately(tmp_path):
+def test_elapsed_boundary_window_remains_due_for_one_rest_fallback_attempt(tmp_path):
     case = ValidationCase(
         case_id="US-window", version="test", symbol="WINDOW", market="US", session="US_PRE",
         signal_time="2026-08-18T10:00:00", signal="대기", quote_price=100.0,
@@ -369,10 +369,11 @@ def test_elapsed_boundary_window_is_marked_data_missing_immediately(tmp_path):
     store = ValidationStore(tmp_path)
     store.save(case)
 
-    assert store.due_forecast_audits("US", datetime(2026, 8, 18, 10, 6, 16), version="test") == []
+    due = store.due_forecast_audits("US", datetime(2026, 8, 18, 10, 6, 16), version="test")
+    assert [item.symbol for item in due] == ["WINDOW"]
     stored = store.cases()[0]
-    assert stored.data_completeness == "DATA_MISSING"
-    assert stored.capture_failures["5"]["reason"].startswith("경계 수집 창")
+    assert stored.data_completeness == "PENDING"
+    assert stored.capture_failures == {}
 
 
 def test_save_once_rejects_same_symbol_audit_even_if_a_fast_rerun_changes_regime(tmp_path):

@@ -535,11 +535,10 @@ class ValidationStore:
         for case in self.pending_forecast_audits(market, version=version, limit=100, batch_id=batch_id):
             overdue = self.overdue_horizon_minutes(case, observed_at, grace_seconds)
             if overdue:
-                case.mark_data_missing(
-                    overdue, observed_at,
-                    "경계 수집 창(±75초) 경과: WebSocket·REST 실제가 미수집",
-                )
-                self.update(case)
+                # Let the caller make one final REST fallback attempt and persist
+                # its result before classifying an elapsed boundary as missing.
+                # Marking it here silently skipped the promised fallback path.
+                due.append(case)
                 continue
             if self.due_horizon_minutes(case, observed_at, grace_seconds):
                 due.append(case)

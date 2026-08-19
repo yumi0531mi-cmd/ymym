@@ -265,6 +265,7 @@ def test_boundary_rest_fallback_failure_marks_data_missing_and_releases_reservat
     store = SimpleNamespace(
         due_forecast_audits=Mock(return_value=[case]),
         due_horizon_minutes=Mock(return_value=[5]),
+        overdue_horizon_minutes=Mock(return_value=[]),
         update=Mock(),
     )
     budget = SimpleNamespace(release=Mock())
@@ -291,7 +292,11 @@ def test_boundary_capture_uses_rest_fallback_when_websocket_tick_is_stale():
         symbol="005930", exchange="", signal_time="2026-08-19T10:00:00",
         horizons=[SimpleNamespace(minutes=5)],
     )
-    store = SimpleNamespace(capture_rest_snapshot_and_score=Mock())
+    store = SimpleNamespace(
+        capture_rest_snapshot_and_score=Mock(),
+        overdue_horizon_minutes=Mock(return_value=[]),
+        due_horizon_minutes=Mock(return_value=[5]),
+    )
     budget = SimpleNamespace(release=Mock())
     client = SimpleNamespace(request_budget=budget)
     stale_tick = RealtimeTick("005930", Market.KR, 69900, 1.2, datetime(2026, 8, 19, 10, 3, 0))
@@ -311,6 +316,38 @@ def test_boundary_capture_uses_rest_fallback_when_websocket_tick_is_stale():
         "005930", "KR", observed_at, 70000, "KIS REST", "6.15-complete-timeframe-history"
     )
     budget.release.assert_not_called()
+
+
+def test_elapsed_boundary_attempts_rest_before_marking_data_missing():
+    from app import capture_forecast_boundary_case
+
+    observed_at = datetime(2026, 8, 19, 10, 6, 20)
+    case = Mock(symbol="005930", exchange="")
+    store = SimpleNamespace(
+        overdue_horizon_minutes=Mock(return_value=[5]),
+        due_horizon_minutes=Mock(return_value=[]),
+        update=Mock(),
+        capture_rest_snapshot_and_score=Mock(),
+    )
+    budget = SimpleNamespace(release=Mock())
+    client = SimpleNamespace(request_budget=budget)
+    rest_quote = _quote()
+    rest_quote.timestamp = observed_at
+
+    with (
+        patch("app.display_tick", return_value=None),
+        patch("app.current_client", return_value=client),
+        patch("app._load_quote_record", return_value={"symbol": "005930"}) as load_quote,
+        patch("app._quote_from_cache_record", return_value=rest_quote),
+    ):
+        capture_forecast_boundary_case(store, Market.KR, case, observed_at)
+
+    load_quote.assert_called_once_with("005930", "KR", "", "경계 수집")
+    case.mark_data_missing.assert_called_once()
+    assert "REST fallback 1회 실행" in case.mark_data_missing.call_args.args[2]
+    store.capture_rest_snapshot_and_score.assert_not_called()
+    store.update.assert_called_once_with(case)
+    budget.release.assert_called_once_with("경계 수집", 1)
 
 
 def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():

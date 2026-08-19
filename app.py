@@ -1238,8 +1238,11 @@ def tick_matches_due_forecast_boundary(case: Any, tick_at: datetime, observed_at
 
 def capture_forecast_boundary_case(store: ValidationStore, market: Market, case: Any, observed_at: datetime) -> None:
     """Capture one due boundary as a fresh WebSocket tick, one REST fallback, or DATA_MISSING."""
+    overdue_minutes = store.overdue_horizon_minutes(case, observed_at)
+    due_minutes = store.due_horizon_minutes(case, observed_at)
+    capture_minutes = overdue_minutes or due_minutes
     tick = display_tick(market, case.symbol)
-    if tick is not None and tick_matches_due_forecast_boundary(case, tick.timestamp, observed_at):
+    if not overdue_minutes and tick is not None and tick_matches_due_forecast_boundary(case, tick.timestamp, observed_at):
         store.capture_rest_snapshot_and_score(
             case.symbol, market.value, tick.timestamp, tick.price, "KIS 체결", APP_VERSION
         )
@@ -1250,11 +1253,22 @@ def capture_forecast_boundary_case(store: ValidationStore, market: Market, case:
             _load_quote_record(case.symbol, market.value, case.exchange, "경계 수집")
         )
     except (KISError, OSError, ValueError, KeyError) as exc:
-        due_minutes = store.due_horizon_minutes(case, observed_at)
-        if due_minutes:
-            case.mark_data_missing(due_minutes, observed_at, f"REST fallback 실패: {type(exc).__name__}: {str(exc)[:180]}")
+        if capture_minutes:
+            case.mark_data_missing(capture_minutes, observed_at, f"REST fallback 실패: {type(exc).__name__}: {str(exc)[:180]}")
             store.update(case)
-            current_client().request_budget.release("경계 수집", len(due_minutes))
+            current_client().request_budget.release("경계 수집", len(capture_minutes))
+        return
+    if overdue_minutes:
+        # A newly fetched quote outside the published ±75-second window cannot be
+        # substituted for the historical boundary.  The attempt is nevertheless
+        # recorded so a late fragment is not misreported as an untried fallback.
+        case.mark_data_missing(
+            overdue_minutes,
+            observed_at,
+            f"경계 수집 창(±75초) 경과 후 REST fallback 1회 실행: KIS 시세 시각 {quote.timestamp.isoformat()}는 경계 실제가로 사용 불가",
+        )
+        store.update(case)
+        current_client().request_budget.release("경계 수집", len(overdue_minutes))
         return
     store.capture_rest_snapshot_and_score(
         case.symbol, market.value, quote.timestamp, quote.price, "KIS REST", APP_VERSION
