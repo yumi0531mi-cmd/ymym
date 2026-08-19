@@ -38,7 +38,7 @@ def test_us_intraday_uses_exchange_date_not_today(tmp_path):
     responses = [({"output2": [
         {"xymd": "20260814", "xhms": "093000", "open": "10", "high": "11", "low": "9", "last": "10.5", "evol": "100"},
         {"xymd": "20260814", "xhms": "093100", "open": "10.5", "high": "11", "low": "10", "last": "10.8", "evol": "120"},
-    ]}, "")]
+    ]}, ""), ({"output2": []}, "")]
     client._get_page = lambda *args, **kwargs: responses.pop(0)  # type: ignore[method-assign]
     bars = client.intraday("TEST", Market.US, "NAS")
     assert len(bars) == 2
@@ -72,8 +72,8 @@ def test_us_intraday_uses_daytime_exchange_code_only_in_us_day(monkeypatch):
 def test_us_intraday_collects_continuation_pages_for_high_timeframe_warmup(tmp_path):
     client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
     pages = [
-        (["100100", "100000"], "M"),
-        (["095900", "095800"], "F"),
+        (["100100", "100000"], ""),
+        (["095900", "095800"], ""),
         (["095700", "095600"], ""),
     ]
     calls = []
@@ -90,7 +90,7 @@ def test_us_intraday_collects_continuation_pages_for_high_timeframe_warmup(tmp_p
     bars = client.intraday("TEST", Market.US, "NAS")
 
     assert len(bars) == 6
-    assert [call[3] for call in calls] == ["", "N", "N"]
+    assert [call[3] for call in calls] == ["", "", ""]
     assert calls[0][2]["NEXT"] == "" and calls[0][2]["KEYB"] == ""
     assert calls[1][2]["NEXT"] == "1" and calls[1][2]["KEYB"] == "20260819095900"
     assert calls[2][2]["KEYB"] == "20260819095700"

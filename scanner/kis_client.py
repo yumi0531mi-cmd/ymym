@@ -544,7 +544,7 @@ class KISClient:
                     raise
                 page_rows = [row for row in list(payload.get("output2") or []) if isinstance(row, dict)]
                 rows.extend(page_rows)
-                if next_marker not in {"M", "F"} or not page_rows:
+                if not page_rows:
                     break
                 keys: list[datetime] = []
                 for row in page_rows:
@@ -564,7 +564,11 @@ class KISClient:
                     "NEXT": "1",
                     "KEYB": (min(keys) - timedelta(minutes=1)).strftime("%Y%m%d%H%M%S"),
                 }
-                continuation = "N"
+                # The documented continuation key is sufficient for this endpoint.
+                # KIS sometimes omits tr_cont even while older minute rows remain;
+                # preserve its header when provided but do not let an empty header
+                # silently collapse the 30-minute indicator history to one page.
+                continuation = "N" if next_marker in {"M", "F"} else ""
             mapping = {"date": "xymd", "time": "xhms", "open": "open", "high": "high", "low": "low", "close": "last", "volume": "evol"}
 
         records = []
