@@ -374,7 +374,6 @@ class ValidationStore:
                 new_time = datetime.fromisoformat(case.signal_time)
                 same_event = (
                     row.get("version") == case.version
-                    and row.get("predicted_regime") == case.predicted_regime
                     and row.get("validation_kind", "ACTIONABLE") == case.validation_kind
                 )
                 if same_event and abs((new_time - old_time).total_seconds()) < cooldown_seconds:

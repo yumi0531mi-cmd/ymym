@@ -336,6 +336,31 @@ def test_elapsed_boundary_window_is_marked_data_missing_immediately(tmp_path):
     assert stored.capture_failures["5"]["reason"].startswith("경계 수집 창")
 
 
+def test_save_once_rejects_same_symbol_audit_even_if_a_fast_rerun_changes_regime(tmp_path):
+    store = ValidationStore(tmp_path)
+    first = ValidationCase(
+        case_id="US-DUPE-first", version="dedupe", symbol="DUPE", market="US", session="US_PRE",
+        signal_time="2026-08-19T12:30:00", signal="대기", quote_price=100.0,
+        latest_trade_price=100.0, quote_age_seconds=0.0, quote_pass=True, entry=None,
+        predicted_regime="박스", actual_regime=None, regime_pass=None, target=None, target_basis="",
+        stop=None, validation_kind="FORECAST_AUDIT",
+    )
+    rerun = ValidationCase(
+        case_id="US-DUPE-rerun", version="dedupe", symbol="DUPE", market="US", session="US_PRE",
+        signal_time="2026-08-19T12:30:30", signal="대기", quote_price=100.0,
+        latest_trade_price=100.0, quote_age_seconds=0.0, quote_pass=True, entry=None,
+        predicted_regime="상승", actual_regime=None, regime_pass=None, target=None, target_basis="",
+        stop=None, validation_kind="FORECAST_AUDIT",
+    )
+
+    _, first_saved = store.save_once(first, cooldown_seconds=300)
+    _, rerun_saved = store.save_once(rerun, cooldown_seconds=300)
+
+    assert first_saved is True
+    assert rerun_saved is False
+    assert len(store.cases()) == 1
+
+
 def test_due_forecast_audits_selects_only_a_missing_horizon_boundary(tmp_path):
     case = ValidationCase(
         case_id="US-due", version="test", symbol="DUE", market="US", session="US_PRE",
