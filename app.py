@@ -1667,6 +1667,10 @@ if search_query:
         else:
             st.warning("미국 종목은 티커로 입력해 주세요. 예: NVDA, AAPL, SOXL")
 current_session = market_session(market)
+# Start the lightweight 15-second boundary collector before any rank/quote/bar
+# analysis. Its fragment then continues independently while the main screen
+# performs slower candidate work.
+capture_pending_forecast_paths(store, market.value)
 if current_session not in ACTIVE_CARD_SESSIONS:
     closed_message = (
         "국내 정규장이 종료되었습니다. 다음 정규장에는 분석이 완료된 후보 카드만 표시합니다."
@@ -1746,8 +1750,6 @@ realtime_hub.configure(
 
 if analysis_cards:
     run_hidden_forecast_validation(analysis_cards, float(cost_pct), int(min_score), store)
-
-capture_pending_forecast_paths(store, market.value)
 
 if candidates and event_store.configured:
     run_free_validation_batch(market.value, candidates, float(cost_pct), int(min_score), store)
