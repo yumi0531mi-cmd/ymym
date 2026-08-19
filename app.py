@@ -1592,7 +1592,8 @@ store = ValidationStore(VALIDATION_ROOT, event_store=event_store)
 
 with st.sidebar:
     st.title("실시간 설정")
-    initial_market_label = default_market_label()
+    requested_market = str(st.query_params.get("market", "")).strip().upper()
+    initial_market_label = "미국" if requested_market in {"US", "미국"} else default_market_label()
     market_label = st.radio(
         "시장",
         ["국내", "미국"],
