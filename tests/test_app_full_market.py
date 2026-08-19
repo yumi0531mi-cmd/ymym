@@ -403,6 +403,22 @@ def test_candidate_stage_summary_reports_observation_reason_counts():
     assert summary["reasons"]["손익비 부족"] == 1
 
 
+def test_observation_card_exposes_actual_rr_blocker_and_stays_visible():
+    from app import observation_diagnostic, visible_observation_cards
+
+    plan = _plan()
+    plan.signal = Signal.WAIT
+    plan.diagnostics["reward_risk_net"] = 0.8
+    plan.diagnostics["final_buy_gates"] = {"비용 반영 손익비": False}
+    item = {"quote": _quote(), "plan": plan, "chart_aligned": True}
+
+    diagnostic = observation_diagnostic(item)
+
+    assert diagnostic["stage"] == "RR_FAIL"
+    assert "0.80" in diagnostic["actual"]
+    assert visible_observation_cards([item]) == [item]
+
+
 def test_missing_kis_credentials_shows_safe_waiting_screen_without_buttons():
     st.cache_resource.clear()
     st.cache_data.clear()

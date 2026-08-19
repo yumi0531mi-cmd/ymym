@@ -968,6 +968,46 @@ def observation_reason(item: dict[str, Any]) -> str:
     return "재진입 구간 대기"
 
 
+def observation_diagnostic(item: dict[str, Any]) -> dict[str, str]:
+    """Expose the first blocking gate with observed values; never treat data wait as score zero."""
+    quote = item.get("quote")
+    plan = item["plan"]
+    diagnostics = plan.diagnostics
+    quality = diagnostics.get("data_quality") or {}
+    levels = actionable_display_levels(plan, quote) if isinstance(quote, Quote) else {"available": False}
+    gates = diagnostics.get("final_buy_gates") or {}
+    if not bool(item.get("chart_aligned")) or not bool(diagnostics.get("forecast_path_ready")):
+        completed = quality.get("completed_minute_bars", diagnostics.get("completed_bars", 0))
+        return {
+            "stage": "MINUTE_DATA_WAIT",
+            "reason": "KIS 완료 1분봉·방향 경로 재수신 대기",
+            "actual": f"완료 1분봉 {completed}개 · 경로 준비 {bool(diagnostics.get('forecast_path_ready'))}",
+            "required": "5·15·30분 방향 경로와 구조 가격대",
+        }
+    if plan.risk_state in {"REAL_BREAKDOWN", "HARD_EXIT"}:
+        return {"stage": "RISK_BLOCK", "reason": plan.risk_state, "actual": f"위험 상태 {plan.risk_state}", "required": "NORMAL_PULLBACK 또는 NORMAL_SWING"}
+    if bool(diagnostics.get("has_downward_forecast")):
+        return {"stage": "STRUCTURE_DOWN", "reason": "15·30분 구조 하방", "actual": compact_directions(plan), "required": "TREND는 15·30분 상승, RANGE는 상승·박스"}
+    if not bool(levels.get("available")):
+        return {"stage": "PRICE_LEVEL_WAIT", "reason": "구조 가격대 재확인", "actual": "매수가·1차 목표·손절 중 일부 미확인", "required": "손절 < 매수가 < 1차 목표"}
+    try:
+        rr = float(diagnostics.get("reward_risk_net"))
+        if rr < MIN_NET_REWARD_RISK:
+            return {"stage": "RR_FAIL", "reason": "비용 반영 손익비 부족", "actual": f"손익비 {rr:.2f}", "required": f"손익비 {MIN_NET_REWARD_RISK:.2f} 이상"}
+    except (TypeError, ValueError):
+        pass
+    point_5 = forecast_point_for(plan, 5)
+    if point_5 is not None and point_5.direction in {Regime.DOWN, Regime.RANGE}:
+        return {"stage": "ENTRY_TIMING_WAIT", "reason": observation_reason(item), "actual": f"5분 {regime_text(point_5.direction)}", "required": "5분 반전·VWAP/EMA 재확인"}
+    failed_gates = [str(label) for label, passed in gates.items() if not bool(passed)]
+    return {
+        "stage": "FINAL_GATE_WAIT",
+        "reason": observation_reason(item),
+        "actual": f"신호점수 {plan.score} · {', '.join(failed_gates[:2]) or '진입 재확인'}",
+        "required": "표시된 FINAL_BUY 관문 충족",
+    }
+
+
 def candidate_stage_summary(items: list[dict[str, Any]], candidate_pool: int) -> dict[str, Any]:
     """Summarize funnel counts and prioritized observation reasons without fabricated data."""
     reason_counts: dict[str, int] = {}
@@ -1050,6 +1090,14 @@ def visible_target1_wait_cards(items: list[dict[str, Any]], display_limit: int =
     waits = [item for item in items if card_stage(item) == "TARGET1_WAIT"]
     waits.sort(key=mixed_card_priority, reverse=True)
     return waits[:limit]
+
+
+def visible_observation_cards(items: list[dict[str, Any]], display_limit: int = MAX_LIVE_CARDS) -> list[dict[str, Any]]:
+    """Keep analyzed non-entry candidates visible instead of hiding a 5→0 funnel."""
+    limit = max(1, min(int(display_limit), MAX_LIVE_CARDS))
+    observations = [item for item in items if card_stage(item) == "OBSERVATION"]
+    observations.sort(key=mixed_card_priority, reverse=True)
+    return observations[:limit]
 
 
 def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
@@ -1296,6 +1344,10 @@ def render_live_card(
             st.warning(f"1차 목표 가능 · 눌림 진입 대기 · {trigger}")
         elif stage == "TARGET1_WAIT":
             st.info("1차 목표 도달 가능 · 현재 추격 진입은 대기하고 표시 재매수가까지 되돌림을 확인")
+        elif stage == "OBSERVATION":
+            diagnostic = observation_diagnostic(item)
+            st.warning(f"관찰 · {diagnostic['stage']} · {diagnostic['reason']}")
+            st.caption(f"현재 계산: {diagnostic['actual']} · 요구 기준: {diagnostic['required']}")
         else:
             st.success("현재 1회 진입 조건 통과 · 1차·2차 목표가와 손절가를 함께 확인")
         trade_type = str(item["plan"].diagnostics.get("trade_type") or "구조 분석 중")
@@ -1539,14 +1591,16 @@ if cards:
     cards = visible_trade_cards(all_analyzed_cards, candidate_card_count)
     pullback_cards = visible_pullback_cards(all_analyzed_cards, candidate_card_count)
     target1_wait_cards = visible_target1_wait_cards(all_analyzed_cards, candidate_card_count)
+    observation_cards = visible_observation_cards(all_analyzed_cards, candidate_card_count)
     entry_wait_cards = list({id(card): card for card in [*pullback_cards, *target1_wait_cards]}.values())
-    analysis_cards = list({id(card): card for card in [*cards, *entry_wait_cards]}.values())
+    analysis_cards = list({id(card): card for card in [*cards, *entry_wait_cards, *observation_cards]}.values())
     stage_summary = candidate_stage_summary(all_analyzed_cards, len(candidates))
 else:
     analysis_cards = []
     pullback_cards = []
     target1_wait_cards = []
     entry_wait_cards = []
+    observation_cards = []
     stage_summary = candidate_stage_summary([], len(candidates))
 
 realtime_hub.configure(
@@ -1596,6 +1650,12 @@ if entry_wait_cards:
     for card_item in entry_wait_cards:
         render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, card_stage(card_item))
 
+if observation_cards:
+    st.subheader(f"정밀 분석 · 관찰 후보 {len(observation_cards)}종목")
+    st.caption("현재 진입 카드는 아니지만, 각 종목의 실제 차단 관문·계산값·요구 기준을 바로 확인합니다.")
+    for card_item in observation_cards:
+        render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "OBSERVATION")
+
 with st.expander("검증·관찰 상세", expanded=False):
     render_latest_forecast_result(store)
     if stage_summary["funnel"]:
@@ -1608,9 +1668,6 @@ with st.expander("검증·관찰 상세", expanded=False):
         if reason_rows:
             st.subheader(f"관찰 후보 · {stage_summary['stages']['OBSERVATION']}종목")
             st.dataframe(pd.DataFrame(reason_rows), hide_index=True, width="stretch")
-            rows = observation_rows(all_analyzed_cards)
-            if rows:
-                st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 for error in errors:
     st.warning(f"일부 후보는 분석 데이터를 만들지 못했습니다: {error}")
