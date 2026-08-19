@@ -906,6 +906,78 @@ class ValidationStore:
             })
         return summary
 
+    def versioned_direction_engine_outcomes(self, version: str, market: str | None = None) -> list[dict[str, Any]]:
+        """Aggregate immutable direction-engine inputs by prediction and realised direction.
+
+        This is an audit-only view: it never recalculates a past signal from later
+        bars, allowing repeated misclassification to be distinguished from a single
+        noisy outcome before modifying an engine.
+        """
+        rows = [
+            row for row in self.load_all()
+            if row.get("version") == version
+            and row.get("validation_kind") == "FORECAST_AUDIT"
+            and row.get("data_completeness") == "COMPLETE"
+            and (market is None or row.get("market") == market)
+        ]
+
+        def actual_direction(origin: float, actual: float) -> str:
+            if actual > origin * 1.0005:
+                return Regime.UP.value
+            if actual < origin * 0.9995:
+                return Regime.DOWN.value
+            return Regime.RANGE.value
+
+        buckets: dict[tuple[int, str, str, str], list[dict[str, Any]]] = {}
+        for row in rows:
+            snapshot = row.get("analysis_snapshot") or {}
+            engines = snapshot.get("direction_engines") or {}
+            try:
+                origin = float(row.get("quote_price"))
+            except (TypeError, ValueError):
+                continue
+            if origin <= 0 or not isinstance(engines, dict):
+                continue
+            for point in row.get("horizons", []):
+                try:
+                    minutes = int(point.get("minutes"))
+                    actual = float(point.get("actual"))
+                except (TypeError, ValueError):
+                    continue
+                engine = engines.get(str(minutes))
+                if not isinstance(engine, dict) or engine.get("input_ready") is not True:
+                    continue
+                predicted = str(point.get("predicted_direction") or "미기록")
+                realised = actual_direction(origin, actual)
+                state = str(engine.get("state") or "미기록")
+                buckets.setdefault((minutes, state, predicted, realised), []).append(engine)
+
+        def average(engines: list[dict[str, Any]], key: str, nested: str | None = None) -> float | None:
+            values: list[float] = []
+            for engine in engines:
+                value = (engine.get(nested) or {}).get(key) if nested else engine.get(key)
+                if isinstance(value, (int, float)):
+                    values.append(float(value))
+            return round(float(pd.Series(values).mean()), 4) if values else None
+
+        result: list[dict[str, Any]] = []
+        for (minutes, state, predicted, realised), engines in sorted(buckets.items(), key=lambda item: item[0]):
+            result.append({
+                "구간": f"{minutes}분",
+                "엔진 상태": state,
+                "예측 방향": predicted,
+                "실제 방향": realised,
+                "완료": len(engines),
+                "평균 점수": average(engines, "score"),
+                "구조": average(engines, "structure", "components"),
+                "추세": average(engines, "trend", "components"),
+                "수급": average(engines, "flow", "components"),
+                "모멘텀": average(engines, "momentum", "components"),
+                "평균 예상 이동%": average(engines, "expected_move_pct"),
+                "평균 완료봉": average(engines, "completed_timeframe_bars"),
+            })
+        return result
+
     def versioned_repeated_failure_insight(self, version: str, market: str | None = None) -> dict[str, Any] | None:
         """Return the lowest 30-minute direction-rate group with at least two observations."""
         candidates = [

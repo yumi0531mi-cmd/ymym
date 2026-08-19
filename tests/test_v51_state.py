@@ -284,6 +284,33 @@ def test_versioned_input_diagnostics_summary_keeps_fixed_horizon_history(tmp_pat
     assert summary[2]["엔진 상태 분포"] == "TRANSITION 2"
 
 
+def test_versioned_direction_engine_outcomes_uses_only_fixed_ready_snapshots(tmp_path):
+    rows = [{
+        "version": "sample", "market": "US", "validation_kind": "FORECAST_AUDIT", "data_completeness": "COMPLETE",
+        "quote_price": 100.0,
+        "horizons": [{"minutes": 5, "predicted_direction": "UP", "actual": 99.0}],
+        "analysis_snapshot": {"direction_engines": {"5": {
+            "input_ready": True, "state": "TREND", "score": 0.4, "completed_timeframe_bars": 25,
+            "expected_move_pct": 0.8, "components": {"structure": 0.65, "trend": 0.4, "flow": 0.2, "momentum": 0.1},
+        }}},
+    }, {
+        "version": "sample", "market": "US", "validation_kind": "FORECAST_AUDIT", "data_completeness": "COMPLETE",
+        "quote_price": 100.0,
+        "horizons": [{"minutes": 5, "predicted_direction": "UP", "actual": 101.0}],
+        "analysis_snapshot": {"direction_engines": {"5": {"input_ready": False, "state": "TRANSITION"}}},
+    }]
+    store = ValidationStore(tmp_path)
+    store.load_all = lambda: rows  # type: ignore[method-assign]
+
+    summary = store.versioned_direction_engine_outcomes("sample", "US")
+
+    assert summary == [{
+        "구간": "5분", "엔진 상태": "TREND", "예측 방향": "UP", "실제 방향": Regime.DOWN.value,
+        "완료": 1, "평균 점수": 0.4, "구조": 0.65, "추세": 0.4, "수급": 0.2,
+        "모멘텀": 0.1, "평균 예상 이동%": 0.8, "평균 완료봉": 25.0,
+    }]
+
+
 def test_rest_snapshot_store_scores_mature_forecast_audit_once(tmp_path):
     case = ValidationCase(
         case_id="US-TEST-audit", version="test", symbol="TEST", market="US", session="US_PRE",
