@@ -1298,6 +1298,12 @@ def render_live_card(
             st.info("1차 목표 도달 가능 · 현재 추격 진입은 대기하고 표시 재매수가까지 되돌림을 확인")
         else:
             st.success("현재 1회 진입 조건 통과 · 1차·2차 목표가와 손절가를 함께 확인")
+        trade_type = str(item["plan"].diagnostics.get("trade_type") or "구조 분석 중")
+        evidence = item["plan"].diagnostics.get("final_buy_evidence") or []
+        confidence = item["plan"].diagnostics.get("evidence_confidence_pct")
+        evidence_text = " · ".join(str(value) for value in evidence[:3])
+        confidence_text = f" · 증거 신뢰도 {float(confidence):.0f}%" if isinstance(confidence, (int, float)) else ""
+        st.caption(f"매매유형: {trade_type}{confidence_text}" + (f" · {evidence_text}" if evidence_text else ""))
         render_realtime_price(
             refresh_seconds,
             quote.symbol,

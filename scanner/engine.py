@@ -60,6 +60,68 @@ def _round_trip_cost_pct(market: Market) -> float:
     return 0.05 if market == Market.KR else 0.10
 
 
+def _classify_trade_type(
+    *,
+    market_state: str,
+    trend_strategy: bool,
+    range_strategy: bool,
+    point_5: object | None,
+    point_15: object | None,
+    point_30: object | None,
+    pullback_wait: bool,
+    repeat_swing_available: bool,
+    hard_block: bool,
+) -> str:
+    """Select one current chart behaviour; repeated swing is evidence, not a universal gate."""
+    directions = [getattr(point, "direction", None) for point in (point_5, point_15, point_30)]
+    if hard_block or any(direction == Regime.DOWN for direction in directions[1:]):
+        return "구조 하방 회피"
+    if pullback_wait:
+        return "눌림 후 상승 대기"
+    if market_state == "BREAKOUT" and all(direction == Regime.UP for direction in directions):
+        return "돌파 추세"
+    if trend_strategy and all(direction == Regime.UP for direction in directions):
+        return "상승 추세 보유"
+    if range_strategy and directions[0] == Regime.UP:
+        return "반복단타 가능" if repeat_swing_available else "박스 하단 반등"
+    if trend_strategy:
+        return "단발 상승 기회"
+    return "관찰 대기"
+
+
+def _final_buy_evidence(
+    *,
+    points: list[object],
+    target1: float | None,
+    entry: float,
+    hard_stop: float,
+    reward_risk: float | None,
+    structure_confirmed: bool,
+    persistence_score_value: int | None,
+    repeat_swing_available: bool,
+) -> tuple[list[str], float | None]:
+    """Return compact, auditable evidence shared by all mixed trade types."""
+    directions = " / ".join(
+        f"{getattr(point, 'minutes', '?')}분 {getattr(getattr(point, 'direction', None), 'value', '미확인')}"
+        for point in points
+    )
+    confidences = [float(value) for point in points if isinstance((value := getattr(point, "direction_confidence_pct", None)), (int, float))]
+    evidence = [directions]
+    if structure_confirmed:
+        evidence.append("15·30분 구조 확인")
+    if target1 is not None and entry > 0:
+        evidence.append(f"1차 목표 여유 {(float(target1) / entry - 1) * 100:+.2f}%")
+    if hard_stop > 0 and entry > hard_stop:
+        evidence.append(f"손절거리 {(entry / hard_stop - 1) * 100:.2f}%")
+    if reward_risk is not None:
+        evidence.append(f"비용 반영 손익비 {reward_risk:.2f}")
+    if repeat_swing_available:
+        evidence.append("반복 Swing 확인")
+    structural_confidence = float(persistence_score_value or 0)
+    confidence = (sum(confidences) / len(confidences) * 0.60 + structural_confidence * 0.40) if confidences else None
+    return evidence[:5], round(confidence, 1) if confidence is not None else None
+
+
 def _plan(
     quote: Quote,
     now: datetime,
@@ -376,7 +438,10 @@ def analyze(
         calibration_probability=calibration_probability,
         calibration_samples=calibration_samples,
         calibration_expectancy_pct=calibration_expectancy_pct,
-        require_repeat_swing=is_range_strategy,
+        # Confirmed repeated swing remains a valuable clue for re-entry, but a
+        # one-time trend, breakout, pullback or box rebound must not be rejected
+        # solely because the same pattern has not repeated three times yet.
+        require_repeat_swing=False,
         minimum_persistence_score=55 if is_trend_strategy else 70,
     )
     gates = dict(decision.gates)
@@ -421,6 +486,23 @@ def analyze(
         reasons.append(f"전체 경로 검증 누적 중: 동일 조건 실측 표본 {calibration_samples}건 / {MIN_COMPLETE_PATH_SAMPLES}건")
     hard_block = regime == Regime.DOWN or not session_ok or risk.state in {"REAL_BREAKDOWN", "HARD_EXIT"} or hard_kill
     signal = Signal.BLOCK if hard_block else Signal.BUY if final_buy else Signal.WAIT
+    repeat_swing_available = bool(
+        persistence.swing.valid_count >= 3
+        and persistence.swing.representative_width_pct
+        and 0.5 <= persistence.swing.representative_width_pct <= 5.0
+    )
+    hard_block = regime == Regime.DOWN or not session_ok or risk.state in {"REAL_BREAKDOWN", "HARD_EXIT"} or hard_kill
+    trade_type = _classify_trade_type(
+        market_state=str(forecast_engine_diagnostics.get("market_state", "TRANSITION")),
+        trend_strategy=is_trend_strategy, range_strategy=is_range_strategy,
+        point_5=point_5, point_15=point_15, point_30=point_30,
+        pullback_wait=pullback_reentry_wait, repeat_swing_available=repeat_swing_available, hard_block=hard_block,
+    )
+    final_buy_evidence, evidence_confidence = _final_buy_evidence(
+        points=list(forecast_points), target1=target1, entry=entry, hard_stop=displayed_stop,
+        reward_risk=reward_risk, structure_confirmed=long_price_path_confirmed,
+        persistence_score_value=persistence.score, repeat_swing_available=repeat_swing_available,
+    )
     diagnostics: dict[str, object] = {
         "timeframes": {minutes: state.regime.value for minutes, state in states.items()},
         "final_buy_gates": gates,
@@ -453,11 +535,7 @@ def analyze(
             "entry_timing_confirmed": strategy_entry_timing_confirmed,
             "pullback_reentry_wait": pullback_reentry_wait,
             "repeat_swing_required_for_entry": is_range_strategy,
-            "repeat_swing_available": bool(
-                persistence.swing.valid_count >= 3
-                and persistence.swing.representative_width_pct
-                and 0.5 <= persistence.swing.representative_width_pct <= 5.0
-            ),
+            "repeat_swing_available": repeat_swing_available,
             "reentry_trigger": (
                 "VWAP·EMA9 재회복 뒤 5분 반전 확인" if trend_pullback_reentry_wait
                 else "박스 하단 지지 재확인 뒤 5분 반전 확인" if range_pullback_reentry_wait
@@ -478,6 +556,9 @@ def analyze(
         "five_hour_data_ready": persistence.horizon_state == "OBSERVED_300",
         "remaining_session_minutes": remaining,
         "completed_bar_at": str(completed.index[-1]),
+        "trade_type": trade_type,
+        "final_buy_evidence": final_buy_evidence,
+        "evidence_confidence_pct": evidence_confidence,
         "strategy_ensemble": ensemble.to_dict(),
         "data_quality": {
             "status": "READY" if data_verified and len(completed) >= 60 else "LIMITED",

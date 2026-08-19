@@ -3,7 +3,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-from scanner.engine import analyze
+from scanner.engine import _classify_trade_type, analyze
 from scanner.forecast import apply_risk_persistence_to_forecast, cap_downside_forecast_path, cap_upside_forecast_path, forecast_path
 from scanner.indicators import enrich, resample
 from scanner.models import Market, Quote, Regime, Signal
@@ -91,6 +91,16 @@ def test_upside_forecast_without_resistance_still_stops_at_five_percent_total_pa
 
     assert capped[-1].base == 105.0
     assert capped[-1].high == 105.0
+
+
+def test_mixed_trade_type_uses_repeated_swing_as_evidence_not_universal_entry_gate():
+    up = ForecastPoint(5, 100.0, 101.0, 102.0, Regime.UP)
+    assert _classify_trade_type(
+        market_state="TREND", trend_strategy=True, range_strategy=False,
+        point_5=up, point_15=ForecastPoint(15, 100, 102, 103, Regime.UP),
+        point_30=ForecastPoint(30, 100, 103, 104, Regime.UP),
+        pullback_wait=False, repeat_swing_available=False, hard_block=False,
+    ) == "상승 추세 보유"
 
 
 def test_downside_forecast_is_snapped_to_confirmed_support_and_keeps_confidence():
