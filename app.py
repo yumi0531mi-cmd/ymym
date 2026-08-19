@@ -1435,6 +1435,10 @@ def render_versioned_forecast_trace(store: ValidationStore, market_value: str, v
     if confusion:
         st.caption("시간대별 예측 방향 ↔ 실제 방향 혼동 행렬")
         st.dataframe(pd.DataFrame(confusion), hide_index=True, use_container_width=True)
+    diagnostics = store.versioned_input_diagnostics_summary(version, market_value)
+    if diagnostics:
+        st.caption("신호 시점 시간축별 입력 진단 · 완료 고차 봉 수와 엔진 준비 상태")
+        st.dataframe(pd.DataFrame(diagnostics), hide_index=True, use_container_width=True)
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 

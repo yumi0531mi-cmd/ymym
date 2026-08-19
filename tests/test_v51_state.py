@@ -254,6 +254,36 @@ def test_versioned_forecast_breakdown_groups_only_matching_completed_forecasts(t
     assert any(row["예측 방향"] == "UP" and row["실제 방향"] == Regime.UP.value for row in confusion)
 
 
+def test_versioned_input_diagnostics_summary_keeps_fixed_horizon_history(tmp_path):
+    rows = [
+        {
+            "version": "sample", "market": "US", "validation_kind": "FORECAST_AUDIT", "data_completeness": "COMPLETE",
+            "analysis_snapshot": {"direction_engines": {
+                "5": {"completed_timeframe_bars": 23, "input_ready": True, "state": "RANGE"},
+                "15": {"completed_timeframe_bars": 7, "input_ready": True, "state": "TRANSITION"},
+                "30": {"completed_timeframe_bars": 3, "input_ready": True, "state": "TRANSITION"},
+            }},
+        },
+        {
+            "version": "sample", "market": "US", "validation_kind": "FORECAST_AUDIT", "data_completeness": "COMPLETE",
+            "analysis_snapshot": {"direction_engines": {
+                "5": {"completed_timeframe_bars": 24, "input_ready": True, "state": "RANGE"},
+                "15": {"completed_timeframe_bars": 8, "input_ready": True, "state": "RANGE"},
+                "30": {"completed_timeframe_bars": 4, "input_ready": True, "state": "TRANSITION"},
+            }},
+        },
+    ]
+    store = ValidationStore(tmp_path)
+    store.load_all = lambda: rows  # type: ignore[method-assign]
+
+    summary = store.versioned_input_diagnostics_summary("sample", "US")
+
+    assert summary[0]["입력 준비"] == "2/2"
+    assert summary[1]["완료 고차 봉 중앙"] == 7.5
+    assert summary[2]["완료 고차 봉 최소"] == 3
+    assert summary[2]["엔진 상태 분포"] == "TRANSITION 2"
+
+
 def test_rest_snapshot_store_scores_mature_forecast_audit_once(tmp_path):
     case = ValidationCase(
         case_id="US-TEST-audit", version="test", symbol="TEST", market="US", session="US_PRE",

@@ -870,6 +870,43 @@ class ValidationStore:
             for (minutes, predicted, actual), count in sorted(counts.items(), key=lambda item: item[0])
         ]
 
+    def versioned_input_diagnostics_summary(self, version: str, market: str | None = None) -> list[dict[str, Any]]:
+        """Summarize immutable per-horizon input readiness before changing an engine."""
+        rows = [
+            row for row in self.load_all()
+            if row.get("version") == version
+            and row.get("validation_kind") == "FORECAST_AUDIT"
+            and row.get("data_completeness") == "COMPLETE"
+            and (market is None or row.get("market") == market)
+        ]
+        summary: list[dict[str, Any]] = []
+        for minutes in (5, 15, 30):
+            engines = [
+                (row.get("analysis_snapshot") or {}).get("direction_engines", {}).get(str(minutes), {})
+                for row in rows
+            ]
+            usable = [engine for engine in engines if isinstance(engine, dict)]
+            counts = [
+                int(engine["completed_timeframe_bars"])
+                for engine in usable
+                if isinstance(engine.get("completed_timeframe_bars"), (int, float))
+            ]
+            ready = sum(engine.get("input_ready") is True for engine in usable)
+            states: dict[str, int] = {}
+            for engine in usable:
+                state = str(engine.get("state") or "미기록")
+                states[state] = states.get(state, 0) + 1
+            summary.append({
+                "구간": f"{minutes}분",
+                "진단 저장": len(usable),
+                "입력 준비": f"{ready}/{len(usable)}" if usable else "0/0",
+                "완료 고차 봉 최소": min(counts) if counts else None,
+                "완료 고차 봉 중앙": float(pd.Series(counts).median()) if counts else None,
+                "완료 고차 봉 최대": max(counts) if counts else None,
+                "엔진 상태 분포": ", ".join(f"{state} {count}" for state, count in sorted(states.items())) or "미기록",
+            })
+        return summary
+
     def versioned_repeated_failure_insight(self, version: str, market: str | None = None) -> dict[str, Any] | None:
         """Return the lowest 30-minute direction-rate group with at least two observations."""
         candidates = [
