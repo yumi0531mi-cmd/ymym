@@ -1886,12 +1886,14 @@ elif audit_only:
 elif candidates:
     st.caption("100개 예측 검증은 영구 저장 연결이 필요합니다. 현재는 앱 재시작 시 기록이 사라질 수 있어 시작하지 않습니다.")
 
+if audit_only:
+    render_versioned_forecast_trace(store, market.value, audit_version)
+    st.stop()
+
 render_pending_forecast_progress(store, market.value)
 render_data_missing_forecast_cases(store, market.value)
 render_versioned_forecast_summary(store, market.value)
 render_versioned_failure_breakdown(store, market.value)
-if audit_version:
-    render_versioned_forecast_trace(store, market.value, audit_version)
 
 if cards:
     updated_at = max(card["quote"].timestamp for card in cards)
