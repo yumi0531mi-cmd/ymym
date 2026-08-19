@@ -8,7 +8,7 @@ from scanner.forecast import (
     apply_risk_persistence_to_forecast, cap_downside_forecast_path, cap_upside_forecast_path,
     constrain_unconfirmed_range_thirty_minute_upside, forecast_path,
 )
-from scanner.indicators import enrich, resample
+from scanner.indicators import enrich, resample, resample_completed
 from scanner.models import Market, Quote, Regime, Signal
 from scanner.models import ForecastPoint
 from scanner.persistence import EventStore, ManualTrade
@@ -439,6 +439,16 @@ def test_forecast_path_keeps_horizon_specific_direction_engine_details():
     assert engines["15"]["input_timeframe_minutes"] == 15
     assert engines["30"]["input_timeframe_minutes"] == 30
     assert engines["5"]["last_completed_timeframe_bar_at"] < str(bars(100).index[-1])
+
+
+def test_completed_resample_excludes_partial_higher_timeframe_bar():
+    frame = bars(100)
+
+    completed = resample_completed(frame, 5)
+
+    assert not completed.empty
+    assert completed.index[-1] < frame.index[-1]
+    assert completed.index[-1] == pd.Timestamp("2026-01-02 10:35:00")
 
 
 def test_engine_exposes_data_quality_direction_engines_and_target_reachability():
