@@ -4,7 +4,10 @@ import numpy as np
 import pandas as pd
 
 from scanner.engine import _classify_trade_type, analyze
-from scanner.forecast import apply_risk_persistence_to_forecast, cap_downside_forecast_path, cap_upside_forecast_path, forecast_path
+from scanner.forecast import (
+    apply_risk_persistence_to_forecast, cap_downside_forecast_path, cap_upside_forecast_path,
+    constrain_unconfirmed_range_thirty_minute_upside, forecast_path,
+)
 from scanner.indicators import enrich, resample
 from scanner.models import Market, Quote, Regime, Signal
 from scanner.models import ForecastPoint
@@ -112,6 +115,22 @@ def test_downside_forecast_is_snapped_to_confirmed_support_and_keeps_confidence(
     assert snapped[-1].low >= 95.0
     assert snapped[-1].direction_confidence_pct == 67.0
     assert snapped[-1].structure_level == 95.0
+
+
+def test_range_bottom_rebound_does_not_keep_thirty_minute_up_without_continuation_evidence():
+    raw = [ForecastPoint(minutes, 99.0, 101.0, 102.0, Regime.UP, "range rebound") for minutes in (5, 15, 30)]
+    latest = pd.Series({
+        "close": 100.0, "vwap": 101.0, "ema9": 100.0, "ema20": 101.0,
+        "ema9_slope": -0.01, "regression_slope": -0.01, "rvol": 0.9, "notional_rvol": 0.9,
+    })
+
+    constrained = constrain_unconfirmed_range_thirty_minute_upside(raw, latest, 100.0)
+
+    assert constrained[0].direction == Regime.UP
+    assert constrained[1].direction == Regime.UP
+    assert constrained[2].direction == Regime.RANGE
+    assert constrained[2].base == 100.0
+    assert "지속 증거 미확인" in constrained[2].basis
 
 
 def test_korean_limit_up_is_not_candidate():

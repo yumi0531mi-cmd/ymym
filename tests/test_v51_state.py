@@ -238,6 +238,7 @@ def test_versioned_forecast_breakdown_groups_only_matching_completed_forecasts(t
         "30분 방향 적중률": 50.0, "30분 평균 가격 오차": -0.1, "30분 평균 절대 오차": 0.30000000000000004,
     }]
     assert breakdown["매매 구조"][0]["구분"] == "TREND_SWING"
+    assert breakdown["매매 구조·30분 방향"][0]["구분"] == "TREND_SWING · 30분 미기록"
 
     insight = store.versioned_repeated_failure_insight("sample", "US")
     assert insight is not None

@@ -5,7 +5,10 @@ from datetime import datetime
 import pandas as pd
 
 from .calibration import MIN_COMPLETE_PATH_SAMPLES
-from .forecast import apply_risk_persistence_to_forecast, cap_downside_forecast_path, cap_upside_forecast_path, forecast_path
+from .forecast import (
+    apply_risk_persistence_to_forecast, cap_downside_forecast_path, cap_upside_forecast_path,
+    constrain_unconfirmed_range_thirty_minute_upside, forecast_path,
+)
 from .indicators import enrich
 from .models import Market, Quote, Regime, Signal, TradePlan
 from .persistence_engine import final_buy_decision, persistence_score, risk_state
@@ -258,6 +261,8 @@ def analyze(
     entry = entry or quote.price
     target1, target2, support, target1_basis, target2_basis, support_basis = trade_levels(df, entry, box)
     raw_forecast_points = forecast_path(completed, regime, reference_price=quote.price)
+    if regime == Regime.RANGE:
+        raw_forecast_points = constrain_unconfirmed_range_thirty_minute_upside(raw_forecast_points, latest, quote.price)
     forecast_engine_diagnostics = dict(getattr(raw_forecast_points, "diagnostics", {}))
     entry_resistance_1m, _, _, _ = confirmed_levels(df, entry)
     flags = fake_signal_flags(completed, support, entry_resistance_1m)

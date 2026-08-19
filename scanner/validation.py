@@ -734,10 +734,17 @@ class ValidationStore:
             except (TypeError, ValueError):
                 return "시간 미기록"
 
+        def direction_at(row: dict[str, Any], minutes: int) -> str:
+            for horizon in row.get("horizons", []):
+                if int(horizon.get("minutes", -1)) == minutes:
+                    return str(horizon.get("predicted_direction") or "미기록")
+            return "미기록"
+
         dimensions = {
             "예측 방향": lambda row: str(row.get("forecast_path_direction") or "MIXED"),
             "시장 상태": lambda row: str(row.get("predicted_regime") or "미분류"),
             "매매 구조": lambda row: str(row.get("strategy") or "미분류"),
+            "매매 구조·30분 방향": lambda row: f"{row.get('strategy') or '미분류'} · 30분 {direction_at(row, 30)}",
             "신호 시간": time_bucket,
         }
         result: dict[str, list[dict[str, Any]]] = {}
@@ -773,7 +780,11 @@ class ValidationStore:
             return None
         return min(
             candidates,
-            key=lambda row: (float(row["30분 방향 적중률"]), -int(row["완료"]), str(row["dimension"]), str(row["구분"])),
+            key=lambda row: (
+                float(row["30분 방향 적중률"]),
+                0 if row["dimension"] == "매매 구조·30분 방향" else 1,
+                -int(row["완료"]), str(row["dimension"]), str(row["구분"]),
+            ),
         )
 
     def summary(self) -> dict[str, Any]:

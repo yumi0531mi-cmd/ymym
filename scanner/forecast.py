@@ -194,6 +194,40 @@ def cap_downside_forecast_path(
     return result
 
 
+def constrain_unconfirmed_range_thirty_minute_upside(
+    points: list[ForecastPoint], latest: pd.Series, reference_price: float,
+) -> list[ForecastPoint]:
+    """Hold a range-bottom rebound at RANGE until its 30-minute continuation is evidenced."""
+    if reference_price <= 0:
+        return points
+    continuation_confirmed = bool(
+        float(latest.close) >= float(latest.vwap)
+        and float(latest.ema9) >= float(latest.ema20)
+        and (float(latest.ema9_slope) > 0 or float(latest.regression_slope) > 0)
+        and float(latest.rvol) >= 1.0
+        and float(latest.notional_rvol) >= 1.0
+    )
+    if continuation_confirmed:
+        return points
+    result: list[ForecastPoint] = []
+    for point in points:
+        if point.minutes != 30 or point.direction != Regime.UP:
+            result.append(point)
+            continue
+        band = max(abs(float(point.high) - float(point.low)) / 2.0, reference_price * 0.0005)
+        result.append(ForecastPoint(
+            point.minutes,
+            max(0.0, reference_price - band),
+            reference_price,
+            reference_price + band,
+            Regime.RANGE,
+            f"{point.basis} · RANGE 30분 지속 증거 미확인",
+            point.direction_confidence_pct,
+            point.structure_level,
+        ))
+    return result
+
+
 def apply_risk_persistence_to_forecast(
     points: list[ForecastPoint],
     reference_price: float,
