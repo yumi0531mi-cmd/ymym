@@ -453,6 +453,34 @@ class ValidationStore:
                 due.append(int(horizon.minutes))
         return due
 
+    @staticmethod
+    def overdue_horizon_minutes(case: ValidationCase, observed_at: datetime, grace_seconds: int = 75) -> list[int]:
+        """Return uncaptured boundaries whose admissible capture window has elapsed."""
+        now = pd.Timestamp(observed_at)
+        signal_at = pd.Timestamp(case.signal_time)
+        if now.tzinfo is None and signal_at.tzinfo is not None:
+            now = now.tz_localize(signal_at.tzinfo)
+        elif now.tzinfo is not None and signal_at.tzinfo is None:
+            now = now.tz_localize(None)
+        captured_times: list[pd.Timestamp] = []
+        for snapshot in case.price_snapshots:
+            try:
+                captured_at = pd.Timestamp(snapshot["timestamp"])
+                if captured_at.tzinfo is None and signal_at.tzinfo is not None:
+                    captured_at = captured_at.tz_localize(signal_at.tzinfo)
+                elif captured_at.tzinfo is not None and signal_at.tzinfo is None:
+                    captured_at = captured_at.tz_localize(None)
+                captured_times.append(captured_at)
+            except (KeyError, TypeError, ValueError):
+                continue
+        overdue: list[int] = []
+        for horizon in case.horizons:
+            cutoff = signal_at + pd.Timedelta(horizon.minutes, unit="min")
+            captured = any(abs((captured_at - cutoff).total_seconds()) <= grace_seconds for captured_at in captured_times)
+            if not captured and now > cutoff + pd.Timedelta(grace_seconds, unit="s"):
+                overdue.append(int(horizon.minutes))
+        return overdue
+
     def pending_forecast_audits(
         self, market: str, version: str | None = None, limit: int = 5, batch_id: str | None = None,
     ) -> list[ValidationCase]:
@@ -488,6 +516,14 @@ class ValidationStore:
         now = pd.Timestamp(observed_at)
         due: list[ValidationCase] = []
         for case in self.pending_forecast_audits(market, version=version, limit=100, batch_id=batch_id):
+            overdue = self.overdue_horizon_minutes(case, observed_at, grace_seconds)
+            if overdue:
+                case.mark_data_missing(
+                    overdue, observed_at,
+                    "경계 수집 창(±75초) 경과: WebSocket·REST 실제가 미수집",
+                )
+                self.update(case)
+                continue
             if self.due_horizon_minutes(case, observed_at, grace_seconds):
                 due.append(case)
         return due[:max(1, int(limit))]

@@ -249,6 +249,24 @@ def test_boundary_capture_failure_is_saved_as_data_missing_not_forecast_miss(tmp
     assert store.pending_forecast_audits("US") == []
 
 
+def test_elapsed_boundary_window_is_marked_data_missing_immediately(tmp_path):
+    case = ValidationCase(
+        case_id="US-window", version="test", symbol="WINDOW", market="US", session="US_PRE",
+        signal_time="2026-08-18T10:00:00", signal="대기", quote_price=100.0,
+        latest_trade_price=100.0, quote_age_seconds=0.0, quote_pass=True, entry=None,
+        predicted_regime="상승", actual_regime=None, regime_pass=None, target=None, target_basis="",
+        stop=None, validation_kind="FORECAST_AUDIT",
+        horizons=[HorizonResult(minutes, 100.5, 101.0, 101.5, "상승") for minutes in (5, 15, 30)],
+    )
+    store = ValidationStore(tmp_path)
+    store.save(case)
+
+    assert store.due_forecast_audits("US", datetime(2026, 8, 18, 10, 6, 16), version="test") == []
+    stored = store.cases()[0]
+    assert stored.data_completeness == "DATA_MISSING"
+    assert stored.capture_failures["5"]["reason"].startswith("경계 수집 창")
+
+
 def test_due_forecast_audits_selects_only_a_missing_horizon_boundary(tmp_path):
     case = ValidationCase(
         case_id="US-due", version="test", symbol="DUE", market="US", session="US_PRE",
