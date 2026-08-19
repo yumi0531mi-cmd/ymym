@@ -464,7 +464,7 @@ def test_connected_app_automatically_renders_live_candidate_card_without_user_se
     assert any("실시간 상승 차트 스캐너" in str(item.value) for item in app.markdown)
     assert any("005930" in str(item.value) for item in app.markdown)
     assert {metric.label for metric in app.metric} >= {"현재가", "추천 매수가", "추천 매도가 1차", "추천 매도가 2차", "손절가"}
-    assert {metric.label for metric in app.metric} >= {"5분 예상", "15분 예상", "30분 예상", "현재 차트 지지"}
+    assert {metric.label for metric in app.metric} >= {"5분 대표 예상", "15분 대표 예상", "30분 대표 예상", "현재 차트 지지"}
     assert any("정밀 분석 1개" in str(item.value) for item in app.caption)
 
 

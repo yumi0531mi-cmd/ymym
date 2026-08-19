@@ -25,6 +25,10 @@ class HorizonResult:
     range_pass: bool | None = None
     direction_pass: bool | None = None
     pass_all: bool | None = None
+    price_error_pct: float | None = None
+    representative_reached: bool | None = None
+    mfe_pct: float | None = None
+    mae_pct: float | None = None
 
 
 @dataclass
@@ -158,6 +162,7 @@ class ValidationCase:
             if actual is None:
                 continue
             horizon.range_pass = horizon.predicted_low <= actual <= horizon.predicted_high
+            horizon.price_error_pct = (actual / horizon.predicted_base - 1.0) * 100 if horizon.predicted_base > 0 else None
             actual_direction = (
                 Regime.UP.value if actual > origin * 1.0005
                 else Regime.DOWN.value if actual < origin * 0.9995
@@ -165,6 +170,11 @@ class ValidationCase:
             )
             horizon.direction_pass = actual_direction == horizon.predicted_direction
             horizon.pass_all = bool(horizon.range_pass and horizon.direction_pass)
+            horizon.representative_reached = (
+                actual >= horizon.predicted_base if horizon.predicted_direction == Regime.UP.value
+                else actual <= horizon.predicted_base if horizon.predicted_direction == Regime.DOWN.value
+                else horizon.predicted_low <= actual <= horizon.predicted_high
+            )
         self.full_path_pass = bool(self.horizons) and all(horizon.pass_all is True for horizon in self.horizons)
         self.data_completeness = "COMPLETE" if self.horizons and all(horizon.actual is not None for horizon in self.horizons) else "PARTIAL"
         if actual_regime is not None:
@@ -245,6 +255,11 @@ class ValidationCase:
             eligible = frame.loc[frame.index <= cutoff]
             if not eligible.empty:
                 actual_prices[horizon] = float(eligible.close.iloc[-1])
+                point = next((item for item in self.horizons if item.minutes == horizon), None)
+                if point is not None:
+                    horizon_origin = self.quote_price if self.validation_kind == "FORECAST_AUDIT" else origin
+                    point.mfe_pct = (float(eligible.high.max()) / horizon_origin - 1) * 100
+                    point.mae_pct = (float(eligible.low.min()) / horizon_origin - 1) * 100
 
         end = frame.loc[frame.index <= signal_at + pd.Timedelta(30, unit="min")]
         if end.empty:

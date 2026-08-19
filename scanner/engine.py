@@ -5,7 +5,7 @@ from datetime import datetime
 import pandas as pd
 
 from .calibration import MIN_COMPLETE_PATH_SAMPLES
-from .forecast import apply_risk_persistence_to_forecast, cap_upside_forecast_path, forecast_path
+from .forecast import apply_risk_persistence_to_forecast, cap_downside_forecast_path, cap_upside_forecast_path, forecast_path
 from .indicators import enrich
 from .models import Market, Quote, Regime, Signal, TradePlan
 from .persistence_engine import final_buy_decision, persistence_score, risk_state
@@ -235,6 +235,7 @@ def analyze(
     forecast_points = cap_upside_forecast_path(
         raw_forecast_points, quote.price, target1, target2, breakout_extension_confirmed
     )
+    forecast_points = cap_downside_forecast_path(forecast_points, quote.price, support)
     forecast_points = apply_risk_persistence_to_forecast(
         forecast_points,
         quote.price,

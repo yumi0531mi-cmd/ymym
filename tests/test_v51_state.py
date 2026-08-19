@@ -4,7 +4,7 @@ from datetime import datetime
 
 from scanner.calibration import calibration_for
 from scanner.cycle import CycleStore
-from scanner.models import Market
+from scanner.models import Market, Regime
 from scanner.persistence import EventStore
 from scanner.validation import HorizonResult, ValidationCase, ValidationStore
 
@@ -211,3 +211,20 @@ def test_due_forecast_audits_selects_only_a_missing_horizon_boundary(tmp_path):
     assert store.due_forecast_audits("US", datetime(2026, 8, 18, 10, 5, 30), version="test", batch_id="free-us-test") == []
     due = store.due_forecast_audits("US", datetime(2026, 8, 18, 10, 15, 20), version="test", batch_id="free-us-test")
     assert [item.symbol for item in due] == ["DUE"]
+
+
+def test_horizon_score_keeps_price_error_and_representative_reachability(tmp_path):
+    case = ValidationCase(
+        case_id="US-score", version="test", symbol="SCORE", market="US", session="US_PRE",
+        signal_time="2026-08-18T10:00:00", signal="대기", quote_price=100.0,
+        latest_trade_price=100.0, quote_age_seconds=0.0, quote_pass=True, entry=None,
+        predicted_regime="상승", actual_regime=None, regime_pass=None, target=None, target_basis="",
+        stop=None, validation_kind="FORECAST_AUDIT",
+        horizons=[HorizonResult(5, 100.0, 101.0, 102.0, "상승")],
+    )
+
+    case.score_path({5: 101.5}, Regime.UP)
+
+    result = case.horizons[0]
+    assert round(float(result.price_error_pct), 4) == round((101.5 / 101.0 - 1) * 100, 4)
+    assert result.representative_reached is True

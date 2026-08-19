@@ -60,6 +60,8 @@ class ForecastPoint:
     high: float
     direction: Regime
     basis: str = ""
+    direction_confidence_pct: float | None = None
+    structure_level: float | None = None
 
 
 @dataclass

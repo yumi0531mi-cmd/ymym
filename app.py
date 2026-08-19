@@ -1113,13 +1113,19 @@ def render_plan_fields(item: dict[str, Any]) -> None:
     forecast_columns = st.columns(3)
     for column, minutes in zip(forecast_columns, (5, 15, 30)):
         point = forecast_point_for(plan, minutes) if chart_aligned else None
-        column.metric(f"{minutes}분 예상", price_text(point.base if point else None))
+        column.metric(f"{minutes}분 대표 예상", price_text(point.base if point else None))
         direction = forecast_direction_text(point)
         if point is not None and point.direction == Regime.DOWN:
             direction = f"▼ {direction}"
         elif point is not None and point.direction == Regime.UP:
             direction = f"▲ {direction}"
-        column.caption(direction)
+        if point is not None:
+            range_text = f"범위 {price_text(point.low)} ~ {price_text(point.high)}"
+            confidence = getattr(point, "direction_confidence_pct", None)
+            confidence_text = f" · 방향 신뢰도 {confidence:.0f}%" if isinstance(confidence, (int, float)) else ""
+            column.caption(f"{direction} · {range_text}{confidence_text}")
+        else:
+            column.caption(direction)
     prices = st.columns(2)
     prices[0].metric(
         "추천 매수가",

@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from scanner.engine import analyze
-from scanner.forecast import apply_risk_persistence_to_forecast, cap_upside_forecast_path, forecast_path
+from scanner.forecast import apply_risk_persistence_to_forecast, cap_downside_forecast_path, cap_upside_forecast_path, forecast_path
 from scanner.indicators import enrich, resample
 from scanner.models import Market, Quote, Regime, Signal
 from scanner.models import ForecastPoint
@@ -91,6 +91,17 @@ def test_upside_forecast_without_resistance_still_stops_at_five_percent_total_pa
 
     assert capped[-1].base == 105.0
     assert capped[-1].high == 105.0
+
+
+def test_downside_forecast_is_snapped_to_confirmed_support_and_keeps_confidence():
+    raw = [ForecastPoint(minutes, 90.0, 92.0, 96.0, Regime.DOWN, "raw", 67.0) for minutes in (5, 15, 30)]
+
+    snapped = cap_downside_forecast_path(raw, 100.0, 95.0)
+
+    assert snapped[-1].base == 95.0
+    assert snapped[-1].low >= 95.0
+    assert snapped[-1].direction_confidence_pct == 67.0
+    assert snapped[-1].structure_level == 95.0
 
 
 def test_korean_limit_up_is_not_candidate():
