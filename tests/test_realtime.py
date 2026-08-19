@@ -135,7 +135,7 @@ def test_kis_realtime_resets_approval_on_subscription_auth_error():
 
 def test_kis_realtime_waits_longer_when_same_appkey_is_already_in_use():
     error = Exception("KIS 실시간 구독 실패: ALREADY IN USE appkey")
-    assert KISRealtimeHub.reconnect_delay_after_error(1.0, error) == 30.0
+    assert KISRealtimeHub.reconnect_delay_after_error(1.0, error) == 15 * 60.0
     assert KISRealtimeHub.reconnect_delay_after_error(1.0, Exception("KIS 실시간 접속키 발급 실패(HTTP 403)")) == 120.0
     assert KISRealtimeHub.reconnect_delay_after_error(2.0, Exception("network timeout")) == 2.0
 

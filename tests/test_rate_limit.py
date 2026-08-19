@@ -52,3 +52,29 @@ def test_retry_after_block_is_visible_without_spending_extra_budget():
 
     clock.now = 7.0
     assert budget.acquire() == 0.0
+
+
+def test_budget_snapshot_separates_usage_by_request_purpose():
+    clock = Clock()
+    budget = RequestBudget(minute_limit=5, five_hour_limit=10, clock=clock)
+
+    assert budget.acquire("후보검색") == 0.0
+    assert budget.acquire("분봉 조회") == 0.0
+    assert budget.acquire("분봉 조회") == 0.0
+
+    assert budget.snapshot().usage_by_purpose == {"분봉 조회": 2, "후보검색": 1}
+
+
+def test_reserved_boundary_capacity_blocks_other_calls_and_is_consumed_by_boundary():
+    clock = Clock()
+    budget = RequestBudget(minute_limit=3, five_hour_limit=4, clock=clock)
+
+    assert budget.acquire("후보검색") == 0.0
+    assert budget.reserve("경계 수집", 2, ttl_seconds=1800) is True
+    assert budget.snapshot().reserved_by_purpose == {"경계 수집": 2}
+    assert budget.can_spend(1) is True
+    assert budget.can_spend(2) is False
+    assert budget.acquire("카드 현재가") == 0.0
+    assert budget.acquire("카드 현재가") > 0.0
+    assert budget.acquire("경계 수집") == 0.0
+    assert budget.snapshot().reserved_by_purpose == {"경계 수집": 1}

@@ -101,7 +101,10 @@ class KISRealtimeHub:
         """Avoid hammering KIS while the same APPKEY is already used elsewhere."""
         message = str(error).upper()
         if "ALREADY IN USE" in message or "APPKEY" in message and "USE" in message:
-            return max(current_delay, 30.0)
+            # This process already has one hub.  A conflict therefore originates
+            # outside it; suppress repeated approval/subscription churn instead of
+            # competing for the same app key every minute.
+            return max(current_delay, 15 * 60.0)
         # An approval-key 403 cannot be cured by retrying every second.  Leave the
         # REST card path enough shared request budget and retry only periodically.
         if "HTTP 403" in message or "APPROVAL" in message and "403" in message:

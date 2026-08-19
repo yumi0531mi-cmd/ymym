@@ -212,7 +212,7 @@ def test_pending_forecast_audits_keep_oldest_five_across_card_rotation(tmp_path)
     assert [case.symbol for case in pending] == ["T0", "T1", "T2", "T3", "T4"]
 
 
-def test_late_first_rest_snapshot_expires_incomplete_audit_without_blocking_queue(tmp_path):
+def test_late_first_rest_snapshot_marks_data_missing_without_blocking_queue(tmp_path):
     case = ValidationCase(
         case_id="US-late", version="test", symbol="LATE", market="US", session="US_PRE",
         signal_time="2026-08-18T10:00:00", signal="대기", quote_price=100.0,
@@ -225,7 +225,27 @@ def test_late_first_rest_snapshot_expires_incomplete_audit_without_blocking_queu
     store.save(case)
 
     assert store.capture_rest_snapshot_and_score("LATE", "US", datetime(2026, 8, 18, 10, 32), 101.0) == 0
-    assert store.cases()[0].data_completeness == "EXPIRED"
+    assert store.cases()[0].data_completeness == "DATA_MISSING"
+    assert store.pending_forecast_audits("US") == []
+
+
+def test_boundary_capture_failure_is_saved_as_data_missing_not_forecast_miss(tmp_path):
+    case = ValidationCase(
+        case_id="US-missing", version="test", symbol="MISS", market="US", session="US_PRE",
+        signal_time="2026-08-18T10:00:00", signal="대기", quote_price=100.0,
+        latest_trade_price=100.0, quote_age_seconds=0.0, quote_pass=True, entry=None,
+        predicted_regime="상승", actual_regime=None, regime_pass=None, target=None, target_basis="",
+        stop=None, validation_kind="FORECAST_AUDIT",
+        horizons=[HorizonResult(minutes, 100.5, 101.0, 101.5, "상승") for minutes in (5, 15, 30)],
+    )
+    store = ValidationStore(tmp_path)
+    case.mark_data_missing([5, 15], datetime(2026, 8, 18, 10, 15), "KIS 호출 예산 보호 중")
+    store.save(case)
+
+    stored = store.cases()[0]
+    assert stored.data_completeness == "DATA_MISSING"
+    assert stored.full_path_pass is False
+    assert stored.capture_failures["5"]["reason"] == "KIS 호출 예산 보호 중"
     assert store.pending_forecast_audits("US") == []
 
 

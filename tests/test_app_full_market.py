@@ -249,6 +249,31 @@ def test_pending_forecast_progress_uses_persisted_snapshots_and_remaining_time()
     }]
 
 
+def test_boundary_rest_fallback_failure_marks_data_missing_and_releases_reservation():
+    from app import capture_forecast_boundary_case
+
+    case = Mock(symbol="005930", exchange="")
+    store = SimpleNamespace(
+        due_forecast_audits=Mock(return_value=[case]),
+        due_horizon_minutes=Mock(return_value=[5]),
+        update=Mock(),
+    )
+    budget = SimpleNamespace(release=Mock())
+    client = SimpleNamespace(request_budget=budget)
+
+    with (
+        patch("app.display_tick", return_value=None),
+        patch("app.current_client", return_value=client),
+        patch("app._load_quote_record", side_effect=KISError("KIS 호출 예산 보호 중")),
+    ):
+        capture_forecast_boundary_case(store, Market.KR, case, datetime(2026, 8, 19, 10, 5))
+
+    case.mark_data_missing.assert_called_once()
+    assert "REST fallback 실패" in case.mark_data_missing.call_args.args[2]
+    store.update.assert_called_once_with(case)
+    budget.release.assert_called_once_with("경계 수집", 1)
+
+
 def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():
     from app import actionable_display_levels
 

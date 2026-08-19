@@ -23,7 +23,7 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
-APP_VERSION = "6.6-holdout-calibration-validation"
+APP_VERSION = "6.7-boundary-capture-integrity"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
 CLIENT_CACHE_VERSION = "client-contract-v12-ranked-100-pages"
@@ -40,7 +40,10 @@ MAX_FAST_SHORTLIST = 15
 # 30건 호출 제한 안에서 운용한다.
 MAX_PENDING_FORECAST_WATCHES = 8
 FREE_VALIDATION_BATCH_SIZE = 100
-FREE_VALIDATION_STARTS_PER_MINUTE = 4
+FREE_VALIDATION_STARTS_PER_MINUTE = 1
+VALIDATION_ANALYSIS_CALL_ALLOWANCE = 4
+VALIDATION_BOUNDARY_RESERVATION_CALLS = 3
+VALIDATION_BOUNDARY_RESERVATION_TTL_SECONDS = 35 * 60
 MAX_DAILY_RISE_PCT = 12.0
 KR_PRICE_CEILING = 300_000.0
 US_PRICE_CEILING = 200.0
@@ -173,29 +176,30 @@ def _quote_from_cache_record(record: dict[str, object]) -> Quote:
     )
 
 
-@st.cache_data(ttl=12, show_spinner=False)
-def _load_quote_record(symbol: str, market_value: str, exchange: str) -> dict[str, object]:
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_quote_record(symbol: str, market_value: str, exchange: str, purpose: str = "카드 현재가") -> dict[str, object]:
     # KIS REST is the only fallback when the official WebSocket is unavailable.
-    # Five visible cards at this interval remain below the 30-call/minute ceiling.
-    quote = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).quote(
-        symbol, Market(market_value), exchange, include_orderbook=False
-    )
+    # REST is a degraded fallback only.  Five-minute reuse keeps five visible cards
+    # from starving scheduled 5·15·30-minute validation boundaries.
+    client = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint())
+    with client.request_scope(purpose):
+        quote = client.quote(symbol, Market(market_value), exchange, include_orderbook=False)
     return _quote_to_cache_record(quote)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def _load_orderbook(symbol: str, market_value: str, exchange: str) -> tuple[float | None, float | None]:
+def _load_orderbook(symbol: str, market_value: str, exchange: str, purpose: str = "카드 현재가") -> tuple[float | None, float | None]:
     # Execution safety is refreshed every 15 minutes; it is not falsely presented
     # as tick-by-tick orderbook data.
-    return get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).orderbook(
-        symbol, Market(market_value), exchange
-    )
+    client = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint())
+    with client.request_scope(purpose):
+        return client.orderbook(symbol, Market(market_value), exchange)
 
 
-def load_rest_dashboard_quote(symbol: str, market_value: str, exchange: str) -> Quote:
-    quote = _quote_from_cache_record(_load_quote_record(symbol, market_value, exchange))
+def load_rest_dashboard_quote(symbol: str, market_value: str, exchange: str, purpose: str = "카드 현재가") -> Quote:
+    quote = _quote_from_cache_record(_load_quote_record(symbol, market_value, exchange, purpose))
     try:
-        bid, ask = _load_orderbook(symbol, market_value, exchange)
+        bid, ask = _load_orderbook(symbol, market_value, exchange, purpose)
     except KISError:
         # Preserve price visibility when an entitlement/session-specific
         # orderbook endpoint is unavailable. Missing bid/ask safely keeps the
@@ -210,19 +214,19 @@ def load_rest_dashboard_quote(symbol: str, market_value: str, exchange: str) -> 
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def load_bars(symbol: str, market_value: str, exchange: str, cache_version: str) -> pd.DataFrame:
+def load_bars(symbol: str, market_value: str, exchange: str, cache_version: str, purpose: str = "분봉 조회") -> pd.DataFrame:
     # Historical completed bars seed the analysis. Live KIS trades are merged below
     # so the trailing structure does not wait for another REST refresh.
-    return get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).intraday(
-        symbol, Market(market_value), exchange
-    )
+    client = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint())
+    with client.request_scope(purpose):
+        return client.intraday(symbol, Market(market_value), exchange)
 
 
 def load_fresh_validation_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
     """Use current completed bars for the compact, rotating validation cohort only."""
-    return get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).intraday(
-        symbol, Market(market_value), exchange
-    )
+    client = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint())
+    with client.request_scope("분봉 조회"):
+        return client.intraday(symbol, Market(market_value), exchange)
 
 
 def merge_live_completed_bars(base: pd.DataFrame, symbol: str, market: Market) -> pd.DataFrame:
@@ -330,7 +334,8 @@ def load_dashboard_candidates(market_value: str, cache_version: str) -> list[dic
         # The v12 KIS client defaults to 100 rank rows. Calling without the
         # optional keyword also keeps a live Streamlit worker safe if it is
         # briefly finishing a rerun that still holds the prior method shape.
-        rankings = client.market_rankings(market)
+        with client.request_scope("후보검색"):
+            rankings = client.market_rankings(market)
         candidates = [candidate.to_dict() for candidate in merge_rankings(market, rankings, limit=MAX_CANDIDATE_LIST)]
         for candidate in candidates:
             candidate["candidate_source"] = "거래량 TOP100 ∪ 거래대금 TOP100"
@@ -356,7 +361,8 @@ def load_dashboard_candidates(market_value: str, cache_version: str) -> list[dic
         if market == Market.KR and is_kr_directional_product(item.name):
             continue
         try:
-            quote = client.quote(item.symbol, market, item.exchange, include_orderbook=False)
+            with client.request_scope("후보검색"):
+                quote = client.quote(item.symbol, market, item.exchange, include_orderbook=False)
         except KISError:
             continue
         fallback.append({
@@ -717,15 +723,15 @@ def record_forecast_accuracy_audit(
 
 def analyze_card(
     symbol: str, market: Market, exchange: str, cost_pct: float, min_score: int, store: ValidationStore,
-    validation_batch_id: str = "", fresh_validation_bars: bool = False,
+    validation_batch_id: str = "", fresh_validation_bars: bool = False, request_purpose: str = "카드 현재가",
 ) -> dict[str, Any]:
     """Fetch and analyze one automatic dashboard card from REST history plus live completed bars."""
-    rest_quote = load_rest_dashboard_quote(symbol, market.value, exchange)
+    rest_quote = load_rest_dashboard_quote(symbol, market.value, exchange, request_purpose)
     quote = quote_with_live_tick(rest_quote)
     base_bars = (
         load_fresh_validation_bars(symbol, market.value, exchange)
         if fresh_validation_bars
-        else load_bars(symbol, market.value, exchange, CLIENT_CACHE_VERSION)
+        else load_bars(symbol, market.value, exchange, CLIENT_CACHE_VERSION, "분봉 조회")
     )
     bars = merge_live_completed_bars(base_bars, symbol, market)
     chart_aligned, chart_alignment_reason = completed_bar_alignment(quote, bars)
@@ -782,7 +788,7 @@ def _render_realtime_price_content(symbol: str, market_value: str, exchange: str
         source = "KIS 체결"
     else:
         try:
-            rest_quote = _quote_from_cache_record(_load_quote_record(symbol, market.value, exchange))
+            rest_quote = _quote_from_cache_record(_load_quote_record(symbol, market.value, exchange, "카드 현재가"))
             price = rest_quote.price
             timestamp = rest_quote.timestamp
             source = "KIS REST 기준"
@@ -1107,7 +1113,7 @@ def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, st
     if display_tick(base_quote.market, base_quote.symbol) is None:
         try:
             quote = _quote_from_cache_record(
-                _load_quote_record(base_quote.symbol, base_quote.market.value, str(item.get("exchange") or ""))
+                _load_quote_record(base_quote.symbol, base_quote.market.value, str(item.get("exchange") or ""), "카드 현재가")
             )
         except (KISError, OSError, ValueError):
             pass
@@ -1200,26 +1206,40 @@ def run_hidden_forecast_validation(items: list[dict[str, Any]], cost_pct: float,
         live_card_snapshot(item, cost_pct, min_score, store)
 
 
+def capture_forecast_boundary_case(store: ValidationStore, market: Market, case: Any, observed_at: datetime) -> None:
+    """Capture one due boundary as WebSocket tick, one REST fallback, or DATA_MISSING."""
+    tick = display_tick(market, case.symbol)
+    if tick is not None:
+        store.capture_rest_snapshot_and_score(
+            case.symbol, market.value, tick.timestamp, tick.price, "KIS 체결", APP_VERSION
+        )
+        current_client().request_budget.release("경계 수집")
+        return
+    try:
+        quote = _quote_from_cache_record(
+            _load_quote_record(case.symbol, market.value, case.exchange, "경계 수집")
+        )
+    except (KISError, OSError, ValueError, KeyError) as exc:
+        due_minutes = store.due_horizon_minutes(case, observed_at)
+        if due_minutes:
+            case.mark_data_missing(due_minutes, observed_at, f"REST fallback 실패: {type(exc).__name__}: {str(exc)[:180]}")
+            store.update(case)
+            current_client().request_budget.release("경계 수집", len(due_minutes))
+        return
+    store.capture_rest_snapshot_and_score(
+        case.symbol, market.value, quote.timestamp, quote.price, "KIS REST", APP_VERSION
+    )
+
+
 @st.fragment(run_every=60.0)
 def capture_pending_forecast_paths(store: ValidationStore, market_value: str) -> None:
     """Capture only 5·15·30-minute boundaries due in this minute."""
     market = Market(market_value)
+    observed_at = datetime.now().astimezone()
     for case in store.due_forecast_audits(
-        market.value, datetime.now().astimezone(), version=APP_VERSION, limit=MAX_PENDING_FORECAST_WATCHES
+        market.value, observed_at, version=APP_VERSION, limit=MAX_PENDING_FORECAST_WATCHES
     ):
-        tick = display_tick(market, case.symbol)
-        if tick is not None:
-            store.capture_rest_snapshot_and_score(
-                case.symbol, market.value, tick.timestamp, tick.price, "KIS 체결", APP_VERSION
-            )
-            continue
-        try:
-            quote = _quote_from_cache_record(_load_quote_record(case.symbol, market.value, case.exchange))
-        except (KISError, OSError, ValueError, KeyError):
-            continue
-        store.capture_rest_snapshot_and_score(
-            case.symbol, market.value, quote.timestamp, quote.price, "KIS REST", APP_VERSION
-        )
+        capture_forecast_boundary_case(store, market, case, observed_at)
 
 
 def pending_forecast_progress_rows(
@@ -1284,6 +1304,29 @@ def render_pending_forecast_progress(store: ValidationStore, market_value: str) 
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 
+@st.fragment(run_every=60.0)
+def render_data_missing_forecast_cases(store: ValidationStore, market_value: str) -> None:
+    """Keep collection failures visible and separate from any prediction-performance table."""
+    rows: list[dict[str, str]] = []
+    for case in store.cases():
+        if (
+            case.market != market_value
+            or case.version != APP_VERSION
+            or case.validation_kind != "FORECAST_AUDIT"
+            or case.data_completeness != "DATA_MISSING"
+        ):
+            continue
+        reasons = "; ".join(
+            f"{minute}분 {detail.get('reason', '원인 미기록')}"
+            for minute, detail in sorted(case.capture_failures.items())
+            if isinstance(detail, dict)
+        )
+        rows.append({"종목": case.symbol, "신호 시각": case.signal_time[-8:], "수집 실패 원인": reasons or "수집 시각 경과"})
+    if rows:
+        st.caption(f"DATA_MISSING {len(rows)}건 · 성능 통계 제외")
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+
 def free_validation_batch_state(market: Market, candidates: list[dict[str, Any]]) -> dict[str, Any]:
     """Create one browser-open, persistent-session batch from the market candidate pool."""
     key = f"free_validation_batch_{market.value}"
@@ -1309,9 +1352,16 @@ def run_free_validation_batch(
     batch_candidates = candidates[:FREE_VALIDATION_BATCH_SIZE]
     start = int(state.get("next_index", 0))
     if start >= len(batch_candidates):
-        # Revisit a compact candidate pool with current bars if the first pass was
-        # waiting for completed 1-minute data instead of ending with zero records.
-        start = 0
+        cases = [
+            case for case in store.cases()
+            if case.validation_kind == "FORECAST_AUDIT" and case.batch_id == str(state["batch_id"])
+        ]
+        complete = sum(case.data_completeness == "COMPLETE" for case in cases)
+        st.caption(
+            f"수집 안정성 배치 시작 완료 · v{APP_VERSION} · 시작 {len(cases)}/{len(batch_candidates)} · "
+            f"30분 완료 {complete}/{len(batch_candidates)} · 같은 버전에서 새 표본을 반복 시작하지 않습니다."
+        )
+        return
     selected = batch_candidates[start:start + FREE_VALIDATION_STARTS_PER_MINUTE]
     started = 0
     deferred_reasons: dict[str, int] = {}
@@ -1320,15 +1370,23 @@ def run_free_validation_batch(
         if not symbol:
             continue
         exchange = str(candidate.get("exchange") or ("NAS" if market == Market.US else ""))
+        budget = current_client().request_budget
+        if not budget.can_spend(VALIDATION_ANALYSIS_CALL_ALLOWANCE):
+            deferred_reasons["신규 표본 분석 예산 대기"] = deferred_reasons.get("신규 표본 분석 예산 대기", 0) + 1
+            continue
+        if not budget.reserve("경계 수집", VALIDATION_BOUNDARY_RESERVATION_CALLS, VALIDATION_BOUNDARY_RESERVATION_TTL_SECONDS):
+            deferred_reasons["5·15·30분 경계 수집 예산 예약 대기"] = deferred_reasons.get("5·15·30분 경계 수집 예산 예약 대기", 0) + 1
+            continue
         try:
             before = len(store.pending_forecast_audits(market.value, version=APP_VERSION, limit=100, batch_id=str(state["batch_id"])))
             item = analyze_card(
                 symbol, market, exchange, cost_pct, min_score, store,
-                validation_batch_id=str(state["batch_id"]), fresh_validation_bars=True,
+                validation_batch_id=str(state["batch_id"]), fresh_validation_bars=True, request_purpose="신규 검증표본",
             )
             after = len(store.pending_forecast_audits(market.value, version=APP_VERSION, limit=100, batch_id=str(state["batch_id"])))
             started += int(after > before)
             if after == before:
+                budget.release("경계 수집", VALIDATION_BOUNDARY_RESERVATION_CALLS)
                 plan = item["plan"]
                 if not bool(plan.diagnostics.get("forecast_path_ready")):
                     reason = "5·15·30분 예측 경로 미완성"
@@ -1338,6 +1396,7 @@ def run_free_validation_batch(
                     reason = "같은 종목 예측 기록 대기"
                 deferred_reasons[reason] = deferred_reasons.get(reason, 0) + 1
         except (KISError, OSError, ValueError, KeyError):
+            budget.release("경계 수집", VALIDATION_BOUNDARY_RESERVATION_CALLS)
             deferred_reasons["KIS 분봉 재수신 대기"] = deferred_reasons.get("KIS 분봉 재수신 대기", 0) + 1
     state["next_index"] = min(len(batch_candidates), start + FREE_VALIDATION_STARTS_PER_MINUTE)
     st.session_state[f"free_validation_batch_{market.value}"] = state
@@ -1557,6 +1616,11 @@ with st.sidebar:
         st.caption(" · ".join(f"{name}: {value}" for name, value in client.connection_diagnostics.items()))
     budget = client.budget_status
     st.caption(f"호출 보호: 1분 {budget.minute_used}/{budget.minute_limit} · 5시간 {budget.five_hour_used}/{budget.five_hour_limit}")
+    purpose_order = ("후보검색", "신규 검증표본", "카드 현재가", "분봉 조회", "경계 수집", "WebSocket 승인/재연결")
+    usage_text = " · ".join(f"{purpose} {budget.usage_by_purpose.get(purpose, 0)}" for purpose in purpose_order)
+    reserved_text = " · ".join(f"{purpose} {count}" for purpose, count in budget.reserved_by_purpose.items()) or "없음"
+    st.caption(f"5시간 호출 유형별: {usage_text}")
+    st.caption(f"경계 수집 예약: {reserved_text}")
     st.caption(realtime_hub.status_label())
     if realtime_hub.last_error:
         st.caption(f"실시간 연결 원인: {realtime_hub.last_error[:160]}")
@@ -1564,7 +1628,7 @@ with st.sidebar:
         st.caption("검증 성과 저장: 영구 보관 연결됨")
     else:
         st.caption("검증 성과 저장: 앱 재시작 시 초기화될 수 있음 · [한 번만 설정하는 안내](https://github.com/yumi0531mi-cmd/ymym/blob/main/docs/supabase_persistent_validation_setup.md)")
-    st.caption(f"화면 현재가 {refresh_seconds}초 확인 · KIS WebSocket 체결 우선 · 미연결 시 REST 12초 안전 대체 · 완료봉 구조 1분")
+    st.caption(f"화면 현재가 {refresh_seconds}초 확인 · KIS WebSocket 체결 우선 · 미연결 시 REST 5분 안전 대체 · 완료봉 구조 1분")
 
 kis_connected = client.ready
 # KIS ticks are redrawn by each card's independent Streamlit fragment.  Do not
@@ -1625,7 +1689,7 @@ else:
                 symbol = str(candidate["symbol"])
                 exchange = str(candidate.get("exchange") or ("NAS" if market == Market.US else ""))
                 try:
-                    card = analyze_card(symbol, market, exchange, float(cost_pct), int(min_score), store)
+                    card = analyze_card(symbol, market, exchange, float(cost_pct), int(min_score), store, request_purpose="카드 현재가")
                     card["name"] = str(candidate.get("name") or symbol)
                     card["candidate_source"] = str(candidate.get("candidate_source") or "거래량 TOP100 ∪ 거래대금 TOP100")
                     cards.append(card)
@@ -1685,6 +1749,7 @@ elif candidates:
     st.caption("100개 예측 검증은 영구 저장 연결이 필요합니다. 현재는 앱 재시작 시 기록이 사라질 수 있어 시작하지 않습니다.")
 
 render_pending_forecast_progress(store, market.value)
+render_data_missing_forecast_cases(store, market.value)
 
 if cards:
     updated_at = max(card["quote"].timestamp for card in cards)

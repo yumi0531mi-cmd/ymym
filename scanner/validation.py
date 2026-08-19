@@ -83,6 +83,7 @@ class ValidationCase:
     forecast_path_direction: str = "MIXED"
     price_source: str = "KIS 체결"
     price_snapshots: list[dict[str, Any]] = field(default_factory=list)
+    capture_failures: dict[str, dict[str, str]] = field(default_factory=dict)
     exchange: str = ""
     batch_id: str = ""
 
@@ -242,6 +243,18 @@ class ValidationCase:
         )
         self.score_path(actual_prices, actual_regime)
         return self.data_completeness == "COMPLETE"
+
+    def mark_data_missing(self, minutes: list[int], observed_at: datetime, reason: str) -> None:
+        """Persist a boundary-capture failure without misclassifying it as a forecast miss."""
+        captured_at = observed_at.isoformat()
+        for minute in minutes:
+            self.capture_failures[str(int(minute))] = {
+                "timestamp": captured_at,
+                "reason": str(reason)[:240],
+            }
+        self.data_completeness = "DATA_MISSING"
+        self.full_path_pass = False
+        self.missing.append("실제 5·15·30분 경계 시세 수집 실패: " + ", ".join(f"{minute}분" for minute in minutes))
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -405,7 +418,40 @@ class ValidationStore:
         return result
 
     def pending(self, market: str | None = None) -> list[ValidationCase]:
-        return [case for case in self.cases() if case.full_path_pass is None and (market is None or case.market == market)]
+        return [
+            case for case in self.cases()
+            if case.full_path_pass is None
+            and case.data_completeness not in {"DATA_MISSING", "EXPIRED"}
+            and (market is None or case.market == market)
+        ]
+
+    @staticmethod
+    def due_horizon_minutes(case: ValidationCase, observed_at: datetime, grace_seconds: int = 75) -> list[int]:
+        """Return only uncaptured 5·15·30-minute boundaries due at ``observed_at``."""
+        now = pd.Timestamp(observed_at)
+        signal_at = pd.Timestamp(case.signal_time)
+        if now.tzinfo is None and signal_at.tzinfo is not None:
+            now = now.tz_localize(signal_at.tzinfo)
+        elif now.tzinfo is not None and signal_at.tzinfo is None:
+            now = now.tz_localize(None)
+        captured_times: list[pd.Timestamp] = []
+        for snapshot in case.price_snapshots:
+            try:
+                captured_at = pd.Timestamp(snapshot["timestamp"])
+                if captured_at.tzinfo is None and signal_at.tzinfo is not None:
+                    captured_at = captured_at.tz_localize(signal_at.tzinfo)
+                elif captured_at.tzinfo is not None and signal_at.tzinfo is None:
+                    captured_at = captured_at.tz_localize(None)
+                captured_times.append(captured_at)
+            except (KeyError, TypeError, ValueError):
+                continue
+        due: list[int] = []
+        for horizon in case.horizons:
+            cutoff = signal_at + pd.Timedelta(horizon.minutes, unit="min")
+            captured = any(abs((captured_at - cutoff).total_seconds()) <= grace_seconds for captured_at in captured_times)
+            if cutoff <= now <= cutoff + pd.Timedelta(grace_seconds, unit="s") and not captured:
+                due.append(int(horizon.minutes))
+        return due
 
     def pending_forecast_audits(
         self, market: str, version: str | None = None, limit: int = 5, batch_id: str | None = None,
@@ -442,30 +488,8 @@ class ValidationStore:
         now = pd.Timestamp(observed_at)
         due: list[ValidationCase] = []
         for case in self.pending_forecast_audits(market, version=version, limit=100, batch_id=batch_id):
-            signal_at = pd.Timestamp(case.signal_time)
-            comparable_now = now
-            if comparable_now.tzinfo is None and signal_at.tzinfo is not None:
-                comparable_now = comparable_now.tz_localize(signal_at.tzinfo)
-            elif comparable_now.tzinfo is not None and signal_at.tzinfo is None:
-                comparable_now = comparable_now.tz_localize(None)
-            snapshot_times = []
-            for snapshot in case.price_snapshots:
-                try:
-                    snapshot_at = pd.Timestamp(snapshot["timestamp"])
-                    if snapshot_at.tzinfo is None and signal_at.tzinfo is not None:
-                        snapshot_at = snapshot_at.tz_localize(signal_at.tzinfo)
-                    elif snapshot_at.tzinfo is not None and signal_at.tzinfo is None:
-                        snapshot_at = snapshot_at.tz_localize(None)
-                    snapshot_times.append(snapshot_at)
-                except (KeyError, TypeError, ValueError):
-                    continue
-            for horizon in case.horizons:
-                cutoff = signal_at + pd.Timedelta(horizon.minutes, unit="min")
-                within_due_window = cutoff <= comparable_now <= cutoff + pd.Timedelta(grace_seconds, unit="s")
-                already_captured = any(abs((snapshot_at - cutoff).total_seconds()) <= grace_seconds for snapshot_at in snapshot_times)
-                if within_due_window and not already_captured:
-                    due.append(case)
-                    break
+            if self.due_horizon_minutes(case, observed_at, grace_seconds):
+                due.append(case)
         return due[:max(1, int(limit))]
 
     def score_ready(self, symbol: str, market: str, bars: pd.DataFrame, cost_pct: float) -> int:
@@ -529,10 +553,16 @@ class ValidationStore:
             if comparable_observed >= signal_at + pd.Timedelta(30, unit="min") and case.score_price_snapshots():
                 scored += 1
             elif comparable_observed >= signal_at + pd.Timedelta(32, unit="min"):
-                # A late first snapshot cannot reconstruct the earlier 5/10/15-minute
-                # values. Close it as incomplete so it cannot block later candidates.
-                case.data_completeness = "EXPIRED"
-                case.full_path_pass = False
+                # A late snapshot cannot reconstruct earlier boundaries. Preserve the
+                # cause as DATA_MISSING instead of treating it as a forecast miss.
+                missing_minutes = [
+                    horizon.minutes for horizon in case.horizons
+                    if horizon.actual is None
+                ]
+                case.mark_data_missing(
+                    missing_minutes or [5, 15, 30], observed_at,
+                    "경계 시각 ±75초 안에 KIS 실제가를 확보하지 못함",
+                )
             self.update(case)
         return scored
 
@@ -593,6 +623,7 @@ class ValidationStore:
         return {
             "records": len(rows),
             "complete_paths": len(complete),
+            "data_missing_paths": sum(row.get("data_completeness") == "DATA_MISSING" for row in rows),
             "expired_paths": sum(row.get("data_completeness") == "EXPIRED" for row in rows),
             "strict_full_path_pass": len(strict_passes),
             "strict_full_path_rate": len(strict_passes) / len(complete) * 100 if complete else None,

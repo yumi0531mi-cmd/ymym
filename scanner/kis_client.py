@@ -5,6 +5,7 @@ import json
 import os
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -139,6 +140,7 @@ class KISClient:
         self.session = requests.Session()
         self.session.headers.update({"content-type": "application/json; charset=utf-8", "custtype": "P"})
         self._mutex = threading.Lock()
+        self._request_context = threading.local()
         self._last_call = 0.0
         self._blocked_until = 0.0
 
@@ -171,7 +173,8 @@ class KISClient:
         return self.request_budget.snapshot()
 
     def _wait_for_slot(self) -> None:
-        budget_wait = self.request_budget.acquire()
+        purpose = str(getattr(self._request_context, "purpose", "기타"))
+        budget_wait = self.request_budget.acquire(purpose)
         if budget_wait > 0:
             raise KISError(f"KIS 호출 예산 보호 중입니다. 최소 {budget_wait:.0f}초 뒤 다시 시도하세요.")
         with self._mutex:
@@ -180,6 +183,16 @@ class KISClient:
             if delay > 0:
                 time.sleep(delay)
             self._last_call = time.monotonic()
+
+    @contextmanager
+    def request_scope(self, purpose: str):
+        """Attribute every REST request in this thread to one user-visible workflow."""
+        previous = getattr(self._request_context, "purpose", "기타")
+        self._request_context.purpose = str(purpose)
+        try:
+            yield
+        finally:
+            self._request_context.purpose = previous
 
     def _request(self, method: str, path: str, *, headers: dict[str, str] | None = None,
                  params: dict[str, Any] | None = None, payload: dict[str, Any] | None = None) -> requests.Response:
@@ -222,15 +235,16 @@ class KISClient:
         """
         if not self.configured:
             raise KISError("KIS_APP_KEY/KIS_APP_SECRET이 없습니다.")
-        response = self._request(
-            "POST",
-            "/oauth2/Approval",
-            payload={
-                "grant_type": "client_credentials",
-                "appkey": self.app_key,
-                "secretkey": self.app_secret,
-            },
-        )
+        with self.request_scope("WebSocket 승인/재연결"):
+            response = self._request(
+                "POST",
+                "/oauth2/Approval",
+                payload={
+                    "grant_type": "client_credentials",
+                    "appkey": self.app_key,
+                    "secretkey": self.app_secret,
+                },
+            )
         if not response.ok:
             raise KISError(f"KIS 실시간 접속키 발급 실패(HTTP {response.status_code})")
         try:
