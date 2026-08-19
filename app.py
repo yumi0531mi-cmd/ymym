@@ -1388,6 +1388,26 @@ def render_versioned_forecast_summary(store: ValidationStore, market_value: str)
     )
 
 
+def render_versioned_failure_breakdown(store: ValidationStore, market_value: str) -> None:
+    """Expose repeated, fixed-version failure patterns before any calibration change."""
+    summary = store.versioned_validation_summary(APP_VERSION, market_value)
+    if int(summary["forecast"]["complete_paths"]) < 20:
+        return
+    st.subheader("1차 실패 원인 분해 · 동일 버전 완료 표본")
+    st.caption("표본 2건 이상인 반복 구간만 표시합니다. 단일 표본은 보정 근거로 사용하지 않습니다.")
+    for label, rows in store.versioned_forecast_breakdown(APP_VERSION, market_value).items():
+        visible = [row for row in rows if int(row["완료"]) >= 2]
+        if not visible:
+            continue
+        table = pd.DataFrame(visible)
+        for column in ("5분 방향 적중률", "15분 방향 적중률", "30분 방향 적중률"):
+            table[column] = table[column].map(lambda value: f"{value:.1f}%" if isinstance(value, (int, float)) else "—")
+        for column in ("30분 평균 가격 오차", "30분 평균 절대 오차"):
+            table[column] = table[column].map(lambda value: f"{value:+.3f}%" if isinstance(value, (int, float)) else "—")
+        st.caption(label)
+        st.dataframe(table, hide_index=True, use_container_width=True)
+
+
 def free_validation_batch_state(market: Market, candidates: list[dict[str, Any]]) -> dict[str, Any]:
     """Create one browser-open, persistent-session batch from the market candidate pool."""
     key = f"free_validation_batch_{market.value}"
@@ -1833,6 +1853,7 @@ elif candidates:
 render_pending_forecast_progress(store, market.value)
 render_data_missing_forecast_cases(store, market.value)
 render_versioned_forecast_summary(store, market.value)
+render_versioned_failure_breakdown(store, market.value)
 
 if cards:
     updated_at = max(card["quote"].timestamp for card in cards)

@@ -211,6 +211,35 @@ def test_versioned_forecast_summary_keeps_price_error_and_path_metrics_separate(
     }
 
 
+def test_versioned_forecast_breakdown_groups_only_matching_completed_forecasts(tmp_path):
+    rows = [
+        {
+            "version": "sample", "market": "US", "validation_kind": "FORECAST_AUDIT", "data_completeness": "COMPLETE",
+            "forecast_path_direction": "UP", "predicted_regime": "상승", "strategy": "TREND_SWING", "signal_time": "2026-08-19T09:10:00",
+            "horizons": [{"minutes": minute, "actual": 101.0, "direction_pass": True, "range_pass": True, "pass_all": True, "price_error_pct": 0.2} for minute in (5, 15, 30)],
+        },
+        {
+            "version": "sample", "market": "US", "validation_kind": "FORECAST_AUDIT", "data_completeness": "COMPLETE",
+            "forecast_path_direction": "UP", "predicted_regime": "상승", "strategy": "TREND_SWING", "signal_time": "2026-08-19T09:20:00",
+            "horizons": [{"minutes": minute, "actual": 99.0, "direction_pass": False, "range_pass": False, "pass_all": False, "price_error_pct": -0.4} for minute in (5, 15, 30)],
+        },
+        {
+            "version": "prior", "market": "US", "validation_kind": "FORECAST_AUDIT", "data_completeness": "COMPLETE",
+            "forecast_path_direction": "DOWN", "horizons": [],
+        },
+    ]
+    store = ValidationStore(tmp_path)
+    store.load_all = lambda: rows  # type: ignore[method-assign]
+
+    breakdown = store.versioned_forecast_breakdown("sample", "US")
+
+    assert breakdown["예측 방향"] == [{
+        "구분": "UP", "완료": 2, "5분 방향 적중률": 50.0, "15분 방향 적중률": 50.0,
+        "30분 방향 적중률": 50.0, "30분 평균 가격 오차": -0.1, "30분 평균 절대 오차": 0.30000000000000004,
+    }]
+    assert breakdown["매매 구조"][0]["구분"] == "TREND_SWING"
+
+
 def test_rest_snapshot_store_scores_mature_forecast_audit_once(tmp_path):
     case = ValidationCase(
         case_id="US-TEST-audit", version="test", symbol="TEST", market="US", session="US_PRE",

@@ -718,6 +718,49 @@ class ValidationStore:
             },
         }
 
+    def versioned_forecast_breakdown(self, version: str, market: str | None = None) -> dict[str, list[dict[str, Any]]]:
+        """Break fixed-version completed forecasts down by observed failure dimensions."""
+        rows = [
+            row for row in self.load_all()
+            if row.get("version") == version
+            and row.get("validation_kind") == "FORECAST_AUDIT"
+            and row.get("data_completeness") == "COMPLETE"
+            and (market is None or row.get("market") == market)
+        ]
+
+        def time_bucket(row: dict[str, Any]) -> str:
+            try:
+                return f"{pd.Timestamp(row.get('signal_time')).hour:02d}시"
+            except (TypeError, ValueError):
+                return "시간 미기록"
+
+        dimensions = {
+            "예측 방향": lambda row: str(row.get("forecast_path_direction") or "MIXED"),
+            "시장 상태": lambda row: str(row.get("predicted_regime") or "미분류"),
+            "매매 구조": lambda row: str(row.get("strategy") or "미분류"),
+            "신호 시간": time_bucket,
+        }
+        result: dict[str, list[dict[str, Any]]] = {}
+        for label, key_fn in dimensions.items():
+            groups: dict[str, list[dict[str, Any]]] = {}
+            for row in rows:
+                groups.setdefault(key_fn(row), []).append(row)
+            summaries: list[dict[str, Any]] = []
+            for key, group in groups.items():
+                forecast = self._forecast_audit_summary(group)
+                horizons = forecast["horizons"]
+                summaries.append({
+                    "구분": key,
+                    "완료": forecast["complete_paths"],
+                    "5분 방향 적중률": horizons["5"]["direction_rate"],
+                    "15분 방향 적중률": horizons["15"]["direction_rate"],
+                    "30분 방향 적중률": horizons["30"]["direction_rate"],
+                    "30분 평균 가격 오차": horizons["30"]["mean_price_error_pct"],
+                    "30분 평균 절대 오차": horizons["30"]["mean_absolute_price_error_pct"],
+                })
+            result[label] = sorted(summaries, key=lambda item: (-int(item["완료"]), str(item["구분"])))
+        return result
+
     def summary(self) -> dict[str, Any]:
         all_rows = self.load_all()
         rows = [row for row in all_rows if row.get("validation_kind", "ACTIONABLE") == "ACTIONABLE"]
