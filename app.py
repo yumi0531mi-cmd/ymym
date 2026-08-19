@@ -1365,6 +1365,7 @@ def run_free_validation_batch(
     selected = batch_candidates[start:start + FREE_VALIDATION_STARTS_PER_MINUTE]
     started = 0
     deferred_reasons: dict[str, int] = {}
+    should_advance = True
     for candidate in selected:
         symbol = str(candidate.get("symbol") or "").upper()
         if not symbol:
@@ -1373,10 +1374,12 @@ def run_free_validation_batch(
         budget = current_client().request_budget
         if not budget.can_spend(VALIDATION_ANALYSIS_CALL_ALLOWANCE):
             deferred_reasons["신규 표본 분석 예산 대기"] = deferred_reasons.get("신규 표본 분석 예산 대기", 0) + 1
-            continue
+            should_advance = False
+            break
         if not budget.reserve("경계 수집", VALIDATION_BOUNDARY_RESERVATION_CALLS, VALIDATION_BOUNDARY_RESERVATION_TTL_SECONDS):
             deferred_reasons["5·15·30분 경계 수집 예산 예약 대기"] = deferred_reasons.get("5·15·30분 경계 수집 예산 예약 대기", 0) + 1
-            continue
+            should_advance = False
+            break
         try:
             before = len(store.pending_forecast_audits(market.value, version=APP_VERSION, limit=100, batch_id=str(state["batch_id"])))
             item = analyze_card(
@@ -1398,7 +1401,9 @@ def run_free_validation_batch(
         except (KISError, OSError, ValueError, KeyError):
             budget.release("경계 수집", VALIDATION_BOUNDARY_RESERVATION_CALLS)
             deferred_reasons["KIS 분봉 재수신 대기"] = deferred_reasons.get("KIS 분봉 재수신 대기", 0) + 1
-    state["next_index"] = min(len(batch_candidates), start + FREE_VALIDATION_STARTS_PER_MINUTE)
+    state["next_index"] = min(
+        len(batch_candidates), start + (FREE_VALIDATION_STARTS_PER_MINUTE if should_advance else 0)
+    )
     st.session_state[f"free_validation_batch_{market.value}"] = state
     cases = [
         case for case in store.cases()
