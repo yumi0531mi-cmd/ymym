@@ -611,7 +611,10 @@ class ValidationStore:
         by_direction: dict[str, list[dict[str, Any]]] = {}
         by_source: dict[str, list[dict[str, Any]]] = {}
         horizon_stats = {
-            str(minutes): {"complete": 0, "range_pass": 0, "direction_pass": 0, "strict_pass": 0}
+            str(minutes): {
+                "complete": 0, "range_pass": 0, "direction_pass": 0, "strict_pass": 0,
+                "price_errors": [], "mfe_values": [], "mae_values": [],
+            }
             for minutes in (5, 15, 30)
         }
         for row in complete:
@@ -631,11 +634,31 @@ class ValidationStore:
                 stats["range_pass"] += int(horizon.get("range_pass") is True)
                 stats["direction_pass"] += int(horizon.get("direction_pass") is True)
                 stats["strict_pass"] += int(horizon.get("pass_all") is True)
+                price_error = horizon.get("price_error_pct")
+                if isinstance(price_error, (int, float)):
+                    stats["price_errors"].append(float(price_error))
+                mfe = horizon.get("mfe_pct")
+                if isinstance(mfe, (int, float)):
+                    stats["mfe_values"].append(float(mfe))
+                mae = horizon.get("mae_pct")
+                if isinstance(mae, (int, float)):
+                    stats["mae_values"].append(float(mae))
         for stats in horizon_stats.values():
             denominator = stats["complete"]
             stats["range_rate"] = stats["range_pass"] / denominator * 100 if denominator else None
             stats["direction_rate"] = stats["direction_pass"] / denominator * 100 if denominator else None
             stats["strict_rate"] = stats["strict_pass"] / denominator * 100 if denominator else None
+            errors = list(stats.pop("price_errors"))
+            mfe_values = list(stats.pop("mfe_values"))
+            mae_values = list(stats.pop("mae_values"))
+            stats["price_error_samples"] = len(errors)
+            stats["mean_price_error_pct"] = sum(errors) / len(errors) if errors else None
+            stats["median_price_error_pct"] = float(pd.Series(errors).median()) if errors else None
+            stats["mean_absolute_price_error_pct"] = sum(abs(value) for value in errors) / len(errors) if errors else None
+            stats["mfe_samples"] = len(mfe_values)
+            stats["mean_mfe_pct"] = sum(mfe_values) / len(mfe_values) if mfe_values else None
+            stats["mae_samples"] = len(mae_values)
+            stats["mean_mae_pct"] = sum(mae_values) / len(mae_values) if mae_values else None
         by_direction_summary = {
             direction: {
                 "complete": len(group),
@@ -668,6 +691,31 @@ class ValidationStore:
             "horizons": horizon_stats,
             "by_prediction_direction": by_direction_summary,
             "by_price_source": by_source_summary,
+        }
+
+    def versioned_validation_summary(self, version: str, market: str | None = None) -> dict[str, Any]:
+        """Return immutable-version outcome metrics without mixing calibration or prior-rule rows."""
+        rows = [
+            row for row in self.load_all()
+            if row.get("version") == version and (market is None or row.get("market") == market)
+        ]
+        forecasts = [row for row in rows if row.get("validation_kind") == "FORECAST_AUDIT"]
+        actionable = [row for row in rows if row.get("validation_kind", "ACTIONABLE") == "ACTIONABLE"]
+        complete_actionable = [row for row in actionable if row.get("data_completeness") == "COMPLETE"]
+        net = [float(row["net_return_pct"]) for row in complete_actionable if isinstance(row.get("net_return_pct"), (int, float))]
+        return {
+            "version": version,
+            "market": market,
+            "forecast": self._forecast_audit_summary(forecasts),
+            "final_buy": {
+                "records": len(actionable),
+                "complete": len(complete_actionable),
+                "target1_first": sum(row.get("target_first") is True for row in complete_actionable),
+                "target2_recorded": sum(row.get("target2") is not None for row in complete_actionable),
+                "hard_stop_first": sum(row.get("hard_stop_first") is True for row in complete_actionable),
+                "average_net_return_pct": sum(net) / len(net) if net else None,
+                "net_return_samples": len(net),
+            },
         }
 
     def summary(self) -> dict[str, Any]:

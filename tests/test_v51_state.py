@@ -176,6 +176,41 @@ def test_forecast_audit_summary_separates_all_direction_paths_from_trade_metrics
     assert audit["by_price_source"]["KIS REST"]["strict_full_path_rate"] == 0.0
 
 
+def test_versioned_forecast_summary_keeps_price_error_and_path_metrics_separate(tmp_path):
+    rows = [
+        {
+            "version": "sample", "market": "US", "validation_kind": "FORECAST_AUDIT",
+            "data_completeness": "COMPLETE", "full_path_pass": True,
+            "horizons": [
+                {"minutes": 5, "actual": 101.0, "range_pass": True, "direction_pass": True, "pass_all": True, "price_error_pct": 1.0, "mfe_pct": 1.5, "mae_pct": -0.3},
+                {"minutes": 15, "actual": 102.0, "range_pass": True, "direction_pass": True, "pass_all": True, "price_error_pct": -0.5},
+                {"minutes": 30, "actual": 103.0, "range_pass": True, "direction_pass": True, "pass_all": True, "price_error_pct": 0.25},
+            ],
+        },
+        {
+            "version": "prior", "market": "US", "validation_kind": "FORECAST_AUDIT",
+            "data_completeness": "COMPLETE", "full_path_pass": False, "horizons": [],
+        },
+        {
+            "version": "sample", "market": "US", "validation_kind": "ACTIONABLE", "data_completeness": "COMPLETE",
+            "target_first": True, "target2": 104.0, "hard_stop_first": False, "net_return_pct": 0.8,
+        },
+    ]
+    store = ValidationStore(tmp_path)
+    store.load_all = lambda: rows  # type: ignore[method-assign]
+
+    summary = store.versioned_validation_summary("sample", "US")
+
+    assert summary["forecast"]["records"] == 1
+    assert summary["forecast"]["horizons"]["5"]["direction_rate"] == 100.0
+    assert summary["forecast"]["horizons"]["5"]["mean_price_error_pct"] == 1.0
+    assert summary["forecast"]["horizons"]["5"]["mean_mfe_pct"] == 1.5
+    assert summary["final_buy"] == {
+        "records": 1, "complete": 1, "target1_first": 1, "target2_recorded": 1,
+        "hard_stop_first": 0, "average_net_return_pct": 0.8, "net_return_samples": 1,
+    }
+
+
 def test_rest_snapshot_store_scores_mature_forecast_audit_once(tmp_path):
     case = ValidationCase(
         case_id="US-TEST-audit", version="test", symbol="TEST", market="US", session="US_PRE",

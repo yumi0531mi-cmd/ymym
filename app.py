@@ -1353,6 +1353,41 @@ def render_data_missing_forecast_cases(store: ValidationStore, market_value: str
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 
+def render_versioned_forecast_summary(store: ValidationStore, market_value: str) -> None:
+    """Display performance only after a fixed-version cohort has enough complete paths."""
+    summary = store.versioned_validation_summary(APP_VERSION, market_value)
+    forecast = summary["forecast"]
+    complete = int(forecast["complete_paths"])
+    if complete < 20:
+        st.caption(f"1차 성능 집계 대기 · 같은 v{APP_VERSION} 완료 표본 {complete}/20 · DATA_MISSING은 성능 통계에서 제외")
+        return
+    st.subheader(f"고정 버전 1차 실측 요약 · 완료 {complete}건")
+    rows: list[dict[str, Any]] = []
+    for minutes in (5, 15, 30):
+        stats = forecast["horizons"][str(minutes)]
+        rows.append({
+            "구간": f"{minutes}분",
+            "완료": stats["complete"],
+            "방향 적중률": f"{stats['direction_rate']:.1f}%" if stats["direction_rate"] is not None else "—",
+            "평균 가격 오차": f"{stats['mean_price_error_pct']:+.3f}%" if stats["mean_price_error_pct"] is not None else "—",
+            "중앙 가격 오차": f"{stats['median_price_error_pct']:+.3f}%" if stats["median_price_error_pct"] is not None else "—",
+            "평균 절대 오차": f"{stats['mean_absolute_price_error_pct']:.3f}%" if stats["mean_absolute_price_error_pct"] is not None else "—",
+            "평균 MFE / MAE": (
+                f"{stats['mean_mfe_pct']:+.3f}% / {stats['mean_mae_pct']:+.3f}%"
+                if stats["mean_mfe_pct"] is not None and stats["mean_mae_pct"] is not None else "—"
+            ),
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    final_buy = summary["final_buy"]
+    st.caption(
+        f"FINAL_BUY {final_buy['records']}건 · 1차 목표 선도달 {final_buy['target1_first']}건 · "
+        f"2차 목표 기록 {final_buy['target2_recorded']}건 · Hard Stop 선도달 {final_buy['hard_stop_first']}건 · "
+        f"비용 반영 평균 손익 "
+        f"{final_buy['average_net_return_pct']:+.3f}%" if final_buy["average_net_return_pct"] is not None else
+        f"FINAL_BUY {final_buy['records']}건 · 완료된 비용 반영 손익 표본 없음"
+    )
+
+
 def free_validation_batch_state(market: Market, candidates: list[dict[str, Any]]) -> dict[str, Any]:
     """Create one browser-open, persistent-session batch from the market candidate pool."""
     key = f"free_validation_batch_{market.value}"
@@ -1797,6 +1832,7 @@ elif candidates:
 
 render_pending_forecast_progress(store, market.value)
 render_data_missing_forecast_cases(store, market.value)
+render_versioned_forecast_summary(store, market.value)
 
 if cards:
     updated_at = max(card["quote"].timestamp for card in cards)

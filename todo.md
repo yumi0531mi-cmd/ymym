@@ -136,3 +136,4 @@
 - [x] 무거운 후보 순위·정밀 분석보다 5·15·30분 경계 수집 fragment를 먼저 독립 실행해 경계 창 지연을 차단
 - [x] 오래된 WebSocket 체결가가 경계 실제가로 기록돼 REST fallback 기회를 잃는 경로를 차단하고, 오래된 체결은 REST 1회 대체로 전환
 - [x] capture_integrity 수집 안정성 URL에서는 카드 현재가·구조 재분석 fragment를 중지해 15초 경계 수집 fragment의 실행 창을 독립 확보
+- [x] 고정 APP_VERSION·시장 기준으로 완료 예측 표본만 분리해 5·15·30분 방향·대표예측가 오차·MFE/MAE·FINAL_BUY 목표/Hard Stop·비용 성과를 집계
