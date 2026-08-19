@@ -1362,6 +1362,13 @@ def render_versioned_forecast_summary(store: ValidationStore, market_value: str)
         st.caption(f"1차 성능 집계 대기 · 같은 v{APP_VERSION} 완료 표본 {complete}/20 · DATA_MISSING은 성능 통계에서 제외")
         return
     st.subheader(f"고정 버전 1차 실측 요약 · 완료 {complete}건")
+    repeated_failure = store.versioned_repeated_failure_insight(APP_VERSION, market_value)
+    if repeated_failure is not None:
+        st.warning(
+            f"반복 저적중 구간: {repeated_failure['dimension']} · {repeated_failure['구분']} · "
+            f"완료 {repeated_failure['완료']}건 · 30분 방향 적중률 {repeated_failure['30분 방향 적중률']:.1f}% · "
+            f"30분 평균 절대 오차 {repeated_failure['30분 평균 절대 오차']:.3f}%"
+        )
     rows: list[dict[str, Any]] = []
     for minutes in (5, 15, 30):
         stats = forecast["horizons"][str(minutes)]

@@ -239,6 +239,10 @@ def test_versioned_forecast_breakdown_groups_only_matching_completed_forecasts(t
     }]
     assert breakdown["매매 구조"][0]["구분"] == "TREND_SWING"
 
+    insight = store.versioned_repeated_failure_insight("sample", "US")
+    assert insight is not None
+    assert insight["30분 방향 적중률"] == 50.0
+
 
 def test_rest_snapshot_store_scores_mature_forecast_audit_once(tmp_path):
     case = ValidationCase(

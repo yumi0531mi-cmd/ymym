@@ -761,6 +761,21 @@ class ValidationStore:
             result[label] = sorted(summaries, key=lambda item: (-int(item["완료"]), str(item["구분"])))
         return result
 
+    def versioned_repeated_failure_insight(self, version: str, market: str | None = None) -> dict[str, Any] | None:
+        """Return the lowest 30-minute direction-rate group with at least two observations."""
+        candidates = [
+            {"dimension": dimension, **row}
+            for dimension, rows in self.versioned_forecast_breakdown(version, market).items()
+            for row in rows
+            if int(row["완료"]) >= 2 and isinstance(row["30분 방향 적중률"], (int, float))
+        ]
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda row: (float(row["30분 방향 적중률"]), -int(row["완료"]), str(row["dimension"]), str(row["구분"])),
+        )
+
     def summary(self) -> dict[str, Any]:
         all_rows = self.load_all()
         rows = [row for row in all_rows if row.get("validation_kind", "ACTIONABLE") == "ACTIONABLE"]
