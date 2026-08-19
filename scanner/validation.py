@@ -86,6 +86,7 @@ class ValidationCase:
     capture_failures: dict[str, dict[str, str]] = field(default_factory=dict)
     exchange: str = ""
     batch_id: str = ""
+    analysis_snapshot: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_plan(
@@ -118,6 +119,22 @@ class ValidationCase:
             if latest_trade_time is not None and latest_trade_price is not None
             else []
         )
+        diagnostics = plan.diagnostics
+        analysis_snapshot = {
+            "completed_bar_at": diagnostics.get("completed_bar_at"),
+            "timeframes": diagnostics.get("timeframes", {}),
+            "market_state": diagnostics.get("market_state"),
+            "indicators": {
+                key: diagnostics.get(key)
+                for key in ("vwap", "ema9", "atr", "atr_pct", "rvol", "notional_rvol")
+            },
+            "indicator_components": diagnostics.get("indicator_components", {}),
+            "direction_engines": diagnostics.get("direction_engines", {}),
+            "direction_invalidation": diagnostics.get("direction_invalidation", {}),
+            "strategy_path": diagnostics.get("strategy_path", {}),
+            "data_quality": diagnostics.get("data_quality", {}),
+            "quote_source": diagnostics.get("data_quality", {}).get("quote_source"),
+        }
         return cls(
             case_id=case_id,
             version=version,
@@ -159,6 +176,7 @@ class ValidationCase:
             price_snapshots=price_snapshots,
             exchange=exchange,
             batch_id=batch_id,
+            analysis_snapshot=analysis_snapshot,
         )
 
     def score_path(self, actual_prices: dict[int, float], actual_regime: Regime | None = None) -> None:
@@ -766,6 +784,46 @@ class ValidationStore:
                 })
             result[label] = sorted(summaries, key=lambda item: (-int(item["완료"]), str(item["구분"])))
         return result
+
+    def versioned_forecast_trace(self, version: str, market: str | None = None) -> list[dict[str, Any]]:
+        """Return immutable per-case prediction/actual evidence for causal review."""
+        rows = [
+            row for row in self.load_all()
+            if row.get("version") == version
+            and row.get("validation_kind") == "FORECAST_AUDIT"
+            and row.get("data_completeness") == "COMPLETE"
+            and (market is None or row.get("market") == market)
+        ]
+
+        def horizon(row: dict[str, Any], minutes: int) -> dict[str, Any]:
+            return next(
+                (item for item in row.get("horizons", []) if int(item.get("minutes", -1)) == minutes),
+                {},
+            )
+
+        trace: list[dict[str, Any]] = []
+        for row in rows:
+            points = {minutes: horizon(row, minutes) for minutes in (5, 15, 30)}
+            all_direction_pass = all(point.get("direction_pass") is True for point in points.values())
+            snapshot = row.get("analysis_snapshot") or {}
+            trace.append({
+                "분류": "3시간대 방향 적중" if all_direction_pass else "1개 이상 방향 실패",
+                "종목": row.get("symbol"),
+                "신호 시각": row.get("signal_time"),
+                "세션": row.get("session"),
+                "전략": row.get("strategy"),
+                "예측 장세": row.get("predicted_regime"),
+                "위험 상태": row.get("risk_state"),
+                "지속성": row.get("persistence_score"),
+                "현재가": row.get("quote_price"),
+                "완료봉 시각": snapshot.get("completed_bar_at") or "v6.11 미저장",
+                "5분 예측/실제/방향": f"{points[5].get('predicted_direction', '—')} / {points[5].get('actual', '—')} / {points[5].get('direction_pass', '—')}",
+                "15분 예측/실제/방향": f"{points[15].get('predicted_direction', '—')} / {points[15].get('actual', '—')} / {points[15].get('direction_pass', '—')}",
+                "30분 예측/실제/방향": f"{points[30].get('predicted_direction', '—')} / {points[30].get('actual', '—')} / {points[30].get('direction_pass', '—')}",
+                "30분 가격 오차": points[30].get("price_error_pct"),
+                "입력 진단": "저장됨" if snapshot else "v6.11 미저장",
+            })
+        return sorted(trace, key=lambda row: (str(row["분류"]), str(row["신호 시각"])))
 
     def versioned_repeated_failure_insight(self, version: str, market: str | None = None) -> dict[str, Any] | None:
         """Return the lowest 30-minute direction-rate group with at least two observations."""

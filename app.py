@@ -730,6 +730,7 @@ def record_forecast_accuracy_audit(
 def analyze_card(
     symbol: str, market: Market, exchange: str, cost_pct: float, min_score: int, store: ValidationStore,
     validation_batch_id: str = "", fresh_validation_bars: bool = False, request_purpose: str = "카드 현재가",
+    record_validation: bool = True,
 ) -> dict[str, Any]:
     """Fetch and analyze one automatic dashboard card from REST history plus live completed bars."""
     rest_quote = load_rest_dashboard_quote(symbol, market.value, exchange, request_purpose)
@@ -759,12 +760,15 @@ def analyze_card(
     )
     # Complete earlier same-symbol signals first, then persist a real KIS-trade-backed
     # plan. The same path also runs from the one-minute card structure refresh.
-    actionable_scored, actionable_recorded = record_and_score_live_validation(
-        store, plan, quote, bars, chart_aligned, float(cost_pct)
-    )
-    forecast_scored, forecast_recorded = record_forecast_accuracy_audit(
-        store, plan, quote, bars, chart_aligned, float(cost_pct), exchange, validation_batch_id
-    )
+    actionable_scored = forecast_scored = 0
+    actionable_recorded = forecast_recorded = False
+    if record_validation:
+        actionable_scored, actionable_recorded = record_and_score_live_validation(
+            store, plan, quote, bars, chart_aligned, float(cost_pct)
+        )
+        forecast_scored, forecast_recorded = record_forecast_accuracy_audit(
+            store, plan, quote, bars, chart_aligned, float(cost_pct), exchange, validation_batch_id
+        )
     if event_store.configured:
         marker = str(plan.diagnostics.get("completed_bar_at") or quote.timestamp.isoformat())
         cycle_store.apply_risk_state(cycle, plan.risk_state, marker)
@@ -1415,6 +1419,21 @@ def render_versioned_failure_breakdown(store: ValidationStore, market_value: str
         st.dataframe(table, hide_index=True, use_container_width=True)
 
 
+def render_versioned_forecast_trace(store: ValidationStore, market_value: str, version: str) -> None:
+    """Show immutable case-level evidence only when the explicit audit URL is requested."""
+    rows = store.versioned_forecast_trace(version, market_value)
+    if not rows:
+        st.info(f"{version}의 완료 예측 감사 표본이 없습니다.")
+        return
+    matched = sum(row["분류"] == "3시간대 방향 적중" for row in rows)
+    st.subheader(f"고정 표본 감사 · {version}")
+    st.caption(
+        f"완료 {len(rows)}건 · 3시간대 방향 적중 {matched}건 · 1개 이상 방향 실패 {len(rows) - matched}건 · "
+        "v6.11은 신호 시점 입력 지표·Direction Engine 상세를 저장하지 않아 해당 열에 미저장으로 표시됩니다."
+    )
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+
 def free_validation_batch_state(market: Market, candidates: list[dict[str, Any]]) -> dict[str, Any]:
     """Create one browser-open, persistent-session batch from the market candidate pool."""
     key = f"free_validation_batch_{market.value}"
@@ -1694,6 +1713,8 @@ with st.sidebar:
     st.title("실시간 설정")
     requested_market = str(st.query_params.get("market", "")).strip().upper()
     capture_integrity = capture_integrity_enabled(st.query_params.get("capture_integrity", ""))
+    audit_version = str(st.query_params.get("audit_version", "")).strip()
+    audit_only = bool(audit_version)
     initial_market_label = "미국" if requested_market in {"US", "미국"} else default_market_label()
     market_label = st.radio(
         "시장",
@@ -1800,7 +1821,10 @@ else:
                 symbol = str(candidate["symbol"])
                 exchange = str(candidate.get("exchange") or ("NAS" if market == Market.US else ""))
                 try:
-                    card = analyze_card(symbol, market, exchange, float(cost_pct), int(min_score), store, request_purpose="카드 현재가")
+                    card = analyze_card(
+                        symbol, market, exchange, float(cost_pct), int(min_score), store,
+                        request_purpose="카드 현재가", record_validation=not audit_only,
+                    )
                     card["name"] = str(candidate.get("name") or symbol)
                     card["candidate_source"] = str(candidate.get("candidate_source") or "거래량 TOP100 ∪ 거래대금 TOP100")
                     cards.append(card)
@@ -1849,11 +1873,13 @@ realtime_hub.configure(
     for card in analysis_cards
 )
 
-if analysis_cards and not capture_integrity:
+if analysis_cards and not capture_integrity and not audit_only:
     run_hidden_forecast_validation(analysis_cards, float(cost_pct), int(min_score), store)
 
-if candidates and event_store.configured:
+if candidates and event_store.configured and not audit_only:
     run_free_validation_batch(market.value, candidates, float(cost_pct), int(min_score), store, capture_integrity)
+elif audit_only:
+    st.caption("감사 전용 모드 · 신규 검증 표본 생성·사후 채점·자동 기록을 실행하지 않습니다.")
 elif candidates:
     st.caption("100개 예측 검증은 영구 저장 연결이 필요합니다. 현재는 앱 재시작 시 기록이 사라질 수 있어 시작하지 않습니다.")
 
@@ -1861,6 +1887,8 @@ render_pending_forecast_progress(store, market.value)
 render_data_missing_forecast_cases(store, market.value)
 render_versioned_forecast_summary(store, market.value)
 render_versioned_failure_breakdown(store, market.value)
+if audit_version:
+    render_versioned_forecast_trace(store, market.value, audit_version)
 
 if cards:
     updated_at = max(card["quote"].timestamp for card in cards)

@@ -244,6 +244,11 @@ def test_versioned_forecast_breakdown_groups_only_matching_completed_forecasts(t
     assert insight is not None
     assert insight["30분 방향 적중률"] == 50.0
 
+    trace = store.versioned_forecast_trace("sample", "US")
+    assert len(trace) == 2
+    assert {row["분류"] for row in trace} == {"3시간대 방향 적중", "1개 이상 방향 실패"}
+    assert all(row["입력 진단"] == "v6.11 미저장" for row in trace)
+
 
 def test_rest_snapshot_store_scores_mature_forecast_audit_once(tmp_path):
     case = ValidationCase(
