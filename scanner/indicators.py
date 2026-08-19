@@ -98,3 +98,15 @@ def resample(frame: pd.DataFrame, minutes: int) -> pd.DataFrame:
     return frame.resample(rule, label="right", closed="right").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     ).dropna()
+
+
+def resample_completed(frame: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """Return only fully formed higher-timeframe bars from one-minute observations."""
+    df = normalize_bars(frame)
+    if minutes == 1:
+        return df
+    rule = f"{minutes}min"
+    grouped = resample(df, minutes)
+    counts = df.close.resample(rule, label="right", closed="right").count()
+    valid = counts[counts >= minutes].index
+    return grouped.loc[grouped.index.intersection(valid)].copy()

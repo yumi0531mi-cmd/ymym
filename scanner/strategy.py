@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .indicators import enrich, resample
+from .indicators import enrich, resample_completed
 from .models import Regime
 
 
@@ -20,7 +20,7 @@ class TimeframeState:
 
 
 def classify(frame: pd.DataFrame, minutes: int) -> TimeframeState:
-    df = enrich(resample(frame, minutes))
+    df = enrich(resample_completed(frame, minutes))
     if len(df) < 8:
         return TimeframeState(minutes, Regime.UNKNOWN, 0.0, float(df.close.iloc[-1]) if len(df) else 0.0, 0.0, 0.0)
     recent = df.tail(min(12, len(df)))
@@ -71,11 +71,10 @@ def confirmed_levels(frame: pd.DataFrame, entry: float) -> tuple[float | None, f
 
 def repeat_box(frame: pd.DataFrame, current: float) -> tuple[float, float] | None:
     """Return a validated completed 5-minute range only while price remains inside it."""
-    grouped = resample(frame, 5)
-    if len(grouped) < 9:
+    grouped = resample_completed(frame, 5)
+    if len(grouped) < 8:
         return None
-    # The final 5-minute aggregation may still be forming. Exclude it from range detection.
-    df = enrich(grouped.iloc[:-1])
+    df = enrich(grouped)
     if len(df) < 8:
         return None
     recent = df.tail(12)
@@ -153,8 +152,8 @@ def trade_levels(
     support = supports[0] if supports else None
     support_basis = "완료 1분봉 스윙 저점" if support else "지지 미확인"
 
-    grouped = resample(frame, 5)
-    completed_5m = enrich(grouped.iloc[:-1]).tail(60) if len(grouped) > 1 else grouped.iloc[0:0]
+    grouped = resample_completed(frame, 5)
+    completed_5m = enrich(grouped).tail(60) if len(grouped) else grouped.iloc[0:0]
     highs_5m = completed_5m.high[
         (completed_5m.high.shift(1) < completed_5m.high)
         & (completed_5m.high.shift(-1) < completed_5m.high)

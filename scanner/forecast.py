@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .indicators import enrich
+from .indicators import enrich, resample_completed
 from .models import ForecastPoint, Regime
 
 
@@ -113,15 +113,39 @@ def _common_range_context(recent: pd.DataFrame, price: float) -> dict[str, objec
         float(returns.std(ddof=0)), atr_fraction * 0.45,
         float(latest.boll_width_pct) / 100 * 0.20, 0.0003,
     )
-    rvol_component = _bound(float(latest.rvol) - 1.0, -1.0, 1.5)
-    notional_component = _bound(float(latest.notional_rvol) - 1.0, -1.0, 1.5)
+    # Three completed 30-minute bars can define immediate structure but cannot yet
+    # establish a reliable relative-volume baseline. Treat unavailable flow as
+    # neutral instead of converting zero-filled warmup values into sell pressure.
+    flow_ready = len(recent) >= 5
+    rvol_component = _bound(float(latest.rvol) - 1.0, -1.0, 1.5) if flow_ready else 0.0
+    notional_component = _bound(float(latest.notional_rvol) - 1.0, -1.0, 1.5) if flow_ready else 0.0
     return {
         "latest": latest,
         "price": price,
         "atr_fraction": atr_fraction,
         "realized_sigma": realized_sigma,
         "flow_score": (rvol_component + notional_component) / 2.0,
+        "flow_ready": flow_ready,
     }
+
+
+def _timeframe_regime(recent: pd.DataFrame) -> Regime:
+    """Classify one completed horizon without inheriting the one-minute regime."""
+    if len(recent) < 3:
+        return Regime.TRANSITION
+    latest = recent.iloc[-1]
+    span = recent.tail(min(8, len(recent)))
+    price = float(latest.close)
+    net = (float(span.close.iloc[-1]) - float(span.close.iloc[0])) / max(price, 1e-9)
+    spread = (float(span.high.max()) - float(span.low.min())) / max(price, 1e-9)
+    efficiency = abs(net) / max(spread, 1e-9)
+    if efficiency < 0.28:
+        return Regime.RANGE
+    if price >= float(latest.vwap) and float(latest.ema9) >= float(latest.ema20) and net > 0:
+        return Regime.UP
+    if price <= float(latest.vwap) and float(latest.ema9) <= float(latest.ema20) and net < 0:
+        return Regime.DOWN
+    return Regime.TRANSITION
 
 
 def cap_upside_forecast_path(
@@ -296,21 +320,30 @@ def forecast_path(
     df = enrich(frame)
     if len(df) < 30:
         return []
-    recent = df.tail(30)
-    latest = recent.iloc[-1]
-    price = float(reference_price or latest.close)
-    context = _common_range_context(recent, price)
-    atr_fraction = float(context["atr_fraction"])
-    sigma = float(context["realized_sigma"])
-    flow_score = float(context["flow_score"])
-
-    state = _market_state(recent, regime, flow_score)
-    components = _components(latest, regime, state, flow_score)
-    basis = _direction_basis(latest, regime, flow_score)
+    price = float(reference_price or df.close.iloc[-1])
     result: list[ForecastPoint] = []
-    diagnostics: dict[str, object] = {"market_state": state, "components": components, "direction_engines": {}}
+    diagnostics: dict[str, object] = {"market_state": "TRANSITION", "components": {}, "direction_engines": {}}
     horizon_scale = {5: 0.55, 15: 1.05, 30: 1.35}
     for horizon in (5, 15, 30):
+        completed = resample_completed(frame, horizon)
+        if len(completed) < 3:
+            band = price * 0.0005
+            result.append(ForecastPoint(horizon, price - band, price, price + band, Regime.RANGE, f"{horizon}분 완료 고차 봉 부족", 50.0, None))
+            diagnostics["direction_engines"][str(horizon)] = {
+                "state": "TRANSITION", "input_timeframe_minutes": horizon,
+                "completed_timeframe_bars": len(completed), "input_ready": False,
+            }
+            continue
+        recent = enrich(completed).tail(min(30, len(completed)))
+        latest = recent.iloc[-1]
+        context = _common_range_context(recent, price)
+        atr_fraction = float(context["atr_fraction"])
+        sigma = float(context["realized_sigma"])
+        flow_score = float(context["flow_score"])
+        local_regime = _timeframe_regime(recent)
+        state = _market_state(recent, local_regime, flow_score)
+        components = _components(latest, local_regime, state, flow_score)
+        basis = _direction_basis(latest, local_regime, flow_score)
         weights = HORIZON_WEIGHTS[horizon][state]
         score = sum(components[key] * weight for key, weight in weights.items())
         if state == "TRANSITION":
@@ -326,6 +359,11 @@ def forecast_path(
         ))
         diagnostics["direction_engines"][str(horizon)] = {
             "state": state,
+            "timeframe_regime": local_regime.value,
+            "input_timeframe_minutes": horizon,
+            "completed_timeframe_bars": len(completed),
+            "last_completed_timeframe_bar_at": str(completed.index[-1]),
+            "input_ready": True,
             "score": round(float(score), 4),
             "weights": weights,
             "components": {key: round(float(value), 4) for key, value in components.items()},
@@ -336,6 +374,10 @@ def forecast_path(
                 "realized_sigma_pct": round(float(sigma) * 100, 4),
                 "atr_pct": round(float(atr_fraction) * 100, 4),
                 "flow_score": round(float(flow_score), 4),
+                "flow_ready": bool(context["flow_ready"]),
             },
         }
+        if horizon == 15:
+            diagnostics["market_state"] = state
+            diagnostics["components"] = components
     return ForecastPath(result, diagnostics)

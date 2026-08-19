@@ -435,6 +435,10 @@ def test_forecast_path_keeps_horizon_specific_direction_engine_details():
     engines = getattr(forecast, "diagnostics")["direction_engines"]
     assert set(engines) == {"5", "15", "30"}
     assert engines["5"]["weights"] != engines["30"]["weights"]
+    assert engines["5"]["input_timeframe_minutes"] == 5
+    assert engines["15"]["input_timeframe_minutes"] == 15
+    assert engines["30"]["input_timeframe_minutes"] == 30
+    assert engines["5"]["last_completed_timeframe_bar_at"] < str(bars(100).index[-1])
 
 
 def test_engine_exposes_data_quality_direction_engines_and_target_reachability():
