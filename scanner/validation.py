@@ -76,6 +76,7 @@ class ValidationCase:
     price_source: str = "KIS 체결"
     price_snapshots: list[dict[str, Any]] = field(default_factory=list)
     exchange: str = ""
+    batch_id: str = ""
 
     @classmethod
     def from_plan(
@@ -88,6 +89,7 @@ class ValidationCase:
         validation_kind: str = "ACTIONABLE",
         price_source: str = "KIS 체결",
         exchange: str = "",
+        batch_id: str = "",
     ):
         directions = {point.direction.value for point in plan.forecasts}
         forecast_path_direction = directions.pop() if len(directions) == 1 else "MIXED"
@@ -145,6 +147,7 @@ class ValidationCase:
             price_source=price_source,
             price_snapshots=price_snapshots,
             exchange=exchange,
+            batch_id=batch_id,
         )
 
     def score_path(self, actual_prices: dict[int, float], actual_regime: Regime | None = None) -> None:
@@ -201,9 +204,18 @@ class ValidationCase:
         actual_prices: dict[int, float] = {}
         for horizon in self.horizons:
             cutoff = signal_at + pd.Timedelta(horizon.minutes, unit="min")
-            eligible = [item for item in observations if signal_at <= item[0] <= cutoff]
+            # A browser fragment fires on a minute cadence and can be a few seconds
+            # after its scheduled boundary. Select the closest real KIS snapshot in
+            # a narrow, disclosed window instead of silently treating a +1-second
+            # tick as missing.
+            eligible = [
+                item for item in observations
+                if signal_at <= item[0] and abs((item[0] - cutoff).total_seconds()) <= 75
+            ]
             if eligible:
-                actual_prices[horizon.minutes] = eligible[-1][1]
+                actual_prices[horizon.minutes] = min(
+                    eligible, key=lambda item: abs((item[0] - cutoff).total_seconds())
+                )[1]
         if len(actual_prices) != len(self.horizons):
             return False
         final_price = actual_prices[max(actual_prices)]
@@ -361,16 +373,66 @@ class ValidationStore:
     def pending(self, market: str | None = None) -> list[ValidationCase]:
         return [case for case in self.cases() if case.full_path_pass is None and (market is None or case.market == market)]
 
-    def pending_forecast_audits(self, market: str, version: str | None = None, limit: int = 5) -> list[ValidationCase]:
+    def pending_forecast_audits(
+        self, market: str, version: str | None = None, limit: int = 5, batch_id: str | None = None,
+    ) -> list[ValidationCase]:
         """Return incomplete full-path audits for the active rule version."""
         pending = [
             case for case in self.pending(market)
-            if case.validation_kind == "FORECAST_AUDIT" and (version is None or case.version == version)
+            if (
+                case.validation_kind == "FORECAST_AUDIT"
+                and (version is None or case.version == version)
+                and (batch_id is None or case.batch_id == batch_id)
+            )
         ]
         return sorted(pending, key=lambda case: case.signal_time)[:max(1, min(int(limit), 5))]
 
-    def has_pending_forecast_audit(self, market: str, version: str) -> bool:
-        return bool(self.pending_forecast_audits(market, version=version, limit=1))
+    def has_pending_forecast_audit(self, market: str, version: str, batch_id: str | None = None) -> bool:
+        return bool(self.pending_forecast_audits(market, version=version, limit=1, batch_id=batch_id))
+
+    def due_forecast_audits(
+        self,
+        market: str,
+        observed_at: datetime,
+        version: str | None = None,
+        limit: int = 8,
+        grace_seconds: int = 75,
+        batch_id: str | None = None,
+    ) -> list[ValidationCase]:
+        """Return only audits needing their next 5·15·30-minute price snapshot.
+
+        This keeps a browser-open batch from refreshing every pending symbol each
+        minute. One symbol is fetched only when one of its three real observation
+        boundaries is due, which preserves the shared KIS request budget.
+        """
+        now = pd.Timestamp(observed_at)
+        due: list[ValidationCase] = []
+        for case in self.pending_forecast_audits(market, version=version, limit=100, batch_id=batch_id):
+            signal_at = pd.Timestamp(case.signal_time)
+            comparable_now = now
+            if comparable_now.tzinfo is None and signal_at.tzinfo is not None:
+                comparable_now = comparable_now.tz_localize(signal_at.tzinfo)
+            elif comparable_now.tzinfo is not None and signal_at.tzinfo is None:
+                comparable_now = comparable_now.tz_localize(None)
+            snapshot_times = []
+            for snapshot in case.price_snapshots:
+                try:
+                    snapshot_at = pd.Timestamp(snapshot["timestamp"])
+                    if snapshot_at.tzinfo is None and signal_at.tzinfo is not None:
+                        snapshot_at = snapshot_at.tz_localize(signal_at.tzinfo)
+                    elif snapshot_at.tzinfo is not None and signal_at.tzinfo is None:
+                        snapshot_at = snapshot_at.tz_localize(None)
+                    snapshot_times.append(snapshot_at)
+                except (KeyError, TypeError, ValueError):
+                    continue
+            for horizon in case.horizons:
+                cutoff = signal_at + pd.Timedelta(horizon.minutes, unit="min")
+                within_due_window = cutoff <= comparable_now <= cutoff + pd.Timedelta(grace_seconds, unit="s")
+                already_captured = any(abs((snapshot_at - cutoff).total_seconds()) <= grace_seconds for snapshot_at in snapshot_times)
+                if within_due_window and not already_captured:
+                    due.append(case)
+                    break
+        return due[:max(1, int(limit))]
 
     def score_ready(self, symbol: str, market: str, bars: pd.DataFrame, cost_pct: float) -> int:
         """Score pending same-symbol cases after a complete 30-minute future path exists."""

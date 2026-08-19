@@ -23,7 +23,7 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
-APP_VERSION = "6.4-3horizon-recommendations"
+APP_VERSION = "6.5-free-100-path-validation"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
 CLIENT_CACHE_VERSION = "client-contract-v12-ranked-100-pages"
@@ -35,9 +35,12 @@ MAX_LIVE_CARDS = 5
 MAX_ANALYSIS_CANDIDATES = 8
 MAX_CANDIDATE_LIST = 200
 MAX_FAST_SHORTLIST = 15
-# KIS WebSocket이 재연결 중일 때 REST 보조 경로는 한 표본만 이어 기록한다.
-# 후보 분석 호출과 합쳐도 분당 30건 제한을 넘기지 않기 위한 안전 장치다.
-MAX_PENDING_FORECAST_WATCHES = 1
+# 무료 Streamlit 검증 배치는 4개 표본을 매분 시작한다. 각 시작은 시세·분봉·호가
+# 확인을 포함하고, 이전 표본의 5·15·30분 실제 가격도 별도 수집하므로 KIS 분당
+# 30건 호출 제한 안에서 운용한다.
+MAX_PENDING_FORECAST_WATCHES = 8
+FREE_VALIDATION_BATCH_SIZE = 100
+FREE_VALIDATION_STARTS_PER_MINUTE = 4
 MAX_DAILY_RISE_PCT = 12.0
 KR_PRICE_CEILING = 300_000.0
 US_PRICE_CEILING = 200.0
@@ -673,6 +676,7 @@ def record_forecast_accuracy_audit(
     chart_aligned: bool,
     cost_pct: float,
     exchange: str = "",
+    batch_id: str = "",
 ) -> tuple[int, bool]:
     """Record every complete 5·15·30분 forecast path for prediction auditing."""
     scored_cases = store.score_ready(quote.symbol, quote.market.value, bars, float(cost_pct))
@@ -691,7 +695,7 @@ def record_forecast_accuracy_audit(
         scored_cases += store.capture_rest_snapshot_and_score(
             quote.symbol, quote.market.value, observed_time, observed_price, price_source, APP_VERSION
         )
-    if store.has_pending_forecast_audit(quote.market.value, APP_VERSION):
+    if not batch_id and store.has_pending_forecast_audit(quote.market.value, APP_VERSION):
         return scored_cases, False
     case = ValidationCase.from_plan(
         plan,
@@ -702,12 +706,16 @@ def record_forecast_accuracy_audit(
         validation_kind="FORECAST_AUDIT",
         price_source=price_source,
         exchange=exchange,
+        batch_id=batch_id,
     )
     _, recorded_case = store.save_once(case, cooldown_seconds=300)
     return scored_cases, recorded_case
 
 
-def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
+def analyze_card(
+    symbol: str, market: Market, exchange: str, cost_pct: float, min_score: int, store: ValidationStore,
+    validation_batch_id: str = "",
+) -> dict[str, Any]:
     """Fetch and analyze one automatic dashboard card from REST history plus live completed bars."""
     rest_quote = load_rest_dashboard_quote(symbol, market.value, exchange)
     quote = quote_with_live_tick(rest_quote)
@@ -737,7 +745,7 @@ def analyze_card(symbol: str, market: Market, exchange: str, cost_pct: float, mi
         store, plan, quote, bars, chart_aligned, float(cost_pct)
     )
     forecast_scored, forecast_recorded = record_forecast_accuracy_audit(
-        store, plan, quote, bars, chart_aligned, float(cost_pct), exchange
+        store, plan, quote, bars, chart_aligned, float(cost_pct), exchange, validation_batch_id
     )
     if event_store.configured:
         marker = str(plan.diagnostics.get("completed_bar_at") or quote.timestamp.isoformat())
@@ -1134,10 +1142,10 @@ def run_hidden_forecast_validation(items: list[dict[str, Any]], cost_pct: float,
 
 @st.fragment(run_every=60.0)
 def capture_pending_forecast_paths(store: ValidationStore, market_value: str) -> None:
-    """Continue one REST-backed forecast, or a live-tick path, after card rotation."""
+    """Capture only 5·15·30-minute boundaries due in this minute."""
     market = Market(market_value)
-    for case in store.pending_forecast_audits(
-        market.value, version=APP_VERSION, limit=MAX_PENDING_FORECAST_WATCHES
+    for case in store.due_forecast_audits(
+        market.value, datetime.now().astimezone(), version=APP_VERSION, limit=MAX_PENDING_FORECAST_WATCHES
     ):
         tick = display_tick(market, case.symbol)
         if tick is not None:
@@ -1152,6 +1160,57 @@ def capture_pending_forecast_paths(store: ValidationStore, market_value: str) ->
         store.capture_rest_snapshot_and_score(
             case.symbol, market.value, quote.timestamp, quote.price, "KIS REST", APP_VERSION
         )
+
+
+def free_validation_batch_state(market: Market, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    """Create one browser-open, persistent-session batch from the market candidate pool."""
+    key = f"free_validation_batch_{market.value}"
+    current_symbols = [str(item.get("symbol") or "").upper() for item in candidates[:FREE_VALIDATION_BATCH_SIZE]]
+    state = st.session_state.get(key)
+    if not isinstance(state, dict) or state.get("symbols") != current_symbols:
+        state = {
+            "batch_id": f"free-{market.value.lower()}-{datetime.now().astimezone().strftime('%Y%m%dT%H%M%S')}",
+            "symbols": current_symbols,
+            "next_index": 0,
+        }
+        st.session_state[key] = state
+    return state
+
+
+@st.fragment(run_every=60.0)
+def run_free_validation_batch(
+    market_value: str, candidates: list[dict[str, Any]], cost_pct: float, min_score: int, store: ValidationStore,
+) -> None:
+    """Start a small new cohort each minute while the free Streamlit screen stays open."""
+    market = Market(market_value)
+    state = free_validation_batch_state(market, candidates)
+    start = int(state.get("next_index", 0))
+    batch_candidates = candidates[:FREE_VALIDATION_BATCH_SIZE]
+    selected = batch_candidates[start:start + FREE_VALIDATION_STARTS_PER_MINUTE]
+    started = 0
+    for candidate in selected:
+        symbol = str(candidate.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        exchange = str(candidate.get("exchange") or ("NAS" if market == Market.US else ""))
+        try:
+            before = len(store.pending_forecast_audits(market.value, version=APP_VERSION, limit=100, batch_id=str(state["batch_id"])))
+            analyze_card(symbol, market, exchange, cost_pct, min_score, store, validation_batch_id=str(state["batch_id"]))
+            after = len(store.pending_forecast_audits(market.value, version=APP_VERSION, limit=100, batch_id=str(state["batch_id"])))
+            started += int(after > before)
+        except (KISError, OSError, ValueError, KeyError):
+            continue
+    state["next_index"] = min(len(batch_candidates), start + FREE_VALIDATION_STARTS_PER_MINUTE)
+    st.session_state[f"free_validation_batch_{market.value}"] = state
+    cases = [
+        case for case in store.cases()
+        if case.validation_kind == "FORECAST_AUDIT" and case.batch_id == str(state["batch_id"])
+    ]
+    complete = sum(case.data_completeness == "COMPLETE" for case in cases)
+    st.caption(
+        f"100개 예측 검증 진행 · 시작 {len(cases)}/{len(batch_candidates)} · 30분 완료 {complete}/{len(batch_candidates)} · "
+        f"이번 분 시작 {started}개 · 화면을 열어 두면 다음 표본을 이어 기록합니다."
+    )
 
 
 def latest_completed_forecast_case(store: ValidationStore, version: str) -> Any | None:
@@ -1465,6 +1524,11 @@ if analysis_cards:
     run_hidden_forecast_validation(analysis_cards, float(cost_pct), int(min_score), store)
 
 capture_pending_forecast_paths(store, market.value)
+
+if candidates and event_store.configured:
+    run_free_validation_batch(market.value, candidates, float(cost_pct), int(min_score), store)
+elif candidates:
+    st.caption("100개 예측 검증은 영구 저장 연결이 필요합니다. 현재는 앱 재시작 시 기록이 사라질 수 있어 시작하지 않습니다.")
 
 if cards:
     updated_at = max(card["quote"].timestamp for card in cards)

@@ -193,3 +193,21 @@ def test_late_first_rest_snapshot_expires_incomplete_audit_without_blocking_queu
     assert store.capture_rest_snapshot_and_score("LATE", "US", datetime(2026, 8, 18, 10, 32), 101.0) == 0
     assert store.cases()[0].data_completeness == "EXPIRED"
     assert store.pending_forecast_audits("US") == []
+
+
+def test_due_forecast_audits_selects_only_a_missing_horizon_boundary(tmp_path):
+    case = ValidationCase(
+        case_id="US-due", version="test", symbol="DUE", market="US", session="US_PRE",
+        signal_time="2026-08-18T10:00:00", signal="대기", quote_price=100.0,
+        latest_trade_price=100.0, quote_age_seconds=0.0, quote_pass=True, entry=None,
+        predicted_regime="상승", actual_regime=None, regime_pass=None, target=None, target_basis="",
+        stop=None, validation_kind="FORECAST_AUDIT", batch_id="free-us-test",
+        horizons=[HorizonResult(minutes, 100.5, 101.0, 101.5, "상승") for minutes in (5, 15, 30)],
+        price_snapshots=[{"timestamp": "2026-08-18T10:05:10", "price": 101.0, "source": "KIS REST"}],
+    )
+    store = ValidationStore(tmp_path)
+    store.save(case)
+
+    assert store.due_forecast_audits("US", datetime(2026, 8, 18, 10, 5, 30), version="test", batch_id="free-us-test") == []
+    due = store.due_forecast_audits("US", datetime(2026, 8, 18, 10, 15, 20), version="test", batch_id="free-us-test")
+    assert [item.symbol for item in due] == ["DUE"]

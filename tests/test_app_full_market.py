@@ -202,7 +202,7 @@ def test_forecast_audit_starts_only_one_pending_path_per_market(tmp_path):
 
     assert first_recorded is True
     assert second_recorded is False
-    assert len(store.pending_forecast_audits("KR", version="6.4-3horizon-recommendations")) == 1
+    assert len(store.pending_forecast_audits("KR", version="6.5-free-100-path-validation")) == 1
 
 
 def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():
@@ -277,11 +277,11 @@ def test_latest_completed_forecast_case_uses_only_active_rule_version_and_comple
 
     store = SimpleNamespace(cases=lambda: [
         SimpleNamespace(validation_kind="FORECAST_AUDIT", version="6.2-old", data_completeness="COMPLETE", full_path_pass=True, signal_time="2026-08-18T10:30:00"),
-        SimpleNamespace(validation_kind="FORECAST_AUDIT", version="6.4-3horizon-recommendations", data_completeness="PENDING", full_path_pass=None, signal_time="2026-08-18T10:31:00"),
-        SimpleNamespace(validation_kind="FORECAST_AUDIT", version="6.4-3horizon-recommendations", data_completeness="COMPLETE", full_path_pass=False, signal_time="2026-08-18T10:32:00"),
+        SimpleNamespace(validation_kind="FORECAST_AUDIT", version="6.5-free-100-path-validation", data_completeness="PENDING", full_path_pass=None, signal_time="2026-08-18T10:31:00"),
+        SimpleNamespace(validation_kind="FORECAST_AUDIT", version="6.5-free-100-path-validation", data_completeness="COMPLETE", full_path_pass=False, signal_time="2026-08-18T10:32:00"),
     ])
 
-    latest = latest_completed_forecast_case(store, "6.4-3horizon-recommendations")
+    latest = latest_completed_forecast_case(store, "6.5-free-100-path-validation")
 
     assert latest is not None
     assert latest.signal_time == "2026-08-18T10:32:00"
