@@ -825,6 +825,51 @@ class ValidationStore:
             })
         return sorted(trace, key=lambda row: (str(row["분류"]), str(row["신호 시각"])))
 
+    def versioned_direction_confusion(self, version: str, market: str | None = None) -> list[dict[str, Any]]:
+        """Compare fixed prediction directions with actual directions at each horizon."""
+        rows = [
+            row for row in self.load_all()
+            if row.get("version") == version
+            and row.get("validation_kind") == "FORECAST_AUDIT"
+            and row.get("data_completeness") == "COMPLETE"
+            and (market is None or row.get("market") == market)
+        ]
+
+        def actual_direction(origin: float, actual: float) -> str:
+            if actual > origin * 1.0005:
+                return Regime.UP.value
+            if actual < origin * 0.9995:
+                return Regime.DOWN.value
+            return Regime.RANGE.value
+
+        counts: dict[tuple[int, str, str], int] = {}
+        for row in rows:
+            try:
+                origin = float(row.get("quote_price"))
+            except (TypeError, ValueError):
+                continue
+            if origin <= 0:
+                continue
+            for point in row.get("horizons", []):
+                try:
+                    minutes = int(point.get("minutes"))
+                    actual = float(point.get("actual"))
+                except (TypeError, ValueError):
+                    continue
+                predicted = str(point.get("predicted_direction") or "미기록")
+                key = (minutes, predicted, actual_direction(origin, actual))
+                counts[key] = counts.get(key, 0) + 1
+        return [
+            {
+                "구간": f"{minutes}분",
+                "예측 방향": predicted,
+                "실제 방향": actual,
+                "건수": count,
+                "일치": predicted == actual,
+            }
+            for (minutes, predicted, actual), count in sorted(counts.items(), key=lambda item: item[0])
+        ]
+
     def versioned_repeated_failure_insight(self, version: str, market: str | None = None) -> dict[str, Any] | None:
         """Return the lowest 30-minute direction-rate group with at least two observations."""
         candidates = [

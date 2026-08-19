@@ -1431,6 +1431,10 @@ def render_versioned_forecast_trace(store: ValidationStore, market_value: str, v
         f"완료 {len(rows)}건 · 3시간대 방향 적중 {matched}건 · 1개 이상 방향 실패 {len(rows) - matched}건 · "
         "v6.11은 신호 시점 입력 지표·Direction Engine 상세를 저장하지 않아 해당 열에 미저장으로 표시됩니다."
     )
+    confusion = store.versioned_direction_confusion(version, market_value)
+    if confusion:
+        st.caption("시간대별 예측 방향 ↔ 실제 방향 혼동 행렬")
+        st.dataframe(pd.DataFrame(confusion), hide_index=True, use_container_width=True)
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 

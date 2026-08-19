@@ -215,13 +215,13 @@ def test_versioned_forecast_breakdown_groups_only_matching_completed_forecasts(t
     rows = [
         {
             "version": "sample", "market": "US", "validation_kind": "FORECAST_AUDIT", "data_completeness": "COMPLETE",
-            "forecast_path_direction": "UP", "predicted_regime": "상승", "strategy": "TREND_SWING", "signal_time": "2026-08-19T09:10:00",
-            "horizons": [{"minutes": minute, "actual": 101.0, "direction_pass": True, "range_pass": True, "pass_all": True, "price_error_pct": 0.2} for minute in (5, 15, 30)],
+            "forecast_path_direction": "UP", "predicted_regime": "상승", "strategy": "TREND_SWING", "signal_time": "2026-08-19T09:10:00", "quote_price": 100.0,
+            "horizons": [{"minutes": minute, "predicted_direction": "UP", "actual": 101.0, "direction_pass": True, "range_pass": True, "pass_all": True, "price_error_pct": 0.2} for minute in (5, 15, 30)],
         },
         {
             "version": "sample", "market": "US", "validation_kind": "FORECAST_AUDIT", "data_completeness": "COMPLETE",
-            "forecast_path_direction": "UP", "predicted_regime": "상승", "strategy": "TREND_SWING", "signal_time": "2026-08-19T09:20:00",
-            "horizons": [{"minutes": minute, "actual": 99.0, "direction_pass": False, "range_pass": False, "pass_all": False, "price_error_pct": -0.4} for minute in (5, 15, 30)],
+            "forecast_path_direction": "UP", "predicted_regime": "상승", "strategy": "TREND_SWING", "signal_time": "2026-08-19T09:20:00", "quote_price": 100.0,
+            "horizons": [{"minutes": minute, "predicted_direction": "UP", "actual": 99.0, "direction_pass": False, "range_pass": False, "pass_all": False, "price_error_pct": -0.4} for minute in (5, 15, 30)],
         },
         {
             "version": "prior", "market": "US", "validation_kind": "FORECAST_AUDIT", "data_completeness": "COMPLETE",
@@ -238,7 +238,7 @@ def test_versioned_forecast_breakdown_groups_only_matching_completed_forecasts(t
         "30분 방향 적중률": 50.0, "30분 평균 가격 오차": -0.1, "30분 평균 절대 오차": 0.30000000000000004,
     }]
     assert breakdown["매매 구조"][0]["구분"] == "TREND_SWING"
-    assert breakdown["매매 구조·30분 방향"][0]["구분"] == "TREND_SWING · 30분 미기록"
+    assert breakdown["매매 구조·30분 방향"][0]["구분"] == "TREND_SWING · 30분 UP"
 
     insight = store.versioned_repeated_failure_insight("sample", "US")
     assert insight is not None
@@ -248,6 +248,10 @@ def test_versioned_forecast_breakdown_groups_only_matching_completed_forecasts(t
     assert len(trace) == 2
     assert {row["분류"] for row in trace} == {"3시간대 방향 적중", "1개 이상 방향 실패"}
     assert all(row["입력 진단"] == "v6.11 미저장" for row in trace)
+
+    confusion = store.versioned_direction_confusion("sample", "US")
+    assert sum(row["건수"] for row in confusion if row["구간"] == "5분") == 2
+    assert any(row["예측 방향"] == "UP" and row["실제 방향"] == Regime.UP.value for row in confusion)
 
 
 def test_rest_snapshot_store_scores_mature_forecast_audit_once(tmp_path):
