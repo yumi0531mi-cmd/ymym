@@ -311,6 +311,28 @@ def test_versioned_direction_engine_outcomes_uses_only_fixed_ready_snapshots(tmp
     }]
 
 
+def test_versioned_direction_postprocess_audit_keeps_raw_to_final_direction_diff(tmp_path):
+    rows = [{
+        "version": "sample", "market": "US", "validation_kind": "FORECAST_AUDIT", "data_completeness": "COMPLETE",
+        "quote_price": 100.0,
+        "horizons": [{"minutes": 15, "predicted_direction": "RANGE", "actual": 101.0}],
+        "analysis_snapshot": {
+            "direction_engines": {"15": {"score": 0.4}},
+            "direction_invalidation": {"risk_state": "SHAKEOUT", "pattern_fatigue": 12, "persistence_score": 58},
+        },
+    }]
+    store = ValidationStore(tmp_path)
+    store.load_all = lambda: rows  # type: ignore[method-assign]
+
+    summary = store.versioned_direction_postprocess_audit("sample", "US")
+
+    assert summary == [{
+        "구간": "15분", "원점수 방향": Regime.UP.value, "최종 방향": "RANGE", "위험 상태": "SHAKEOUT",
+        "실제 방향": Regime.UP.value, "완료": 1, "방향 변환": True,
+        "평균 원점수": 0.4, "평균 피로": 12.0, "평균 지속성": 58.0,
+    }]
+
+
 def test_rest_snapshot_store_scores_mature_forecast_audit_once(tmp_path):
     case = ValidationCase(
         case_id="US-TEST-audit", version="test", symbol="TEST", market="US", session="US_PRE",

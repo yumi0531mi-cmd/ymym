@@ -978,6 +978,74 @@ class ValidationStore:
             })
         return result
 
+    def versioned_direction_postprocess_audit(self, version: str, market: str | None = None) -> list[dict[str, Any]]:
+        """Expose fixed raw-score to final-direction transformations without recalculation."""
+        rows = [
+            row for row in self.load_all()
+            if row.get("version") == version
+            and row.get("validation_kind") == "FORECAST_AUDIT"
+            and row.get("data_completeness") == "COMPLETE"
+            and (market is None or row.get("market") == market)
+        ]
+
+        def actual_direction(origin: float, actual: float) -> str:
+            if actual > origin * 1.0005:
+                return Regime.UP.value
+            if actual < origin * 0.9995:
+                return Regime.DOWN.value
+            return Regime.RANGE.value
+
+        buckets: dict[tuple[int, str, str, str, str], list[dict[str, Any]]] = {}
+        for row in rows:
+            snapshot = row.get("analysis_snapshot") or {}
+            engines = snapshot.get("direction_engines") or {}
+            invalidation = snapshot.get("direction_invalidation") or {}
+            try:
+                origin = float(row.get("quote_price"))
+            except (TypeError, ValueError):
+                continue
+            if origin <= 0 or not isinstance(engines, dict):
+                continue
+            for point in row.get("horizons", []):
+                try:
+                    minutes = int(point.get("minutes"))
+                    actual = float(point.get("actual"))
+                except (TypeError, ValueError):
+                    continue
+                engine = engines.get(str(minutes))
+                if not isinstance(engine, dict) or not isinstance(engine.get("score"), (int, float)):
+                    continue
+                score = float(engine["score"])
+                raw_direction = Regime.UP.value if score >= 0.16 else Regime.DOWN.value if score <= -0.16 else Regime.RANGE.value
+                final_direction = str(point.get("predicted_direction") or "미기록")
+                risk = str(invalidation.get("risk_state") or "미기록")
+                realised = actual_direction(origin, actual)
+                buckets.setdefault((minutes, raw_direction, final_direction, risk, realised), []).append({
+                    "score": score,
+                    "fatigue": invalidation.get("pattern_fatigue"),
+                    "persistence": invalidation.get("persistence_score"),
+                })
+
+        def average(values: list[dict[str, Any]], key: str) -> float | None:
+            numeric = [float(row[key]) for row in values if isinstance(row.get(key), (int, float))]
+            return round(float(pd.Series(numeric).mean()), 4) if numeric else None
+
+        return [
+            {
+                "구간": f"{minutes}분",
+                "원점수 방향": raw_direction,
+                "최종 방향": final_direction,
+                "위험 상태": risk,
+                "실제 방향": realised,
+                "완료": len(values),
+                "방향 변환": raw_direction != final_direction,
+                "평균 원점수": average(values, "score"),
+                "평균 피로": average(values, "fatigue"),
+                "평균 지속성": average(values, "persistence"),
+            }
+            for (minutes, raw_direction, final_direction, risk, realised), values in sorted(buckets.items(), key=lambda item: item[0])
+        ]
+
     def versioned_repeated_failure_insight(self, version: str, market: str | None = None) -> dict[str, Any] | None:
         """Return the lowest 30-minute direction-rate group with at least two observations."""
         candidates = [

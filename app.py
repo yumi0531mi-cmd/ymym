@@ -1457,6 +1457,10 @@ def render_versioned_forecast_trace(store: ValidationStore, market_value: str, v
     if engine_outcomes:
         st.caption("Direction Engine 고정 점수·구성요소 ↔ 실제 방향 · 반복 원인 분석 전용")
         st.dataframe(pd.DataFrame(engine_outcomes), hide_index=True, use_container_width=True)
+    postprocess = store.versioned_direction_postprocess_audit(version, market_value)
+    if postprocess:
+        st.caption("원점수 방향 → 최종 ForecastPoint 방향 변환 · 위험/지속성 보정 감사")
+        st.dataframe(pd.DataFrame(postprocess), hide_index=True, use_container_width=True)
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 
