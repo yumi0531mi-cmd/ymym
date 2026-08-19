@@ -311,7 +311,14 @@ def analyze(
         persistence.swing.fatigue,
     )
     forecast_by_minutes = {point.minutes: point for point in forecast_points}
-    forecast_path_ready = {point.minutes for point in forecast_points} == {5, 15, 30}
+    engine_inputs = forecast_engine_diagnostics.get("direction_engines", {})
+    forecast_path_ready = (
+        {point.minutes for point in forecast_points} == {5, 15, 30}
+        and (
+            not engine_inputs
+            or all(bool((engine_inputs.get(str(minutes)) or {}).get("input_ready")) for minutes in (5, 15, 30))
+        )
+    )
     point_5 = forecast_by_minutes.get(5)
     point_15 = forecast_by_minutes.get(15)
     point_30 = forecast_by_minutes.get(30)

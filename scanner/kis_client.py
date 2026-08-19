@@ -527,12 +527,44 @@ class KISClient:
             # KIS uses separate exchange codes only for the US daytime market.
             # Regular/pre/after-hours minute charts retain NAS/NYS/AMS.
             request_exchange = day_exchange.get(exchange, exchange) if session_name == "US_DAY" else exchange
-            payload = self._get(
-                "/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice",
-                "HHDFS76950200",
-                {"AUTH": "", "EXCD": request_exchange, "SYMB": symbol, "NMIN": "1", "PINC": "1", "NEXT": "", "NREC": "120", "FILL": "", "KEYB": ""},
-            )
-            rows = payload.get("output2") or []
+            path = "/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice"
+            params = {"AUTH": "", "EXCD": request_exchange, "SYMB": symbol, "NMIN": "1", "PINC": "1", "NEXT": "", "NREC": "120", "FILL": "", "KEYB": ""}
+            rows: list[dict[str, Any]] = []
+            continuation = ""
+            # KIS permits up to 120 records on one response.  A 30-minute engine
+            # needs at least ten completed higher-timeframe bars for indicator
+            # warmup, so collect up to three official continuation pages (360
+            # one-minute bars) instead of treating three 30-minute bars as ready.
+            for _page in range(3):
+                try:
+                    payload, next_marker = self._get_page(path, "HHDFS76950200", params, continuation)
+                except KISError:
+                    if rows:
+                        break
+                    raise
+                page_rows = [row for row in list(payload.get("output2") or []) if isinstance(row, dict)]
+                rows.extend(page_rows)
+                if next_marker not in {"M", "F"} or not page_rows:
+                    break
+                keys: list[datetime] = []
+                for row in page_rows:
+                    try:
+                        parsed = datetime.strptime(
+                            f"{str(row.get('xymd') or '')}{str(row.get('xhms') or '').zfill(6)[:6]}",
+                            "%Y%m%d%H%M%S",
+                        )
+                        keys.append(parsed)
+                    except ValueError:
+                        continue
+                if not keys:
+                    break
+                params = {
+                    **params,
+                    "PINC": "1",
+                    "NEXT": "1",
+                    "KEYB": (min(keys) - timedelta(minutes=1)).strftime("%Y%m%d%H%M%S"),
+                }
+                continuation = "N"
             mapping = {"date": "xymd", "time": "xhms", "open": "open", "high": "high", "low": "low", "close": "last", "volume": "evol"}
 
         records = []

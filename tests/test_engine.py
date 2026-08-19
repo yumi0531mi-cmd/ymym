@@ -141,7 +141,7 @@ def test_korean_limit_up_is_not_candidate():
 
 
 def test_future_scoring_is_chronological_and_strict():
-    df = bars(180)
+    df = bars(360)
     current = float(df.close.iloc[-1])
     plan = analyze(quote(current), df)
     case = ValidationCase.from_plan(plan, current, "US_REGULAR")
@@ -377,7 +377,7 @@ def test_trend_pullback_keeps_fifteen_and_thirty_minute_up_structure_for_reentry
     from scanner.persistence_engine import RiskResult
     from scanner.strategy import TimeframeState
 
-    frame = bars()
+    frame = bars(360)
     monkeypatch.setattr(
         engine_module,
         "multi_timeframe",
@@ -428,7 +428,7 @@ def test_indicator_enrichment_adds_role_separated_direction_inputs():
 
 
 def test_forecast_path_keeps_horizon_specific_direction_engine_details():
-    forecast = forecast_path(bars(100, slope=.08), Regime.UP, reference_price=108.0)
+    forecast = forecast_path(bars(360, slope=.08), Regime.UP, reference_price=108.0)
 
     assert [point.minutes for point in forecast] == [5, 15, 30]
     assert getattr(forecast, "diagnostics")["market_state"] in {"TREND", "BREAKOUT", "TRANSITION", "RANGE"}
@@ -438,7 +438,20 @@ def test_forecast_path_keeps_horizon_specific_direction_engine_details():
     assert engines["5"]["input_timeframe_minutes"] == 5
     assert engines["15"]["input_timeframe_minutes"] == 15
     assert engines["30"]["input_timeframe_minutes"] == 30
-    assert engines["5"]["last_completed_timeframe_bar_at"] < str(bars(100).index[-1])
+    assert all(engine["input_ready"] is True for engine in engines.values())
+
+
+def test_forecast_path_refuses_underwarmed_higher_timeframe_directions():
+    forecast = forecast_path(bars(120, slope=.08), Regime.UP, reference_price=108.0)
+
+    assert [point.minutes for point in forecast] == [5]
+    engines = getattr(forecast, "diagnostics")["direction_engines"]
+    assert engines["5"]["input_ready"] is True
+    assert engines["15"]["input_ready"] is False
+    assert engines["15"]["completed_timeframe_bars"] == 7
+    assert engines["30"]["input_ready"] is False
+    assert engines["30"]["completed_timeframe_bars"] == 3
+    assert engines["5"]["last_completed_timeframe_bar_at"] < str(bars(120).index[-1])
 
 
 def test_completed_resample_excludes_partial_higher_timeframe_bar():

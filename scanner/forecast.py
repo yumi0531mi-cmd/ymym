@@ -41,6 +41,13 @@ HORIZON_WEIGHTS: dict[int, dict[str, dict[str, float]]] = {
 }
 
 
+# High-timeframe EMA, Bollinger, flow and regression components are not credible
+# with the previous 3 completed 30-minute bars.  These minima align to the
+# longest 10-bar warmup used by enrich(), while retaining a 20-bar baseline for
+# the more reactive five-minute engine.
+MIN_COMPLETED_TIMEFRAME_BARS = {5: 20, 15: 10, 30: 10}
+
+
 def _signed(value: float, scale: float = 1.0) -> float:
     return _bound(value / max(scale, 1e-9), -1.0, 1.0)
 
@@ -326,12 +333,12 @@ def forecast_path(
     horizon_scale = {5: 0.55, 15: 1.05, 30: 1.35}
     for horizon in (5, 15, 30):
         completed = resample_completed(frame, horizon)
-        if len(completed) < 3:
-            band = price * 0.0005
-            result.append(ForecastPoint(horizon, price - band, price, price + band, Regime.RANGE, f"{horizon}분 완료 고차 봉 부족", 50.0, None))
+        required_bars = MIN_COMPLETED_TIMEFRAME_BARS[horizon]
+        if len(completed) < required_bars:
             diagnostics["direction_engines"][str(horizon)] = {
                 "state": "TRANSITION", "input_timeframe_minutes": horizon,
-                "completed_timeframe_bars": len(completed), "input_ready": False,
+                "completed_timeframe_bars": len(completed), "minimum_completed_timeframe_bars": required_bars,
+                "input_ready": False,
             }
             continue
         recent = enrich(completed).tail(min(30, len(completed)))
@@ -362,6 +369,7 @@ def forecast_path(
             "timeframe_regime": local_regime.value,
             "input_timeframe_minutes": horizon,
             "completed_timeframe_bars": len(completed),
+            "minimum_completed_timeframe_bars": required_bars,
             "last_completed_timeframe_bar_at": str(completed.index[-1]),
             "input_ready": True,
             "score": round(float(score), 4),

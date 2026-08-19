@@ -33,11 +33,13 @@ def test_kr_quote_and_orderbook_are_separate_responses():
     assert quote.bid == 229500 and quote.ask == 230000
 
 
-def test_us_intraday_uses_exchange_date_not_today():
-    client = client_with([{"output2": [
+def test_us_intraday_uses_exchange_date_not_today(tmp_path):
+    client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
+    responses = [({"output2": [
         {"xymd": "20260814", "xhms": "093000", "open": "10", "high": "11", "low": "9", "last": "10.5", "evol": "100"},
         {"xymd": "20260814", "xhms": "093100", "open": "10.5", "high": "11", "low": "10", "last": "10.8", "evol": "120"},
-    ]}])
+    ]}, "")]
+    client._get_page = lambda *args, **kwargs: responses.pop(0)  # type: ignore[method-assign]
     bars = client.intraday("TEST", Market.US, "NAS")
     assert len(bars) == 2
     assert bars.index[0].year == 2026 and bars.index[0].month == 8 and bars.index[0].day == 14
@@ -49,10 +51,10 @@ def test_us_intraday_keeps_regular_session_exchange_code(monkeypatch):
     monkeypatch.setattr(kis_module, "market_session", lambda *_args, **_kwargs: "US_REGULAR")
     client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=".test_cache")
     calls = []
-    def fake_get(path, tr_id, params):
-        calls.append((path, tr_id, params))
-        return {"output2": []}
-    client._get = fake_get  # type: ignore[method-assign]
+    def fake_get_page(path, tr_id, params, tr_cont=""):
+        calls.append((path, tr_id, params, tr_cont))
+        return {"output2": []}, ""
+    client._get_page = fake_get_page  # type: ignore[method-assign]
     client.intraday("AAPL", Market.US, "NAS")
     assert calls[0][2]["EXCD"] == "NAS"
 
@@ -62,9 +64,36 @@ def test_us_intraday_uses_daytime_exchange_code_only_in_us_day(monkeypatch):
     monkeypatch.setattr(kis_module, "market_session", lambda *_args, **_kwargs: "US_DAY")
     client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=".test_cache")
     calls = []
-    client._get = lambda path, tr_id, params: calls.append((path, tr_id, params)) or {"output2": []}  # type: ignore[method-assign]
+    client._get_page = lambda path, tr_id, params, tr_cont="": calls.append((path, tr_id, params, tr_cont)) or ({"output2": []}, "")  # type: ignore[method-assign]
     client.intraday("AAPL", Market.US, "NAS")
     assert calls[0][2]["EXCD"] == "BAQ"
+
+
+def test_us_intraday_collects_continuation_pages_for_high_timeframe_warmup(tmp_path):
+    client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
+    pages = [
+        (["100100", "100000"], "M"),
+        (["095900", "095800"], "F"),
+        (["095700", "095600"], ""),
+    ]
+    calls = []
+
+    def fake_get_page(path, tr_id, params, tr_cont=""):
+        calls.append((path, tr_id, dict(params), tr_cont))
+        times, marker = pages.pop(0)
+        return ({"output2": [
+            {"xymd": "20260819", "xhms": value, "open": "10", "high": "11", "low": "9", "last": "10.5", "evol": "100"}
+            for value in times
+        ]}, marker)
+
+    client._get_page = fake_get_page  # type: ignore[method-assign]
+    bars = client.intraday("TEST", Market.US, "NAS")
+
+    assert len(bars) == 6
+    assert [call[3] for call in calls] == ["", "N", "N"]
+    assert calls[0][2]["NEXT"] == "" and calls[0][2]["KEYB"] == ""
+    assert calls[1][2]["NEXT"] == "1" and calls[1][2]["KEYB"] == "20260819095900"
+    assert calls[2][2]["KEYB"] == "20260819095700"
 
 
 def test_kr_intraday_uses_official_120_record_daily_minute_endpoint(tmp_path):
