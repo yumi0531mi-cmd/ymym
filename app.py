@@ -23,7 +23,7 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
-APP_VERSION = "6.9-priority-boundary-capture"
+APP_VERSION = "6.10-stale-tick-boundary-fallback"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
 CLIENT_CACHE_VERSION = "client-contract-v12-ranked-100-pages"
@@ -1206,10 +1206,30 @@ def run_hidden_forecast_validation(items: list[dict[str, Any]], cost_pct: float,
         live_card_snapshot(item, cost_pct, min_score, store)
 
 
+def tick_matches_due_forecast_boundary(case: Any, tick_at: datetime, observed_at: datetime, grace_seconds: int = 75) -> bool:
+    """Accept a trade tick only when it belongs to the currently due boundary window."""
+    signal_at = pd.Timestamp(case.signal_time)
+    observed = pd.Timestamp(observed_at)
+    tick_time = pd.Timestamp(tick_at)
+    if observed.tzinfo is None and signal_at.tzinfo is not None:
+        observed = observed.tz_localize(signal_at.tzinfo)
+    elif observed.tzinfo is not None and signal_at.tzinfo is None:
+        observed = observed.tz_localize(None)
+    if tick_time.tzinfo is None and signal_at.tzinfo is not None:
+        tick_time = tick_time.tz_localize(signal_at.tzinfo)
+    elif tick_time.tzinfo is not None and signal_at.tzinfo is None:
+        tick_time = tick_time.tz_localize(None)
+    for horizon in case.horizons:
+        cutoff = signal_at + pd.Timedelta(int(horizon.minutes), unit="min")
+        if cutoff <= observed <= cutoff + pd.Timedelta(grace_seconds, unit="s"):
+            return abs((tick_time - cutoff).total_seconds()) <= grace_seconds
+    return False
+
+
 def capture_forecast_boundary_case(store: ValidationStore, market: Market, case: Any, observed_at: datetime) -> None:
-    """Capture one due boundary as WebSocket tick, one REST fallback, or DATA_MISSING."""
+    """Capture one due boundary as a fresh WebSocket tick, one REST fallback, or DATA_MISSING."""
     tick = display_tick(market, case.symbol)
-    if tick is not None:
+    if tick is not None and tick_matches_due_forecast_boundary(case, tick.timestamp, observed_at):
         store.capture_rest_snapshot_and_score(
             case.symbol, market.value, tick.timestamp, tick.price, "KIS 체결", APP_VERSION
         )

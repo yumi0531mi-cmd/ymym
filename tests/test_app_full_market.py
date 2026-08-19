@@ -274,6 +274,36 @@ def test_boundary_rest_fallback_failure_marks_data_missing_and_releases_reservat
     budget.release.assert_called_once_with("경계 수집", 1)
 
 
+def test_boundary_capture_uses_rest_fallback_when_websocket_tick_is_stale():
+    from app import capture_forecast_boundary_case
+
+    observed_at = datetime(2026, 8, 19, 10, 5, 20)
+    case = SimpleNamespace(
+        symbol="005930", exchange="", signal_time="2026-08-19T10:00:00",
+        horizons=[SimpleNamespace(minutes=5)],
+    )
+    store = SimpleNamespace(capture_rest_snapshot_and_score=Mock())
+    budget = SimpleNamespace(release=Mock())
+    client = SimpleNamespace(request_budget=budget)
+    stale_tick = RealtimeTick("005930", Market.KR, 69900, 1.2, datetime(2026, 8, 19, 10, 3, 0))
+    rest_quote = _quote()
+    rest_quote.timestamp = observed_at
+
+    with (
+        patch("app.display_tick", return_value=stale_tick),
+        patch("app.current_client", return_value=client),
+        patch("app._load_quote_record", return_value={"symbol": "005930"}) as load_quote,
+        patch("app._quote_from_cache_record", return_value=rest_quote),
+    ):
+        capture_forecast_boundary_case(store, Market.KR, case, observed_at)
+
+    load_quote.assert_called_once_with("005930", "KR", "", "경계 수집")
+    store.capture_rest_snapshot_and_score.assert_called_once_with(
+        "005930", "KR", observed_at, 70000, "KIS REST", "6.10-stale-tick-boundary-fallback"
+    )
+    budget.release.assert_not_called()
+
+
 def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():
     from app import actionable_display_levels
 
