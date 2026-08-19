@@ -313,7 +313,7 @@ def test_boundary_capture_uses_rest_fallback_when_websocket_tick_is_stale():
 
     load_quote.assert_called_once_with("005930", "KR", "", "경계 수집")
     store.capture_rest_snapshot_and_score.assert_called_once_with(
-        "005930", "KR", observed_at, 70000, "KIS REST", "6.15-complete-timeframe-history"
+        "005930", "KR", observed_at, 70000, "KIS REST", "6.16-boundary-fallback-verification"
     )
     budget.release.assert_not_called()
 
