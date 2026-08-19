@@ -1788,12 +1788,15 @@ if search_query:
             direct_request = {"symbol": ticker, "name": ticker, "exchange": us_exchange_for(ticker)}
         else:
             st.warning("미국 종목은 티커로 입력해 주세요. 예: NVDA, AAPL, SOXL")
-current_session = market_session(market)
+current_session = "AUDIT_ONLY" if audit_only else market_session(market)
 # Start the lightweight 15-second boundary collector before any rank/quote/bar
 # analysis. Its fragment then continues independently while the main screen
 # performs slower candidate work.
-capture_pending_forecast_paths(store, market.value)
-if current_session not in ACTIVE_CARD_SESSIONS:
+if not audit_only:
+    capture_pending_forecast_paths(store, market.value)
+if audit_only:
+    st.caption("감사 전용 모드 · 후보 분석·경계 수집·신규 표본 생성·사후 채점을 실행하지 않습니다.")
+elif current_session not in ACTIVE_CARD_SESSIONS:
     closed_message = (
         "국내 정규장이 종료되었습니다. 다음 정규장에는 분석이 완료된 후보 카드만 표시합니다."
         if market == Market.KR
