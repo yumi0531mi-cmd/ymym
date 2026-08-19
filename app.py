@@ -1461,6 +1461,10 @@ def render_versioned_forecast_trace(store: ValidationStore, market_value: str, v
     if postprocess:
         st.caption("원점수 방향 → 최종 ForecastPoint 방향 변환 · 위험/지속성 보정 감사")
         st.dataframe(pd.DataFrame(postprocess), hide_index=True, use_container_width=True)
+    processing_effect = store.versioned_direction_processing_effect_summary(version, market_value)
+    if processing_effect:
+        st.caption("원점수 방향 ↔ 최종 방향 적중률 · 방향 변환 순효과")
+        st.dataframe(pd.DataFrame(processing_effect), hide_index=True, use_container_width=True)
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 

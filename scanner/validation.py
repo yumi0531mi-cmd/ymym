@@ -1046,6 +1046,68 @@ class ValidationStore:
             for (minutes, raw_direction, final_direction, risk, realised), values in sorted(buckets.items(), key=lambda item: item[0])
         ]
 
+    def versioned_direction_processing_effect_summary(self, version: str, market: str | None = None) -> list[dict[str, Any]]:
+        """Compare raw engine direction and final forecast direction against the same fixed outcomes."""
+        rows = [
+            row for row in self.load_all()
+            if row.get("version") == version
+            and row.get("validation_kind") == "FORECAST_AUDIT"
+            and row.get("data_completeness") == "COMPLETE"
+            and (market is None or row.get("market") == market)
+        ]
+
+        def actual_direction(origin: float, actual: float) -> str:
+            if actual > origin * 1.0005:
+                return Regime.UP.value
+            if actual < origin * 0.9995:
+                return Regime.DOWN.value
+            return Regime.RANGE.value
+
+        stats: dict[int, dict[str, int]] = {minutes: {"total": 0, "raw": 0, "final": 0, "changed": 0, "improved": 0, "worsened": 0} for minutes in (5, 15, 30)}
+        for row in rows:
+            snapshot = row.get("analysis_snapshot") or {}
+            engines = snapshot.get("direction_engines") or {}
+            try:
+                origin = float(row.get("quote_price"))
+            except (TypeError, ValueError):
+                continue
+            if origin <= 0 or not isinstance(engines, dict):
+                continue
+            for point in row.get("horizons", []):
+                try:
+                    minutes = int(point.get("minutes"))
+                    actual = float(point.get("actual"))
+                except (TypeError, ValueError):
+                    continue
+                if minutes not in stats:
+                    continue
+                engine = engines.get(str(minutes))
+                if not isinstance(engine, dict) or not isinstance(engine.get("score"), (int, float)):
+                    continue
+                score = float(engine["score"])
+                raw = Regime.UP.value if score >= 0.16 else Regime.DOWN.value if score <= -0.16 else Regime.RANGE.value
+                final = str(point.get("predicted_direction") or "미기록")
+                realised = actual_direction(origin, actual)
+                item = stats[minutes]
+                item["total"] += 1
+                raw_pass = raw == realised
+                final_pass = final == realised
+                item["raw"] += int(raw_pass)
+                item["final"] += int(final_pass)
+                if raw != final:
+                    item["changed"] += 1
+                    item["improved"] += int(final_pass and not raw_pass)
+                    item["worsened"] += int(raw_pass and not final_pass)
+        return [{
+            "구간": f"{minutes}분",
+            "고정 표본": item["total"],
+            "원점수 방향 적중률": round(item["raw"] / item["total"] * 100, 1) if item["total"] else None,
+            "최종 방향 적중률": round(item["final"] / item["total"] * 100, 1) if item["total"] else None,
+            "방향 변환": item["changed"],
+            "변환 개선": item["improved"],
+            "변환 악화": item["worsened"],
+        } for minutes, item in stats.items()]
+
     def versioned_repeated_failure_insight(self, version: str, market: str | None = None) -> dict[str, Any] | None:
         """Return the lowest 30-minute direction-rate group with at least two observations."""
         candidates = [

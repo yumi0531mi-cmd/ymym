@@ -333,6 +333,30 @@ def test_versioned_direction_postprocess_audit_keeps_raw_to_final_direction_diff
     }]
 
 
+def test_versioned_direction_processing_effect_summary_compares_same_fixed_outcome(tmp_path):
+    rows = [{
+        "version": "sample", "market": "US", "validation_kind": "FORECAST_AUDIT", "data_completeness": "COMPLETE",
+        "quote_price": 100.0,
+        "horizons": [{"minutes": 5, "predicted_direction": Regime.RANGE.value, "actual": 101.0}],
+        "analysis_snapshot": {"direction_engines": {"5": {"score": 0.4}}},
+    }, {
+        "version": "sample", "market": "US", "validation_kind": "FORECAST_AUDIT", "data_completeness": "COMPLETE",
+        "quote_price": 100.0,
+        "horizons": [{"minutes": 5, "predicted_direction": Regime.UP.value, "actual": 101.0}],
+        "analysis_snapshot": {"direction_engines": {"5": {"score": 0.4}}},
+    }]
+    store = ValidationStore(tmp_path)
+    store.load_all = lambda: rows  # type: ignore[method-assign]
+
+    summary = store.versioned_direction_processing_effect_summary("sample", "US")
+
+    assert summary[0] == {
+        "구간": "5분", "고정 표본": 2, "원점수 방향 적중률": 100.0, "최종 방향 적중률": 50.0,
+        "방향 변환": 1, "변환 개선": 0, "변환 악화": 1,
+    }
+    assert summary[1]["고정 표본"] == 0
+
+
 def test_rest_snapshot_store_scores_mature_forecast_audit_once(tmp_path):
     case = ValidationCase(
         case_id="US-TEST-audit", version="test", symbol="TEST", market="US", session="US_PRE",
