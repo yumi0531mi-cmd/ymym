@@ -23,7 +23,7 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
-APP_VERSION = "6.10-stale-tick-boundary-fallback"
+APP_VERSION = "6.11-isolated-boundary-capture"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
 CLIENT_CACHE_VERSION = "client-contract-v12-ranked-100-pages"
@@ -39,6 +39,7 @@ MAX_FAST_SHORTLIST = 15
 # 확인을 포함하고, 이전 표본의 5·15·30분 실제 가격도 별도 수집하므로 KIS 분당
 # 30건 호출 제한 안에서 운용한다.
 MAX_PENDING_FORECAST_WATCHES = 8
+CAPTURE_INTEGRITY_MAX_PENDING = 5
 FREE_VALIDATION_BATCH_SIZE = 100
 FREE_VALIDATION_STARTS_PER_MINUTE = 1
 VALIDATION_ANALYSIS_CALL_ALLOWANCE = 4
@@ -276,6 +277,11 @@ def default_market_label() -> str:
     if kr_session not in ACTIVE_CARD_SESSIONS and us_session in ACTIVE_CARD_SESSIONS:
         return "미국"
     return "국내"
+
+
+def capture_integrity_enabled(value: Any) -> bool:
+    """Enable the collection-only screen path from an explicit diagnostic URL flag."""
+    return str(value).strip().lower() in {"1", "true", "yes", "5"}
 
 
 def eligible_price(candidate: dict[str, Any], market: Market) -> bool:
@@ -1365,12 +1371,20 @@ def free_validation_batch_state(market: Market, candidates: list[dict[str, Any]]
 @st.fragment(run_every=60.0)
 def run_free_validation_batch(
     market_value: str, candidates: list[dict[str, Any]], cost_pct: float, min_score: int, store: ValidationStore,
+    capture_integrity: bool = False,
 ) -> None:
     """Start a small new cohort each minute while the free Streamlit screen stays open."""
     market = Market(market_value)
     state = free_validation_batch_state(market, candidates)
     batch_candidates = candidates[:FREE_VALIDATION_BATCH_SIZE]
     start = int(state.get("next_index", 0))
+    active_cases = store.pending_forecast_audits(market.value, version=APP_VERSION, limit=100)
+    if capture_integrity and len(active_cases) >= CAPTURE_INTEGRITY_MAX_PENDING:
+        st.caption(
+            f"수집 안정성 경계 수집 우선 · 대기 표본 {len(active_cases)}/{CAPTURE_INTEGRITY_MAX_PENDING}건 · "
+            "카드 재분석 없이 5·15·30분 실제가를 먼저 저장합니다."
+        )
+        return
     if start >= len(batch_candidates):
         cases = [
             case for case in store.cases()
@@ -1475,7 +1489,7 @@ def render_latest_forecast_result(store: ValidationStore) -> None:
 
 def render_live_card(
     item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore,
-    refresh_seconds: int, stage: str = "FINAL_BUY",
+    refresh_seconds: int, stage: str = "FINAL_BUY", live_updates: bool = True,
 ) -> None:
     """Render a price-first card with 1-second tick and 1-minute structure refreshes."""
     quote: Quote = item["quote"]
@@ -1502,16 +1516,20 @@ def render_live_card(
         evidence_text = " · ".join(str(value) for value in evidence[:3])
         confidence_text = f" · 증거 신뢰도 {float(confidence):.0f}%" if isinstance(confidence, (int, float)) else ""
         st.caption(f"매매유형: {trade_type}{confidence_text}" + (f" · {evidence_text}" if evidence_text else ""))
-        render_realtime_price(
-            refresh_seconds,
-            quote.symbol,
-            quote.market.value,
-            str(item.get("exchange") or ""),
-            quote.price,
-            quote.previous_close,
-            quote.timestamp.isoformat(),
-        )
-        render_live_plan_fields(item, cost_pct, min_score, store)
+        if live_updates:
+            render_realtime_price(
+                refresh_seconds,
+                quote.symbol,
+                quote.market.value,
+                str(item.get("exchange") or ""),
+                quote.price,
+                quote.previous_close,
+                quote.timestamp.isoformat(),
+            )
+            render_live_plan_fields(item, cost_pct, min_score, store)
+        else:
+            st.caption("수집 안정성 확인 중 · 카드 현재가·구조 재분석은 경계 실제가 저장 뒤에 다시 시작합니다.")
+            render_plan_fields(item)
 
 
 def render_card_detail(item: dict[str, Any]) -> None:
@@ -1613,6 +1631,7 @@ store = ValidationStore(VALIDATION_ROOT, event_store=event_store)
 with st.sidebar:
     st.title("실시간 설정")
     requested_market = str(st.query_params.get("market", "")).strip().upper()
+    capture_integrity = capture_integrity_enabled(st.query_params.get("capture_integrity", ""))
     initial_market_label = "미국" if requested_market in {"US", "미국"} else default_market_label()
     market_label = st.radio(
         "시장",
@@ -1768,11 +1787,11 @@ realtime_hub.configure(
     for card in analysis_cards
 )
 
-if analysis_cards:
+if analysis_cards and not capture_integrity:
     run_hidden_forecast_validation(analysis_cards, float(cost_pct), int(min_score), store)
 
 if candidates and event_store.configured:
-    run_free_validation_batch(market.value, candidates, float(cost_pct), int(min_score), store)
+    run_free_validation_batch(market.value, candidates, float(cost_pct), int(min_score), store, capture_integrity)
 elif candidates:
     st.caption("100개 예측 검증은 영구 저장 연결이 필요합니다. 현재는 앱 재시작 시 기록이 사라질 수 있어 시작하지 않습니다.")
 
@@ -1786,7 +1805,7 @@ if cards:
     st.subheader(f"상승 차트 · 현재 1회 진입 가능 {len(cards)}종목")
     st.caption(f"정밀 분석 {analyzed_count}개 중 현재 진입 조건 통과 {len(cards)}개 · {updated_at.strftime('%H:%M:%S')} · {realtime_hub.status_label()} · {source_text}")
     for card_item in cards:
-        render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "FINAL_BUY")
+        render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "FINAL_BUY", not capture_integrity)
 elif kis_connected and not errors and not candidates:
     limit_text = "30만 원 미만" if market == Market.KR else "200달러 미만"
     st.info(f"현재 {limit_text} 가격 상한 안의 거래량·거래대금 후보풀을 받지 못했습니다. 순위 API를 다음 갱신 때 다시 확인합니다.")
@@ -1805,13 +1824,13 @@ if entry_wait_cards:
     st.subheader(f"1차 익절 가능 · 현재 진입 대기 {len(entry_wait_cards)}종목")
     st.caption("목표 구조는 남아 있으나 현재 위치가 추격 구간이거나 5분 눌림 진행 중입니다. 각 카드의 추천 매수가가 재진입 참고 가격입니다.")
     for card_item in entry_wait_cards:
-        render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, card_stage(card_item))
+        render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, card_stage(card_item), not capture_integrity)
 
 if observation_cards:
     st.subheader(f"정밀 분석 · 관찰 후보 {len(observation_cards)}종목")
     st.caption("현재 진입 카드는 아니지만, 각 종목의 실제 차단 관문·계산값·요구 기준을 바로 확인합니다.")
     for card_item in observation_cards:
-        render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "OBSERVATION")
+        render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "OBSERVATION", not capture_integrity)
 
 with st.expander("검증·관찰 상세", expanded=False):
     render_latest_forecast_result(store)

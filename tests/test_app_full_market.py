@@ -115,6 +115,15 @@ def test_default_market_uses_active_us_session_after_korean_close():
         assert default_market_label() == "국내"
 
 
+def test_capture_integrity_flag_requires_explicit_enabled_value():
+    from app import capture_integrity_enabled
+
+    assert capture_integrity_enabled("5") is True
+    assert capture_integrity_enabled("true") is True
+    assert capture_integrity_enabled("0") is False
+    assert capture_integrity_enabled("") is False
+
+
 def test_live_validation_records_only_actionable_buy_signal():
     from app import record_and_score_live_validation
 
@@ -299,7 +308,7 @@ def test_boundary_capture_uses_rest_fallback_when_websocket_tick_is_stale():
 
     load_quote.assert_called_once_with("005930", "KR", "", "경계 수집")
     store.capture_rest_snapshot_and_score.assert_called_once_with(
-        "005930", "KR", observed_at, 70000, "KIS REST", "6.10-stale-tick-boundary-fallback"
+        "005930", "KR", observed_at, 70000, "KIS REST", "6.11-isolated-boundary-capture"
     )
     budget.release.assert_not_called()
 
