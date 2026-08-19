@@ -223,6 +223,32 @@ def test_forecast_audit_starts_only_one_pending_path_per_market(tmp_path):
     assert len(store.pending_forecast_audits("KR", version=APP_VERSION)) == 1
 
 
+def test_pending_forecast_progress_uses_persisted_snapshots_and_remaining_time():
+    from app import pending_forecast_progress_rows
+    from scanner.validation import HorizonResult, ValidationCase
+
+    case = ValidationCase(
+        case_id="KR-005930-pending", version="6.6-holdout-calibration-validation", symbol="005930",
+        market="KR", session="KR_REGULAR", signal_time="2026-08-19T10:00:00", signal="대기",
+        quote_price=70000.0, latest_trade_price=70000.0, quote_age_seconds=0.0, quote_pass=True,
+        entry=None, predicted_regime="박스권", actual_regime=None, regime_pass=None,
+        target=None, target_basis="", stop=None, validation_kind="FORECAST_AUDIT",
+        horizons=[HorizonResult(minutes, 69900.0, 70000.0, 70100.0, "박스권") for minutes in (5, 15, 30)],
+        price_snapshots=[{"timestamp": "2026-08-19T10:05:00", "price": 70010.0, "source": "KIS REST"}],
+    )
+
+    class PendingStore:
+        def pending_forecast_audits(self, *_args, **_kwargs):
+            return [case]
+
+    rows = pending_forecast_progress_rows(PendingStore(), "KR", datetime(2026, 8, 19, 10, 16))
+
+    assert rows == [{
+        "종목": "005930", "신호 시각": "10:00:00", "5분 실제가": "수집 완료",
+        "15분 실제가": "수집 시각 대기", "30분 실제가": "대기 · 14분", "30분 완료까지": "약 14분",
+    }]
+
+
 def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():
     from app import actionable_display_levels
 

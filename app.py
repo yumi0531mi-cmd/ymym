@@ -1222,6 +1222,68 @@ def capture_pending_forecast_paths(store: ValidationStore, market_value: str) ->
         )
 
 
+def pending_forecast_progress_rows(
+    store: ValidationStore, market_value: str, observed_at: datetime | None = None,
+) -> list[dict[str, str]]:
+    """Expose persisted 5·15·30-minute audit progress without estimating missing prices."""
+    now = pd.Timestamp(observed_at or datetime.now().astimezone())
+    rows: list[dict[str, str]] = []
+    cases = store.pending_forecast_audits(
+        market_value, version=APP_VERSION, limit=MAX_PENDING_FORECAST_WATCHES,
+    )
+    for case in cases:
+        signal_at = pd.Timestamp(case.signal_time)
+        comparable_now = now
+        if comparable_now.tzinfo is None and signal_at.tzinfo is not None:
+            comparable_now = comparable_now.tz_localize(signal_at.tzinfo)
+        elif comparable_now.tzinfo is not None and signal_at.tzinfo is None:
+            comparable_now = comparable_now.tz_localize(None)
+        snapshots: list[pd.Timestamp] = []
+        for snapshot in case.price_snapshots:
+            try:
+                captured_at = pd.Timestamp(snapshot["timestamp"])
+                if captured_at.tzinfo is None and signal_at.tzinfo is not None:
+                    captured_at = captured_at.tz_localize(signal_at.tzinfo)
+                elif captured_at.tzinfo is not None and signal_at.tzinfo is None:
+                    captured_at = captured_at.tz_localize(None)
+                snapshots.append(captured_at)
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        def horizon_status(minutes: int) -> str:
+            cutoff = signal_at + pd.Timedelta(minutes, unit="min")
+            if any(abs((captured_at - cutoff).total_seconds()) <= 75 for captured_at in snapshots):
+                return "수집 완료"
+            seconds_left = (cutoff - comparable_now).total_seconds()
+            if seconds_left > 0:
+                return f"대기 · {max(1, int((seconds_left + 59) // 60))}분"
+            if abs(seconds_left) <= 75:
+                return "수집 시각 대기"
+            return "수집 누락"
+
+        final_cutoff = signal_at + pd.Timedelta(30, unit="min")
+        final_seconds_left = (final_cutoff - comparable_now).total_seconds()
+        rows.append({
+            "종목": case.symbol,
+            "신호 시각": signal_at.strftime("%H:%M:%S"),
+            "5분 실제가": horizon_status(5),
+            "15분 실제가": horizon_status(15),
+            "30분 실제가": horizon_status(30),
+            "30분 완료까지": "완료 채점 대기" if final_seconds_left <= 0 else f"약 {max(1, int((final_seconds_left + 59) // 60))}분",
+        })
+    return rows
+
+
+@st.fragment(run_every=60.0)
+def render_pending_forecast_progress(store: ValidationStore, market_value: str) -> None:
+    """Show live progress for persisted parallel forecast audits while the page remains open."""
+    rows = pending_forecast_progress_rows(store, market_value)
+    if not rows:
+        return
+    st.caption(f"병렬 예측 검증 진행 {len(rows)}종목 · 실제 저장 시각 기준")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+
 def free_validation_batch_state(market: Market, candidates: list[dict[str, Any]]) -> dict[str, Any]:
     """Create one browser-open, persistent-session batch from the market candidate pool."""
     key = f"free_validation_batch_{market.value}"
@@ -1621,6 +1683,8 @@ if candidates and event_store.configured:
     run_free_validation_batch(market.value, candidates, float(cost_pct), int(min_score), store)
 elif candidates:
     st.caption("100개 예측 검증은 영구 저장 연결이 필요합니다. 현재는 앱 재시작 시 기록이 사라질 수 있어 시작하지 않습니다.")
+
+render_pending_forecast_progress(store, market.value)
 
 if cards:
     updated_at = max(card["quote"].timestamp for card in cards)
