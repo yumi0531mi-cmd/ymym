@@ -23,7 +23,7 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
-APP_VERSION = "6.5-free-100-path-validation"
+APP_VERSION = "6.5.1-free-100-path-validation-retry"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
 CLIENT_CACHE_VERSION = "client-contract-v12-ranked-100-pages"
@@ -1231,8 +1231,9 @@ def run_free_validation_batch(
     ]
     complete = sum(case.data_completeness == "COMPLETE" for case in cases)
     st.caption(
-        f"100개 예측 검증 진행 · 시작 {len(cases)}/{len(batch_candidates)} · 30분 완료 {complete}/{len(batch_candidates)} · "
-        f"이번 분 시작 {started}개 · 화면을 열어 두면 다음 표본을 이어 기록합니다."
+        f"100개 예측 검증 진행 · v{APP_VERSION} · 시작 {len(cases)}/{len(batch_candidates)} · "
+        f"30분 완료 {complete}/{len(batch_candidates)} · 이번 분 시작 {started}개 · "
+        f"순환 {start + 1 if batch_candidates else 0}/{len(batch_candidates)} · 화면을 열어 두면 다음 표본을 이어 기록합니다."
     )
     if deferred_reasons:
         st.caption("이번 분 대기: " + " · ".join(f"{reason} {count}" for reason, count in deferred_reasons.items()))
