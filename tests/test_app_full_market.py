@@ -164,6 +164,24 @@ def test_forecast_audit_records_complete_watch_path_separately():
     assert saved_case.price_source == "KIS 체결"
 
 
+def test_forecast_audit_records_complete_direction_path_even_when_price_structure_is_unaligned():
+    from app import record_forecast_accuracy_audit
+
+    store = SimpleNamespace(
+        score_ready=Mock(return_value=0),
+        has_pending_forecast_audit=Mock(return_value=False),
+        save_once=Mock(return_value=(Path("case.json"), True)),
+    )
+    tick = RealtimeTick("005930", Market.KR, 70000, 1.2, datetime(2026, 8, 17, 10, 0))
+    hub = SimpleNamespace(tick=Mock(return_value=tick))
+
+    with patch("app.current_realtime_hub", return_value=hub):
+        _, recorded = record_forecast_accuracy_audit(store, _plan(), _quote(), _bars(), False, 0.05)
+
+    assert recorded is True
+    assert store.save_once.call_args.args[0].validation_kind == "FORECAST_AUDIT"
+
+
 def test_forecast_audit_uses_labeled_kis_rest_snapshot_while_trade_tick_reconnects():
     from app import record_forecast_accuracy_audit
 

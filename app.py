@@ -218,6 +218,13 @@ def load_bars(symbol: str, market_value: str, exchange: str, cache_version: str)
     )
 
 
+def load_fresh_validation_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
+    """Use current completed bars for the compact, rotating validation cohort only."""
+    return get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint()).intraday(
+        symbol, Market(market_value), exchange
+    )
+
+
 def merge_live_completed_bars(base: pd.DataFrame, symbol: str, market: Market) -> pd.DataFrame:
     """Overlay locally completed one-minute KIS trade bars onto cached REST history."""
     rows = current_realtime_hub().completed_bar_rows(market, symbol)
@@ -682,11 +689,7 @@ def record_forecast_accuracy_audit(
     scored_cases = store.score_ready(quote.symbol, quote.market.value, bars, float(cost_pct))
     live_tick = current_realtime_hub().tick(quote.market, quote.symbol)
     forecast_minutes = {point.minutes for point in getattr(plan, "forecasts", [])}
-    if not (
-        chart_aligned
-        and bool(plan.diagnostics.get("forecast_path_ready"))
-        and forecast_minutes == {5, 15, 30}
-    ):
+    if not (bool(plan.diagnostics.get("forecast_path_ready")) and forecast_minutes == {5, 15, 30}):
         return scored_cases, False
     observed_price = live_tick.price if live_tick is not None else quote.price
     observed_time = live_tick.timestamp if live_tick is not None else quote.timestamp
@@ -714,14 +717,17 @@ def record_forecast_accuracy_audit(
 
 def analyze_card(
     symbol: str, market: Market, exchange: str, cost_pct: float, min_score: int, store: ValidationStore,
-    validation_batch_id: str = "",
+    validation_batch_id: str = "", fresh_validation_bars: bool = False,
 ) -> dict[str, Any]:
     """Fetch and analyze one automatic dashboard card from REST history plus live completed bars."""
     rest_quote = load_rest_dashboard_quote(symbol, market.value, exchange)
     quote = quote_with_live_tick(rest_quote)
-    bars = merge_live_completed_bars(
-        load_bars(symbol, market.value, exchange, CLIENT_CACHE_VERSION), symbol, market
+    base_bars = (
+        load_fresh_validation_bars(symbol, market.value, exchange)
+        if fresh_validation_bars
+        else load_bars(symbol, market.value, exchange, CLIENT_CACHE_VERSION)
     )
+    bars = merge_live_completed_bars(base_bars, symbol, market)
     chart_aligned, chart_alignment_reason = completed_bar_alignment(quote, bars)
     cycle = cycle_store.get(symbol, market, quote.timestamp)
     preliminary = analyze(
@@ -1184,10 +1190,15 @@ def run_free_validation_batch(
     """Start a small new cohort each minute while the free Streamlit screen stays open."""
     market = Market(market_value)
     state = free_validation_batch_state(market, candidates)
-    start = int(state.get("next_index", 0))
     batch_candidates = candidates[:FREE_VALIDATION_BATCH_SIZE]
+    start = int(state.get("next_index", 0))
+    if start >= len(batch_candidates):
+        # Revisit a compact candidate pool with current bars if the first pass was
+        # waiting for completed 1-minute data instead of ending with zero records.
+        start = 0
     selected = batch_candidates[start:start + FREE_VALIDATION_STARTS_PER_MINUTE]
     started = 0
+    deferred_reasons: dict[str, int] = {}
     for candidate in selected:
         symbol = str(candidate.get("symbol") or "").upper()
         if not symbol:
@@ -1195,11 +1206,23 @@ def run_free_validation_batch(
         exchange = str(candidate.get("exchange") or ("NAS" if market == Market.US else ""))
         try:
             before = len(store.pending_forecast_audits(market.value, version=APP_VERSION, limit=100, batch_id=str(state["batch_id"])))
-            analyze_card(symbol, market, exchange, cost_pct, min_score, store, validation_batch_id=str(state["batch_id"]))
+            item = analyze_card(
+                symbol, market, exchange, cost_pct, min_score, store,
+                validation_batch_id=str(state["batch_id"]), fresh_validation_bars=True,
+            )
             after = len(store.pending_forecast_audits(market.value, version=APP_VERSION, limit=100, batch_id=str(state["batch_id"])))
             started += int(after > before)
+            if after == before:
+                plan = item["plan"]
+                if not bool(plan.diagnostics.get("forecast_path_ready")):
+                    reason = "5·15·30분 예측 경로 미완성"
+                elif {point.minutes for point in getattr(plan, "forecasts", [])} != {5, 15, 30}:
+                    reason = "시간대별 예측값 부족"
+                else:
+                    reason = "같은 종목 예측 기록 대기"
+                deferred_reasons[reason] = deferred_reasons.get(reason, 0) + 1
         except (KISError, OSError, ValueError, KeyError):
-            continue
+            deferred_reasons["KIS 분봉 재수신 대기"] = deferred_reasons.get("KIS 분봉 재수신 대기", 0) + 1
     state["next_index"] = min(len(batch_candidates), start + FREE_VALIDATION_STARTS_PER_MINUTE)
     st.session_state[f"free_validation_batch_{market.value}"] = state
     cases = [
@@ -1211,6 +1234,8 @@ def run_free_validation_batch(
         f"100개 예측 검증 진행 · 시작 {len(cases)}/{len(batch_candidates)} · 30분 완료 {complete}/{len(batch_candidates)} · "
         f"이번 분 시작 {started}개 · 화면을 열어 두면 다음 표본을 이어 기록합니다."
     )
+    if deferred_reasons:
+        st.caption("이번 분 대기: " + " · ".join(f"{reason} {count}" for reason, count in deferred_reasons.items()))
 
 
 def latest_completed_forecast_case(store: ValidationStore, version: str) -> Any | None:
