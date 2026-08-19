@@ -135,6 +135,34 @@ def test_future_scoring_is_chronological_and_strict():
     assert len([h for h in case.horizons if h.actual is not None]) == 3
 
 
+def test_validation_snapshot_preserves_soft_and_hard_stops_separately():
+    df = bars(180)
+    current = float(df.close.iloc[-1])
+    plan = analyze(quote(current), df)
+    plan.soft_stop = current * 0.99
+    plan.hard_stop = current * 0.98
+    plan.stop = plan.hard_stop
+    plan.target = current * 1.01
+    case = ValidationCase.from_plan(plan, current, "US_REGULAR")
+    start = datetime.fromisoformat(case.signal_time)
+    idx = pd.date_range(start, periods=31, freq="min")
+    future = pd.DataFrame({
+        "open": current,
+        "high": [current, current, current * 1.01] + [current] * 28,
+        "low": [current, current * 0.985, current * 0.995] + [current] * 28,
+        "close": current,
+        "volume": 1000,
+    }, index=idx)
+
+    case.score_future_bars(future)
+
+    assert case.soft_stop == current * 0.99
+    assert case.hard_stop == current * 0.98
+    assert case.soft_stop_first is True
+    assert case.hard_stop_first is False
+    assert case.target_first is True
+
+
 def test_forecast_audit_scores_full_path_from_kis_rest_snapshots():
     df = bars(180)
     current = float(df.close.iloc[-1])

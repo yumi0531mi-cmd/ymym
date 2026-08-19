@@ -88,6 +88,40 @@ def test_calibration_can_scope_samples_to_target_rule_version():
     assert result.probability_pct == 100.0
 
 
+def test_calibration_keeps_time_forward_holdout_separate_from_fit_cohort():
+    strategy = "TREND_SWING · 상승 추세 눌림"
+    rows = [
+        {
+            "market": "KR", "session": "KR_REGULAR", "strategy": strategy,
+            "score": 83, "complete_four_area_pass": index < 80, "data_completeness": "COMPLETE",
+            "entry_executable": True, "structural_target_confirmed": True,
+            "net_return_pct": 0.3 if index < 80 else -0.2,
+            "signal_time": f"2026-08-18T09:{index:02d}:00",
+        }
+        for index in range(100)
+    ]
+    rows.extend(
+        {
+            "market": "KR", "session": "KR_REGULAR", "strategy": strategy,
+            "score": 83, "complete_four_area_pass": index < 90, "data_completeness": "COMPLETE",
+            "entry_executable": True, "structural_target_confirmed": True,
+            "net_return_pct": 0.3 if index < 90 else -0.2,
+            "signal_time": f"2026-08-19T09:{index:02d}:00",
+        }
+        for index in range(100)
+    )
+
+    result = calibration_for(
+        RowsOnlyStore(rows), market="KR", session="KR_REGULAR", strategy=strategy, score=83,
+    )
+
+    assert result.samples == 100
+    assert result.probability_pct == 80.0
+    assert result.recent_samples == 100
+    assert result.recent_probability_pct == 90.0
+    assert result.target_80_verified is True
+
+
 def test_strategy_summary_includes_expectancy_and_profit_factor(tmp_path):
     strategy = "BREAKOUT_CONTINUATION · TREND_SWING"
     rows = [

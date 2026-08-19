@@ -205,7 +205,7 @@ def test_forecast_audit_uses_labeled_kis_rest_snapshot_while_trade_tick_reconnec
 
 
 def test_forecast_audit_starts_only_one_pending_path_per_market(tmp_path):
-    from app import record_forecast_accuracy_audit
+    from app import APP_VERSION, record_forecast_accuracy_audit
     from scanner.validation import ValidationStore
 
     store = ValidationStore(tmp_path)
@@ -220,7 +220,7 @@ def test_forecast_audit_starts_only_one_pending_path_per_market(tmp_path):
 
     assert first_recorded is True
     assert second_recorded is False
-    assert len(store.pending_forecast_audits("KR", version="6.5.1-free-100-path-validation-retry")) == 1
+    assert len(store.pending_forecast_audits("KR", version=APP_VERSION)) == 1
 
 
 def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():

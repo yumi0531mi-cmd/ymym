@@ -51,7 +51,11 @@ class ValidationCase:
     target: float | None
     target_basis: str
     stop: float | None
+    soft_stop: float | None = None
+    hard_stop: float | None = None
     target_first: bool | None = None
+    soft_stop_first: bool | None = None
+    hard_stop_first: bool | None = None
     stopped_first: bool | None = None
     target_pass: bool | None = None
     horizons: list[HorizonResult] = field(default_factory=list)
@@ -131,7 +135,9 @@ class ValidationCase:
             regime_pass=None,
             target=plan.target,
             target_basis=plan.target_basis,
-            stop=plan.stop,
+            stop=plan.hard_stop or plan.stop,
+            soft_stop=plan.soft_stop,
+            hard_stop=plan.hard_stop or plan.stop,
             horizons=horizons,
             missing=list(plan.missing),
             strategy=plan.strategy,
@@ -270,26 +276,39 @@ class ValidationCase:
         self.mae_pct = (low / origin - 1) * 100
         target_window = frame.loc[frame.index <= signal_at + pd.Timedelta(5, unit="min")]
         target_time = None
-        stop_time = None
+        soft_stop_time = None
+        hard_stop_time = None
         if not target_window.empty:
             if self.target is not None:
                 touched = target_window.index[target_window.high >= self.target]
                 target_time = touched[0] if len(touched) else None
-            if self.stop is not None:
-                touched = target_window.index[target_window.low <= self.stop]
-                stop_time = touched[0] if len(touched) else None
-        if target_time is not None and stop_time is not None and target_time == stop_time:
+            if self.soft_stop is not None:
+                touched = target_window.index[target_window.low <= self.soft_stop]
+                soft_stop_time = touched[0] if len(touched) else None
+            hard_stop = self.hard_stop if self.hard_stop is not None else self.stop
+            if hard_stop is not None:
+                touched = target_window.index[target_window.low <= hard_stop]
+                hard_stop_time = touched[0] if len(touched) else None
+        self.soft_stop_first = bool(
+            soft_stop_time is not None
+            and (target_time is None or soft_stop_time < target_time)
+            and (hard_stop_time is None or soft_stop_time <= hard_stop_time)
+        )
+        if target_time is not None and hard_stop_time is not None and target_time == hard_stop_time:
             self.target_first = False
             self.stopped_first = True
+            self.hard_stop_first = True
             self.target_pass = False
             self.target_outcome = "AMBIGUOUS_SAME_BAR"
             self.missing.append("1차 목표 5분 창에서 목표·손절 동시 접촉: 보수적으로 실패 처리")
         else:
-            self.target_first = target_time is not None and (stop_time is None or target_time < stop_time)
-            self.stopped_first = stop_time is not None and (target_time is None or stop_time < target_time)
+            self.target_first = target_time is not None and (hard_stop_time is None or target_time < hard_stop_time)
+            self.stopped_first = hard_stop_time is not None and (target_time is None or hard_stop_time < target_time)
+            self.hard_stop_first = self.stopped_first
             self.target_pass = self.target_first
             self.target_outcome = "TARGET_FIRST" if self.target_first else "STOP_FIRST" if self.stopped_first else "TIME_EXPIRED"
-        exit_price = self.target if self.target_first else self.stop if self.stopped_first else float(target_window.close.iloc[-1]) if not target_window.empty else float(end.close.iloc[-1])
+        hard_stop = self.hard_stop if self.hard_stop is not None else self.stop
+        exit_price = self.target if self.target_first else hard_stop if self.stopped_first else float(target_window.close.iloc[-1]) if not target_window.empty else float(end.close.iloc[-1])
         self.net_return_pct = (float(exit_price) / origin - 1) * 100 - cost_pct
 
         first = float(end.close.iloc[0])
@@ -659,7 +678,7 @@ class ValidationStore:
             "quote_price", "latest_trade_price", "latest_trade_time", "quote_age_seconds", "quote_pass",
             "entry", "entry_executable", "orderbook_available", "spread_pct",
             "predicted_regime", "actual_regime", "regime_pass", "structural_target_confirmed",
-            "target", "target_basis", "stop", "target_outcome", "target_pass", "full_path_pass",
+                "target", "target_basis", "soft_stop", "hard_stop", "stop", "target_outcome", "target_pass", "soft_stop_first", "hard_stop_first", "full_path_pass",
             "data_completeness", "complete_four_area_pass", "mfe_pct", "mae_pct", "net_return_pct",
         ]
         with path.open("w", newline="", encoding="utf-8-sig") as handle:
