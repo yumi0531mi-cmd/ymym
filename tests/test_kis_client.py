@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from scanner.kis_client import KISClient, KISError, secrets_fingerprint
 from scanner.models import Market
@@ -75,6 +75,7 @@ def test_us_intraday_collects_continuation_pages_for_high_timeframe_warmup(tmp_p
         (["100100", "100000"], ""),
         (["095900", "095800"], ""),
         (["095700", "095600"], ""),
+        ([], ""),
     ]
     calls = []
 
@@ -90,10 +91,35 @@ def test_us_intraday_collects_continuation_pages_for_high_timeframe_warmup(tmp_p
     bars = client.intraday("TEST", Market.US, "NAS")
 
     assert len(bars) == 6
-    assert [call[3] for call in calls] == ["", "", ""]
+    assert [call[3] for call in calls] == ["", "", "", ""]
     assert calls[0][2]["NEXT"] == "" and calls[0][2]["KEYB"] == ""
     assert calls[1][2]["NEXT"] == "1" and calls[1][2]["KEYB"] == "20260819095900"
     assert calls[2][2]["KEYB"] == "20260819095700"
+
+
+def test_us_intraday_allows_six_official_pages_for_warmed_30_minute_history(tmp_path):
+    client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
+    newest = datetime(2026, 8, 19, 10, 1)
+    pages = [
+        [(newest - timedelta(minutes=page * 2 + offset)).strftime("%H%M%S") for offset in (0, 1)]
+        for page in range(6)
+    ]
+    calls = []
+
+    def fake_get_page(path, tr_id, params, tr_cont=""):
+        calls.append((path, tr_id, dict(params), tr_cont))
+        times = pages.pop(0)
+        return ({"output2": [
+            {"xymd": "20260819", "xhms": value, "open": "10", "high": "11", "low": "9", "last": "10.5", "evol": "100"}
+            for value in times
+        ]}, "")
+
+    client._get_page = fake_get_page  # type: ignore[method-assign]
+    bars = client.intraday("TEST", Market.US, "NAS")
+
+    assert len(calls) == 6
+    assert len(bars) == 12
+    assert calls[-1][2]["KEYB"] == "20260819095100"
 
 
 def test_kr_intraday_uses_official_120_record_daily_minute_endpoint(tmp_path):

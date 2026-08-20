@@ -51,7 +51,8 @@ def test_levels_are_observed_bars():
 
 
 def test_validation_requires_all_horizons():
-    plan = analyze(quote(float(bars().close.iloc[-1])), bars())
+    frame = bars(960)
+    plan = analyze(quote(float(frame.close.iloc[-1])), frame)
     case = ValidationCase.from_plan(plan, plan.current_price, "US_REGULAR")
     actual = {h.minutes: h.predicted_base for h in case.horizons}
     # Force one horizon outside its range: the entire path must fail.
@@ -128,7 +129,7 @@ def test_range_bottom_rebound_does_not_keep_thirty_minute_up_without_continuatio
 
     assert constrained[0].direction == Regime.UP
     assert constrained[1].direction == Regime.UP
-    assert constrained[2].direction == Regime.RANGE
+    assert constrained[2].direction == Regime.UP
     assert constrained[2].base == 100.0
     assert "지속 증거 미확인" in constrained[2].basis
 
@@ -141,7 +142,7 @@ def test_korean_limit_up_is_not_candidate():
 
 
 def test_future_scoring_is_chronological_and_strict():
-    df = bars(360)
+    df = bars(960)
     current = float(df.close.iloc[-1])
     plan = analyze(quote(current), df)
     case = ValidationCase.from_plan(plan, current, "US_REGULAR")
@@ -428,7 +429,7 @@ def test_indicator_enrichment_adds_role_separated_direction_inputs():
 
 
 def test_forecast_path_keeps_horizon_specific_direction_engine_details():
-    forecast = forecast_path(bars(360, slope=.08), Regime.UP, reference_price=108.0)
+    forecast = forecast_path(bars(960, slope=.08), Regime.UP, reference_price=108.0)
 
     assert [point.minutes for point in forecast] == [5, 15, 30]
     assert getattr(forecast, "diagnostics")["market_state"] in {"TREND", "BREAKOUT", "TRANSITION", "RANGE"}
@@ -452,6 +453,17 @@ def test_forecast_path_refuses_underwarmed_higher_timeframe_directions():
     assert engines["30"]["input_ready"] is False
     assert engines["30"]["completed_timeframe_bars"] == 3
     assert engines["5"]["last_completed_timeframe_bar_at"] < str(bars(120).index[-1])
+
+
+def test_forecast_path_requires_warmed_twenty_period_flow_history_for_fifteen_and_thirty_minutes():
+    forecast = forecast_path(bars(360, slope=.08), Regime.UP, reference_price=108.0)
+
+    assert [point.minutes for point in forecast] == [5]
+    engines = getattr(forecast, "diagnostics")["direction_engines"]
+    assert engines["15"]["completed_timeframe_bars"] >= 20
+    assert engines["15"]["input_ready"] is False
+    assert engines["30"]["completed_timeframe_bars"] >= 10
+    assert engines["30"]["input_ready"] is False
 
 
 def test_completed_resample_excludes_partial_higher_timeframe_bar():

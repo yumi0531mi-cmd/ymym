@@ -41,11 +41,12 @@ HORIZON_WEIGHTS: dict[int, dict[str, dict[str, float]]] = {
 }
 
 
-# High-timeframe EMA, Bollinger, flow and regression components are not credible
-# with the previous 3 completed 30-minute bars.  These minima align to the
-# longest 10-bar warmup used by enrich(), while retaining a 20-bar baseline for
-# the more reactive five-minute engine.
-MIN_COMPLETED_TIMEFRAME_BARS = {5: 20, 15: 10, 30: 10}
+# A higher-timeframe direction cannot use a 20-period flow/volatility component
+# before its own completed history exists.  The old 10-bar 15/30-minute minima
+# let a partially warm relative-volume baseline drive the score.  Keep the
+# reactive five-minute floor at 20, require 30 completed 15-minute bars for its
+# 20-period baseline plus structure, and require 20 completed 30-minute bars.
+MIN_COMPLETED_TIMEFRAME_BARS = {5: 20, 15: 30, 30: 20}
 
 
 def _signed(value: float, scale: float = 1.0) -> float:
@@ -120,10 +121,10 @@ def _common_range_context(recent: pd.DataFrame, price: float) -> dict[str, objec
         float(returns.std(ddof=0)), atr_fraction * 0.45,
         float(latest.boll_width_pct) / 100 * 0.20, 0.0003,
     )
-    # Three completed 30-minute bars can define immediate structure but cannot yet
-    # establish a reliable relative-volume baseline. Treat unavailable flow as
-    # neutral instead of converting zero-filled warmup values into sell pressure.
-    flow_ready = len(recent) >= 5
+    # Relative volume, notional relative volume, CMF and regression all need the
+    # completed horizon's 20-bar baseline.  Do not treat a partly populated
+    # baseline as directional flow.
+    flow_ready = len(recent) >= 20
     rvol_component = _bound(float(latest.rvol) - 1.0, -1.0, 1.5) if flow_ready else 0.0
     notional_component = _bound(float(latest.notional_rvol) - 1.0, -1.0, 1.5) if flow_ready else 0.0
     return {
@@ -188,9 +189,8 @@ def cap_upside_forecast_path(
         base = min(float(point.base), horizon_cap)
         high = min(max(base, float(point.high)), ceiling)
         low = min(float(point.low), base)
-        direction = Regime.UP if base > reference_price * 1.0005 else Regime.RANGE
         result.append(ForecastPoint(
-            point.minutes, max(0.0, low), base, high, direction, f"{point.basis} · {label}",
+            point.minutes, max(0.0, low), base, high, point.direction, f"{point.basis} · {label}",
             point.direction_confidence_pct, ceiling,
         ))
     return result
@@ -217,9 +217,8 @@ def cap_downside_forecast_path(
         base = max(float(point.base), horizon_floor)
         low = max(min(base, float(point.low)), float(primary_support))
         high = max(float(point.high), base)
-        direction = Regime.DOWN if base < reference_price * 0.9995 else Regime.RANGE
         result.append(ForecastPoint(
-            point.minutes, low, base, high, direction, f"{point.basis} · 기본 구조 지지 하한",
+            point.minutes, low, base, high, point.direction, f"{point.basis} · 기본 구조 지지 하한",
             point.direction_confidence_pct, float(primary_support),
         ))
     return result
@@ -251,8 +250,8 @@ def constrain_unconfirmed_range_thirty_minute_upside(
             max(0.0, reference_price - band),
             reference_price,
             reference_price + band,
-            Regime.RANGE,
-            f"{point.basis} · RANGE 30분 지속 증거 미확인",
+            point.direction,
+            f"{point.basis} · 30분 지속 증거 미확인 · 가격 경로만 중립화",
             point.direction_confidence_pct,
             point.structure_level,
         ))
@@ -304,7 +303,7 @@ def apply_risk_persistence_to_forecast(
         direction = point.direction
         if risk_state == "SHAKEOUT" and point.minutes == 5:
             direction = Regime.RANGE
-        elif abs(base / reference_price - 1.0) < 0.0005:
+        elif point.minutes == 5 and abs(base / reference_price - 1.0) < 0.0005:
             direction = Regime.RANGE
         result.append(ForecastPoint(
             point.minutes, max(0.0, low), base, max(base, high), direction,

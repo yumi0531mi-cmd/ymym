@@ -23,10 +23,10 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
-APP_VERSION = "6.16-boundary-fallback-verification"
+APP_VERSION = "6.17-warmed-independent-direction"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
-CLIENT_CACHE_VERSION = "client-contract-v13-us-360-minute-history"
+CLIENT_CACHE_VERSION = "client-contract-v14-us-720-minute-history"
 # The market-data connection has its own lifecycle. Bump this only when the
 # WebSocket protocol or recovery contract changes, without issuing a new REST token.
 REALTIME_HUB_CACHE_VERSION = "realtime-hub-v4-ranked-five"

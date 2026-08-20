@@ -23,6 +23,9 @@ class KISError(RuntimeError):
     pass
 
 
+US_INTRADAY_HISTORY_PAGES = 6
+
+
 def _secret_with_source(
     names: tuple[str, ...], secrets: Any | None = None, default: str = ""
 ) -> tuple[str, str]:
@@ -531,11 +534,12 @@ class KISClient:
             params = {"AUTH": "", "EXCD": request_exchange, "SYMB": symbol, "NMIN": "1", "PINC": "1", "NEXT": "", "NREC": "120", "FILL": "", "KEYB": ""}
             rows: list[dict[str, Any]] = []
             continuation = ""
-            # KIS permits up to 120 records on one response.  A 30-minute engine
-            # needs at least ten completed higher-timeframe bars for indicator
-            # warmup, so collect up to three official continuation pages (360
-            # one-minute bars) instead of treating three 30-minute bars as ready.
-            for _page in range(3):
+            # KIS permits up to 120 records on one response.  The 15/30-minute
+            # direction engines need stable 20-period flow baselines, so collect
+            # up to six official pages (720 one-minute bars) before classifying a
+            # horizon.  This is history acquisition, not a relaxation of a signal
+            # gate: underwarmed horizons are withheld by forecast_path().
+            for _page in range(US_INTRADAY_HISTORY_PAGES):
                 try:
                     payload, next_marker = self._get_page(path, "HHDFS76950200", params, continuation)
                 except KISError:
