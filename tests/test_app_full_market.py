@@ -51,6 +51,37 @@ def test_quote_survives_orderbook_endpoint_failure():
     assert result.bid is None and result.ask is None
 
 
+def test_dashboard_card_skips_forecast_audit_when_background_batch_owns_fixed_samples():
+    from app import analyze_card
+
+    plan = _plan()
+    calibration = SimpleNamespace(
+        samples=0, probability_pct=None, recent_samples=0,
+        recent_probability_pct=None, recent_average_net_return_pct=None,
+        to_dict=lambda: {"samples": 0, "probability_pct": None},
+    )
+    cycle = SimpleNamespace(cooldown_active=False, hard_kill=False)
+    forecast_audit = Mock()
+
+    with (
+        patch("app.load_rest_dashboard_quote", return_value=_quote()),
+        patch("app.quote_with_live_tick", return_value=_quote()),
+        patch("app.load_bars", return_value=_bars()),
+        patch("app.merge_live_completed_bars", return_value=_bars()),
+        patch("app.completed_bar_alignment", return_value=(True, "")),
+        patch("app.cycle_store.get", return_value=cycle),
+        patch("app.analyze", return_value=plan) as analyze_engine,
+        patch("app.calibration_for", return_value=calibration),
+        patch("app.record_and_score_live_validation", return_value=(0, False)),
+        patch("app.record_forecast_accuracy_audit", forecast_audit),
+    ):
+        result = analyze_card("005930", Market.KR, "", 0.05, 80, SimpleNamespace(), record_forecast_audit=False)
+
+    assert analyze_engine.call_count == 1
+    assert result["forecast_validation_recorded"] is False
+    forecast_audit.assert_not_called()
+
+
 def _quote(*_args, **_kwargs) -> Quote:
     return Quote(
         symbol="005930", market=Market.KR, price=70000, previous_close=69000,
@@ -322,7 +353,7 @@ def test_boundary_capture_uses_rest_fallback_when_websocket_tick_is_stale():
 
     load_quote.assert_called_once_with("005930", "KR", "")
     store.capture_rest_snapshot_and_score.assert_called_once_with(
-        "005930", "KR", observed_at, 70000, "KIS REST", "6.22-fresh-boundary-price-capture"
+        "005930", "KR", observed_at, 70000, "KIS REST", "6.23-background-validation-scanner"
     )
     budget.release.assert_not_called()
 

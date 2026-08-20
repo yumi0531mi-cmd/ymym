@@ -23,7 +23,7 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
-APP_VERSION = "6.22-fresh-boundary-price-capture"
+APP_VERSION = "6.23-background-validation-scanner"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
 CLIENT_CACHE_VERSION = "client-contract-v16-kr-us-720-minute-history-rollover"
@@ -36,11 +36,11 @@ MAX_LIVE_CARDS = 5
 MAX_ANALYSIS_CANDIDATES = 8
 MAX_CANDIDATE_LIST = 200
 MAX_FAST_SHORTLIST = 15
-# 무료 Streamlit 검증 배치는 4개 표본을 매분 시작한다. 각 시작은 시세·분봉·호가
+# 백그라운드 검증 배치는 1개 표본을 매분 시작한다. 각 시작은 시세·분봉·호가
 # 확인을 포함하고, 이전 표본의 5·15·30분 실제 가격도 별도 수집하므로 KIS 분당
 # 30건 호출 제한 안에서 운용한다.
 MAX_PENDING_FORECAST_WATCHES = 8
-CAPTURE_INTEGRITY_MAX_PENDING = 5
+BACKGROUND_VALIDATION_MAX_PENDING = 5
 FREE_VALIDATION_BATCH_SIZE = 100
 FREE_VALIDATION_STARTS_PER_MINUTE = 1
 VALIDATION_ANALYSIS_CALL_ALLOWANCE = 4
@@ -774,7 +774,7 @@ def record_forecast_accuracy_audit(
 def analyze_card(
     symbol: str, market: Market, exchange: str, cost_pct: float, min_score: int, store: ValidationStore,
     validation_batch_id: str = "", fresh_validation_bars: bool = False, request_purpose: str = "카드 현재가",
-    record_validation: bool = True,
+    record_validation: bool = True, record_forecast_audit: bool = True,
 ) -> dict[str, Any]:
     """Fetch and analyze one automatic dashboard card from REST history plus live completed bars."""
     rest_quote = load_rest_dashboard_quote(symbol, market.value, exchange, request_purpose)
@@ -795,13 +795,30 @@ def analyze_card(
         store, market=market.value, session=quote.session, strategy=preliminary.strategy,
         score=preliminary.score, version=APP_VERSION,
     )
-    plan = analyze(
-        quote, bars, orderbook_required=True, round_trip_cost_pct=cost_pct,
-        minimum_score=min_score, cooldown_active=cycle.cooldown_active, hard_kill=cycle.hard_kill,
-        calibration_probability=getattr(calibration, "recent_probability_pct", calibration.probability_pct),
-        calibration_samples=getattr(calibration, "recent_samples", calibration.samples),
-        calibration_expectancy_pct=getattr(calibration, "recent_average_net_return_pct", calibration.average_net_return_pct if hasattr(calibration, "average_net_return_pct") else None),
+    calibration_samples = getattr(calibration, "recent_samples", calibration.samples)
+    calibration_probability = getattr(calibration, "recent_probability_pct", calibration.probability_pct)
+    calibration_expectancy = getattr(
+        calibration,
+        "recent_average_net_return_pct",
+        calibration.average_net_return_pct if hasattr(calibration, "average_net_return_pct") else None,
     )
+    # Before enough completed observations exist, calibration is deliberately
+    # non-binding. Reuse the first common-engine result instead of calculating the
+    # same chart structure twice for every live card.
+    if calibration_samples < 100:
+        plan = preliminary
+        plan.calibration_probability = None
+        plan.calibration_samples = calibration_samples
+        plan.diagnostics["calibration_probability_pct"] = None
+        plan.diagnostics["calibration_expectancy_pct"] = None
+    else:
+        plan = analyze(
+            quote, bars, orderbook_required=True, round_trip_cost_pct=cost_pct,
+            minimum_score=min_score, cooldown_active=cycle.cooldown_active, hard_kill=cycle.hard_kill,
+            calibration_probability=calibration_probability,
+            calibration_samples=calibration_samples,
+            calibration_expectancy_pct=calibration_expectancy,
+        )
     # Complete earlier same-symbol signals first, then persist a real KIS-trade-backed
     # plan. The same path also runs from the one-minute card structure refresh.
     actionable_scored = forecast_scored = 0
@@ -810,9 +827,10 @@ def analyze_card(
         actionable_scored, actionable_recorded = record_and_score_live_validation(
             store, plan, quote, bars, chart_aligned, float(cost_pct)
         )
-        forecast_scored, forecast_recorded = record_forecast_accuracy_audit(
-            store, plan, quote, bars, chart_aligned, float(cost_pct), exchange, validation_batch_id
-        )
+        if record_forecast_audit:
+            forecast_scored, forecast_recorded = record_forecast_accuracy_audit(
+                store, plan, quote, bars, chart_aligned, float(cost_pct), exchange, validation_batch_id
+            )
     if event_store.configured:
         marker = str(plan.diagnostics.get("completed_bar_at") or quote.timestamp.isoformat())
         cycle_store.apply_risk_state(cycle, plan.risk_state, marker)
@@ -1185,9 +1203,7 @@ def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, st
     actionable_scored, actionable_recorded = record_and_score_live_validation(
         store, plan, quote, bars, chart_aligned, float(cost_pct)
     )
-    forecast_scored, forecast_recorded = record_forecast_accuracy_audit(
-        store, plan, quote, bars, chart_aligned, float(cost_pct), str(item.get("exchange") or "")
-    )
+    forecast_scored, forecast_recorded = 0, False
     return {
         **item, "quote": quote, "bars": bars, "plan": plan,
         "validation_scored": actionable_scored + forecast_scored,
@@ -1251,13 +1267,6 @@ def render_plan_fields(item: dict[str, Any]) -> None:
 @st.fragment(run_every=60.0)
 def render_live_plan_fields(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore) -> None:
     render_plan_fields(live_card_snapshot(item, cost_pct, min_score, store))
-
-
-@st.fragment(run_every=60.0)
-def run_hidden_forecast_validation(items: list[dict[str, Any]], cost_pct: float, min_score: int, store: ValidationStore) -> None:
-    """Keep visible FINAL_BUY and pullback/re-entry candidates in the forecast audit."""
-    for item in items:
-        live_card_snapshot(item, cost_pct, min_score, store)
 
 
 def tick_matches_due_forecast_boundary(case: Any, tick_at: datetime, observed_at: datetime, grace_seconds: int = 75) -> bool:
@@ -1536,10 +1545,11 @@ def run_free_validation_batch(
     batch_candidates = candidates[:FREE_VALIDATION_BATCH_SIZE]
     start = int(state.get("next_index", 0))
     active_cases = store.pending_forecast_audits(market.value, version=APP_VERSION, limit=100)
-    if capture_integrity and len(active_cases) >= CAPTURE_INTEGRITY_MAX_PENDING:
+    if len(active_cases) >= BACKGROUND_VALIDATION_MAX_PENDING:
+        mode = "수집 안정성" if capture_integrity else "백그라운드 검증"
         st.caption(
-            f"수집 안정성 경계 수집 우선 · 대기 표본 {len(active_cases)}/{CAPTURE_INTEGRITY_MAX_PENDING}건 · "
-            "카드 재분석 없이 5·15·30분 실제가를 먼저 저장합니다."
+            f"{mode} 경계 수집 우선 · 대기 표본 {len(active_cases)}/{BACKGROUND_VALIDATION_MAX_PENDING}건 · "
+            "스캐너 카드와 별도로 5·15·30분 실제가를 저장합니다."
         )
         return
     if start >= len(batch_candidates):
@@ -1905,7 +1915,7 @@ else:
                 try:
                     card = analyze_card(
                         symbol, market, exchange, float(cost_pct), int(min_score), store,
-                        request_purpose="카드 현재가", record_validation=not audit_only,
+                        request_purpose="카드 현재가", record_validation=not audit_only, record_forecast_audit=False,
                     )
                     card["name"] = str(candidate.get("name") or symbol)
                     card["candidate_source"] = str(candidate.get("candidate_source") or "거래량 TOP100 ∪ 거래대금 TOP100")
@@ -1955,9 +1965,6 @@ realtime_hub.configure(
     for card in analysis_cards
 )
 
-if analysis_cards and not capture_integrity and not audit_only:
-    run_hidden_forecast_validation(analysis_cards, float(cost_pct), int(min_score), store)
-
 if candidates and event_store.configured and not audit_only:
     run_free_validation_batch(market.value, candidates, float(cost_pct), int(min_score), store, capture_integrity)
 elif audit_only:
@@ -1981,7 +1988,7 @@ if cards:
     st.subheader(f"상승 차트 · 현재 1회 진입 가능 {len(cards)}종목")
     st.caption(f"정밀 분석 {analyzed_count}개 중 현재 진입 조건 통과 {len(cards)}개 · {updated_at.strftime('%H:%M:%S')} · {realtime_hub.status_label()} · {source_text}")
     for card_item in cards:
-        render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "FINAL_BUY", not capture_integrity)
+        render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "FINAL_BUY", True)
 elif kis_connected and not errors and not candidates:
     limit_text = "30만 원 미만" if market == Market.KR else "200달러 미만"
     st.info(f"현재 {limit_text} 가격 상한 안의 거래량·거래대금 후보풀을 받지 못했습니다. 순위 API를 다음 갱신 때 다시 확인합니다.")
