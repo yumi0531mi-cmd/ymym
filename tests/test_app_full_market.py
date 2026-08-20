@@ -284,7 +284,7 @@ def test_boundary_rest_fallback_failure_marks_data_missing_and_releases_reservat
     with (
         patch("app.display_tick", return_value=None),
         patch("app.current_client", return_value=client),
-        patch("app._load_quote_record", side_effect=KISError("KIS 호출 예산 보호 중")),
+        patch("app.load_boundary_quote", side_effect=KISError("KIS 호출 예산 보호 중")),
     ):
         capture_forecast_boundary_case(store, Market.KR, case, datetime(2026, 8, 19, 10, 5))
 
@@ -316,14 +316,13 @@ def test_boundary_capture_uses_rest_fallback_when_websocket_tick_is_stale():
     with (
         patch("app.display_tick", return_value=stale_tick),
         patch("app.current_client", return_value=client),
-        patch("app._load_quote_record", return_value={"symbol": "005930"}) as load_quote,
-        patch("app._quote_from_cache_record", return_value=rest_quote),
+        patch("app.load_boundary_quote", return_value=rest_quote) as load_quote,
     ):
         capture_forecast_boundary_case(store, Market.KR, case, observed_at)
 
-    load_quote.assert_called_once_with("005930", "KR", "", "경계 수집")
+    load_quote.assert_called_once_with("005930", "KR", "")
     store.capture_rest_snapshot_and_score.assert_called_once_with(
-        "005930", "KR", observed_at, 70000, "KIS REST", "6.21-persistence-safe-domestic-validation"
+        "005930", "KR", observed_at, 70000, "KIS REST", "6.22-fresh-boundary-price-capture"
     )
     budget.release.assert_not_called()
 
@@ -347,12 +346,11 @@ def test_elapsed_boundary_attempts_rest_before_marking_data_missing():
     with (
         patch("app.display_tick", return_value=None),
         patch("app.current_client", return_value=client),
-        patch("app._load_quote_record", return_value={"symbol": "005930"}) as load_quote,
-        patch("app._quote_from_cache_record", return_value=rest_quote),
+        patch("app.load_boundary_quote", return_value=rest_quote) as load_quote,
     ):
         capture_forecast_boundary_case(store, Market.KR, case, observed_at)
 
-    load_quote.assert_called_once_with("005930", "KR", "", "경계 수집")
+    load_quote.assert_called_once_with("005930", "KR", "")
     case.mark_data_missing.assert_called_once()
     assert "REST fallback 1회 실행" in case.mark_data_missing.call_args.args[2]
     store.capture_rest_snapshot_and_score.assert_not_called()

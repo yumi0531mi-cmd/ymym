@@ -23,7 +23,7 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
-APP_VERSION = "6.21-persistence-safe-domestic-validation"
+APP_VERSION = "6.22-fresh-boundary-price-capture"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
 CLIENT_CACHE_VERSION = "client-contract-v16-kr-us-720-minute-history-rollover"
@@ -232,6 +232,18 @@ def load_rest_dashboard_quote(symbol: str, market_value: str, exchange: str, pur
         bid=bid, ask=ask, volume=quote.volume, turnover=quote.turnover,
         session=quote.session, source=quote.source,
     )
+
+
+def load_boundary_quote(symbol: str, market_value: str, exchange: str) -> Quote:
+    """Fetch one uncached KIS quote for a due 5/15/30-minute audit boundary.
+
+    Visible-card quotes deliberately reuse a five-minute cache to conserve REST
+    budget. A validation boundary must retain the price timestamp from that exact
+    short capture window, so it must never share that cache entry.
+    """
+    client = current_client()
+    with client.request_scope("경계 수집"):
+        return client.quote(symbol, Market(market_value), exchange, include_orderbook=False)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -1281,9 +1293,7 @@ def capture_forecast_boundary_case(store: ValidationStore, market: Market, case:
         current_client().request_budget.release("경계 수집")
         return
     try:
-        quote = _quote_from_cache_record(
-            _load_quote_record(case.symbol, market.value, case.exchange, "경계 수집")
-        )
+        quote = load_boundary_quote(case.symbol, market.value, case.exchange)
     except (KISError, OSError, ValueError, KeyError) as exc:
         if capture_minutes:
             case.mark_data_missing(capture_minutes, observed_at, f"REST fallback 실패: {type(exc).__name__}: {str(exc)[:180]}")
