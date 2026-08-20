@@ -186,6 +186,25 @@ def test_kr_intraday_collects_six_official_date_time_pages_for_higher_timeframe_
     assert calls[2][2]["FID_INPUT_HOUR_1"] == "152800"
 
 
+def test_kr_intraday_can_limit_a_card_refresh_to_one_official_page(tmp_path):
+    client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
+    calls = []
+    row = {
+        "stck_bsop_date": "20260819", "stck_cntg_hour": "100000",
+        "stck_oprc": "100", "stck_hgpr": "101", "stck_lwpr": "99", "stck_prpr": "100", "cntg_vol": "1000",
+    }
+
+    def fake_get(path, tr_id, params):
+        calls.append((path, tr_id, dict(params)))
+        return {"output2": [row]}
+
+    client._get = fake_get  # type: ignore[method-assign]
+    bars = client.intraday("005930", Market.KR, history_pages=1)
+
+    assert len(calls) == 1
+    assert len(bars) == 1
+
+
 def test_kr_intraday_stops_when_api_repeats_the_same_opening_page(tmp_path):
     client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
     calls = []

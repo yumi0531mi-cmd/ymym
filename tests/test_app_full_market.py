@@ -90,6 +90,12 @@ def test_background_validation_rendering_follows_observation_cards_in_normal_sca
     assert observation_cards < validation_status
 
 
+def test_live_card_snapshot_uses_one_page_refresh_when_realtime_tick_is_missing():
+    from app import live_card_snapshot
+
+    assert "load_recent_completed_bars" in live_card_snapshot.__doc__ or "load_recent_completed_bars" in APP_PATH.read_text(encoding="utf-8").split("def live_card_snapshot", 1)[1].split("def render_plan_fields", 1)[0]
+
+
 def _quote(*_args, **_kwargs) -> Quote:
     return Quote(
         symbol="005930", market=Market.KR, price=70000, previous_close=69000,

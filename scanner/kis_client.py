@@ -500,7 +500,9 @@ class KISClient:
             self._number(out, "tvol", "acml_vol"), self._number(out, "tamt"), market_session(market, now),
         )
 
-    def intraday(self, symbol: str, market: Market, exchange: str = "NAS") -> pd.DataFrame:
+    def intraday(
+        self, symbol: str, market: Market, exchange: str = "NAS", history_pages: int | None = None,
+    ) -> pd.DataFrame:
         symbol = symbol.strip().upper()
         now = datetime.now(tz=KST)
         if market == Market.KR:
@@ -519,7 +521,8 @@ class KISClient:
             # but accepts a prior date and time on every call.  Continue from the
             # oldest returned completed minute to warm the 15/30-minute engines;
             # this intentionally consumes one budgeted REST call per page.
-            for _page in range(KR_INTRADAY_HISTORY_PAGES):
+            page_limit = max(1, min(int(history_pages or KR_INTRADAY_HISTORY_PAGES), KR_INTRADAY_HISTORY_PAGES))
+            for _page in range(page_limit):
                 try:
                     payload = self._get(path, "FHKST03010230", params)
                 except KISError:
@@ -577,7 +580,8 @@ class KISClient:
             # up to six official pages (720 one-minute bars) before classifying a
             # horizon.  This is history acquisition, not a relaxation of a signal
             # gate: underwarmed horizons are withheld by forecast_path().
-            for _page in range(US_INTRADAY_HISTORY_PAGES):
+            page_limit = max(1, min(int(history_pages or US_INTRADAY_HISTORY_PAGES), US_INTRADAY_HISTORY_PAGES))
+            for _page in range(page_limit):
                 try:
                     payload, next_marker = self._get_page(path, "HHDFS76950200", params, continuation)
                 except KISError:

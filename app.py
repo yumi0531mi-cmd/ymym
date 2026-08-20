@@ -26,7 +26,7 @@ from scanner.validation import ValidationCase, ValidationStore
 APP_VERSION = "6.23-background-validation-scanner"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
-CLIENT_CACHE_VERSION = "client-contract-v16-kr-us-720-minute-history-rollover"
+CLIENT_CACHE_VERSION = "client-contract-v17-recent-completed-minute-refresh"
 # The market-data connection has its own lifecycle. Bump this only when the
 # WebSocket protocol or recovery contract changes, without issuing a new REST token.
 REALTIME_HUB_CACHE_VERSION = "realtime-hub-v4-ranked-five"
@@ -255,6 +255,14 @@ def load_bars(symbol: str, market_value: str, exchange: str, cache_version: str,
         return client.intraday(symbol, Market(market_value), exchange)
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def load_recent_completed_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
+    """Refresh one official minute-chart page when card ticks are temporarily unavailable."""
+    client = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint())
+    with client.request_scope("분봉 조회"):
+        return client.intraday(symbol, Market(market_value), exchange, history_pages=1)
+
+
 def load_fresh_validation_bars(symbol: str, market_value: str, exchange: str) -> pd.DataFrame:
     """Use current completed bars for the compact, rotating validation cohort only."""
     client = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint())
@@ -276,6 +284,16 @@ def merge_live_completed_bars(base: pd.DataFrame, symbol: str, market: Market) -
     elif getattr(historical.index, "tz", None) is not None:
         live.index = live.index.tz_localize(historical.index.tz)
     merged = pd.concat([historical, live], axis=0)
+    return merged[~merged.index.duplicated(keep="last")].sort_index()
+
+
+def merge_completed_bar_frames(base: pd.DataFrame, recent: pd.DataFrame) -> pd.DataFrame:
+    """Merge a small fresh official page into cached history without accepting duplicate minutes."""
+    if recent is None or recent.empty:
+        return base
+    if base is None or base.empty:
+        return recent.copy().sort_index()
+    merged = pd.concat([base, recent], axis=0)
     return merged[~merged.index.duplicated(keep="last")].sort_index()
 
 
@@ -1190,6 +1208,12 @@ def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, st
         except (KISError, OSError, ValueError):
             pass
     bars = merge_live_completed_bars(item["bars"], quote.symbol, quote.market)
+    if display_tick(base_quote.market, base_quote.symbol) is None:
+        try:
+            recent = load_recent_completed_bars(base_quote.symbol, base_quote.market.value, str(item.get("exchange") or ""))
+            bars = merge_completed_bar_frames(bars, recent)
+        except (KISError, OSError, ValueError):
+            pass
     chart_aligned, chart_alignment_reason = completed_bar_alignment(quote, bars)
     cycle = cycle_store.get(quote.symbol, quote.market, quote.timestamp)
     previous_plan = item["plan"]
