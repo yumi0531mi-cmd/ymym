@@ -82,6 +82,14 @@ def test_dashboard_card_skips_forecast_audit_when_background_batch_owns_fixed_sa
     forecast_audit.assert_not_called()
 
 
+def test_background_validation_rendering_follows_observation_cards_in_normal_scanner():
+    source = APP_PATH.read_text(encoding="utf-8")
+
+    observation_cards = source.index('if observation_cards:')
+    validation_status = source.index('st.caption("백그라운드 검증 상태')
+    assert observation_cards < validation_status
+
+
 def _quote(*_args, **_kwargs) -> Quote:
     return Quote(
         symbol="005930", market=Market.KR, price=70000, previous_close=69000,

@@ -1976,11 +1976,6 @@ if audit_only:
     render_versioned_forecast_trace(store, market.value, audit_version)
     st.stop()
 
-render_pending_forecast_progress(store, market.value)
-render_data_missing_forecast_cases(store, market.value)
-render_versioned_forecast_summary(store, market.value)
-render_versioned_failure_breakdown(store, market.value)
-
 if cards:
     updated_at = max(card["quote"].timestamp for card in cards)
     source_labels = {str(card.get("candidate_source") or "거래량 TOP100 ∪ 거래대금 TOP100") for card in cards}
@@ -2014,6 +2009,13 @@ if observation_cards:
     st.caption("현재 진입 카드는 아니지만, 각 종목의 실제 차단 관문·계산값·요구 기준을 바로 확인합니다.")
     for card_item in observation_cards:
         render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "OBSERVATION", not capture_integrity)
+
+st.divider()
+st.caption("백그라운드 검증 상태 · 스캐너 카드 선정과 독립적으로 고정 예측의 실제 가격 경계만 수집합니다.")
+render_pending_forecast_progress(store, market.value)
+render_data_missing_forecast_cases(store, market.value)
+render_versioned_forecast_summary(store, market.value)
+render_versioned_failure_breakdown(store, market.value)
 
 with st.expander("검증·관찰 상세", expanded=False):
     render_latest_forecast_result(store)
