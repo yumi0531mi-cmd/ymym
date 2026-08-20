@@ -147,6 +147,19 @@ def test_observation_reason_rows_keep_data_and_strategy_gates_as_recorded():
     ]
 
 
+def test_candidate_stage_summary_uses_card_diagnostic_gate_code_for_observations():
+    from app import candidate_stage_summary
+
+    plan = _plan()
+    plan.signal = Signal.WAIT
+    plan.diagnostics.update({"forecast_path_ready": False, "data_quality": {"completed_minute_bars": 599}})
+    item = {"quote": _quote(), "plan": plan, "name": "삼성전자", "chart_aligned": True, "bars": _bars()}
+
+    summary = candidate_stage_summary([item], candidate_pool=1)
+
+    assert summary["reasons"] == {"MINUTE_DATA_WAIT · KIS 완료 1분봉·방향 경로 재수신 대기": 1}
+
+
 def _quote(*_args, **_kwargs) -> Quote:
     return Quote(
         symbol="005930", market=Market.KR, price=70000, previous_close=69000,
@@ -631,7 +644,7 @@ def test_candidate_stage_summary_reports_observation_reason_counts():
     assert summary["funnel"]["후보풀"] == 12
     assert summary["stages"]["FINAL_BUY"] == 1
     assert summary["stages"]["OBSERVATION"] == 1
-    assert summary["reasons"]["손익비 부족"] == 1
+    assert summary["reasons"]["RR_FAIL · 비용 반영 손익비 부족"] == 1
 
 
 def test_observation_card_exposes_actual_rr_blocker_and_stays_visible():

@@ -1126,8 +1126,9 @@ def candidate_stage_summary(items: list[dict[str, Any]], candidate_pool: int) ->
         if isinstance(quote, Quote) and recommendation_quality_passes(plan, actionable_display_levels(plan, quote)):
             reward_ready += 1
         if stage == "OBSERVATION":
-            reason = observation_reason(item)
-            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            diagnostic = observation_diagnostic(item)
+            gate_label = f"{diagnostic['stage']} · {diagnostic['reason']}"
+            reason_counts[gate_label] = reason_counts.get(gate_label, 0) + 1
     return {
         "funnel": {
             "후보풀": candidate_pool,
