@@ -2063,12 +2063,12 @@ if entry_wait_cards:
 if observation_cards:
     st.subheader(f"정밀 분석 · 관찰 후보 {len(observation_cards)}종목")
     st.caption("현재 진입 카드는 아니지만, 각 종목의 실제 차단 관문·계산값·요구 기준을 바로 확인합니다.")
-    for card_item in observation_cards:
-        render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "OBSERVATION", not capture_integrity)
     observation_summary = observation_rows(observation_cards, display_limit=5)
     if observation_summary:
         st.caption("관찰 후보 가격·방향 교차 점검 · 카드와 같은 완료 차트 가격 구조만 표시하며, 구조가 확정되지 않은 가격은 추천가로 보이지 않게 처리합니다.")
         st.dataframe(pd.DataFrame(observation_summary), hide_index=True, width="stretch")
+    for card_item in observation_cards:
+        render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "OBSERVATION", not capture_integrity)
 
 st.divider()
 st.caption("백그라운드 검증 상태 · 스캐너 카드 선정과 독립적으로 고정 예측의 실제 가격 경계만 수집합니다.")

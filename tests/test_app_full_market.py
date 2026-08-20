@@ -125,6 +125,16 @@ def test_observation_summary_rows_use_card_price_levels_and_forecast_ranges():
     assert "5분 70,000~71,500" in rows[0]["예상 범위"]
 
 
+def test_observation_price_summary_precedes_individual_observation_cards():
+    source = APP_PATH.read_text(encoding="utf-8")
+
+    section = source.index('if observation_cards:')
+    summary = source.index('observation_summary = observation_rows(observation_cards, display_limit=5)', section)
+    card_loop = source.index('for card_item in observation_cards:', section)
+    background = source.index('st.caption("백그라운드 검증 상태', section)
+    assert section < summary < card_loop < background
+
+
 def _quote(*_args, **_kwargs) -> Quote:
     return Quote(
         symbol="005930", market=Market.KR, price=70000, previous_close=69000,
