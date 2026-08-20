@@ -203,10 +203,24 @@ def test_empty_us_rankings_expose_cached_fallback_funnel_without_extra_candidate
     assert [candidate["symbol"] for candidate in candidates] == ["GOOD"]
     assert diagnostics == {
         "순위 행": 0, "병합 후보": 0, "가격 상한 통과": 0,
-        "대체 시세 성공": 2, "상승·상한 통과": 1, "순위 오류": "없음",
+        "대체 시세 성공": 2, "대체 가격 상한 통과": 2, "상승·상한 통과": 1,
+        "순위 오류": "없음",
+        "참조 후보": [
+            {
+                "symbol": "GOOD", "name": "Good", "market": "US", "exchange": "NAS",
+                "price": 50, "change_pct": pytest.approx(100 / 49), "volume": 10_000,
+                "turnover": 500_000, "candidate_source": "유동성 시작목록 자동 대체",
+            },
+            {
+                "symbol": "FLAT", "name": "Flat", "market": "US", "exchange": "NAS",
+                "price": 50, "change_pct": pytest.approx(-100 / 51), "volume": 10_000,
+                "turnover": 500_000, "candidate_source": "유동성 시작목록 자동 대체",
+            },
+        ],
     }
     assert "순위 행 0" in candidate_pool_diagnostic_text(diagnostics)
     assert "상승·상한 통과 1" in candidate_pool_diagnostic_text(diagnostics)
+    assert "대체 가격 상한 통과 2" in candidate_pool_diagnostic_text(diagnostics)
 
 
 def _quote(*_args, **_kwargs) -> Quote:

@@ -403,8 +403,10 @@ def load_dashboard_candidate_snapshot(market_value: str, cache_version: str) -> 
         "병합 후보": 0,
         "가격 상한 통과": 0,
         "대체 시세 성공": 0,
+        "대체 가격 상한 통과": 0,
         "상승·상한 통과": 0,
         "순위 오류": "없음",
+        "참조 후보": [],
     }
     try:
         # The v12 KIS client defaults to 100 rank rows. Calling without the
@@ -456,6 +458,9 @@ def load_dashboard_candidate_snapshot(market_value: str, cache_version: str) -> 
             "turnover": quote.turnover,
             "candidate_source": "유동성 시작목록 자동 대체",
         })
+    reference_candidates = [candidate for candidate in fallback if candidate_pool_price_eligible(candidate, market)]
+    diagnostics["대체 가격 상한 통과"] = len(reference_candidates)
+    diagnostics["참조 후보"] = reference_candidates[:MAX_CANDIDATE_LIST]
     filtered = sort_rising_candidates(fallback, market)[:MAX_CANDIDATE_LIST]
     diagnostics["상승·상한 통과"] = len(filtered)
     return filtered, diagnostics
@@ -473,6 +478,7 @@ def candidate_pool_diagnostic_text(diagnostics: dict[str, Any]) -> str:
         f"병합 후보 {int(diagnostics.get('병합 후보', 0))} · "
         f"가격 상한 통과 {int(diagnostics.get('가격 상한 통과', 0))} · "
         f"대체 시세 성공 {int(diagnostics.get('대체 시세 성공', 0))} · "
+        f"대체 가격 상한 통과 {int(diagnostics.get('대체 가격 상한 통과', 0))} · "
         f"상승·상한 통과 {int(diagnostics.get('상승·상한 통과', 0))} · "
         f"순위 오류 {diagnostics.get('순위 오류', '없음')}"
     )
@@ -2116,6 +2122,22 @@ elif kis_connected and not errors and not candidates:
     st.info(f"현재 {limit_text} 가격 상한 안의 거래량·거래대금 후보풀을 받지 못했습니다. 순위 API를 다음 갱신 때 다시 확인합니다.")
     if candidate_load_diagnostics:
         st.caption(candidate_pool_diagnostic_text(candidate_load_diagnostics))
+        reference_candidates = [
+            candidate for candidate in candidate_load_diagnostics.get("참조 후보", [])
+            if isinstance(candidate, dict)
+        ]
+        if reference_candidates:
+            st.subheader(f"가격 상한 통과 · 유동성 참조 후보 {len(reference_candidates)}종목")
+            st.caption("순위 원천 공백 시 표시하는 시세 확인 목록입니다. 현재 상승 후보·정밀 분석·고정 검증 표본에는 포함하지 않습니다.")
+            st.dataframe(pd.DataFrame([
+                {
+                    "종목": f"{candidate.get('symbol')} · {candidate.get('name') or ''}",
+                    "현재가": price_text(float(candidate.get("price") or 0.0)),
+                    "등락률": f"{float(candidate.get('change_pct') or 0.0):+.2f}%",
+                    "원천": str(candidate.get("candidate_source") or "유동성 참조"),
+                }
+                for candidate in reference_candidates
+            ]), hide_index=True, width="stretch")
 
 if candidates and not cards:
     st.info("현재 상승 차트에서 지금 1회 진입 조건을 모두 통과한 종목은 없습니다.")
