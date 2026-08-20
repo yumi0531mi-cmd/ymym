@@ -151,15 +151,21 @@ class RequestBudget:
             self._prune(now)
             if now < self._blocked_until:
                 return self._blocked_until - now
-            if self._minute_used(now) >= self.minute_limit:
+            purpose = str(purpose or "기타")
+            reserved = self._has_reservation(purpose)
+            # A persisted forecast boundary has only a ±75-second capture window.
+            # Hold one minute-budget slot for that boundary so ordinary card/rank/bar
+            # work cannot make its REST fallback wait until the window has expired.
+            boundary_slot_held = self._has_reservation("경계 수집") and not reserved
+            minute_cap_for_purpose = self.minute_limit - (1 if boundary_slot_held else 0)
+            if self._minute_used(now) >= max(0, minute_cap_for_purpose):
                 first_in_minute = next((at for at, _purpose in self._calls if at > now - 60), now)
                 return max(0.1, first_in_minute + 60 - now)
-            reserved = self._has_reservation(str(purpose))
             if not reserved and len(self._calls) + self._reserved_count() >= self.five_hour_limit:
                 return max(0.1, self._calls[0][0] + 5 * 60 * 60 - now)
             if reserved:
-                self._consume_reservation(str(purpose))
-            self._calls.append((now, str(purpose or "기타")))
+                self._consume_reservation(purpose)
+            self._calls.append((now, purpose))
             return 0.0
 
     def block_for(self, seconds: float) -> None:

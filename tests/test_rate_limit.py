@@ -93,3 +93,16 @@ def test_renew_keeps_pending_boundary_capacity_alive_without_reserving_extra_cal
     assert budget.snapshot().reserved_by_purpose == {"경계 수집": 3}
     assert budget.acquire("경계 수집") == 0.0
     assert budget.snapshot().reserved_by_purpose == {"경계 수집": 2}
+
+
+def test_boundary_reservation_holds_last_minute_slot_from_ordinary_calls():
+    clock = Clock()
+    budget = RequestBudget(minute_limit=3, five_hour_limit=10, clock=clock)
+
+    assert budget.reserve("경계 수집", 1, ttl_seconds=300) is True
+    assert budget.acquire("후보검색") == 0.0
+    assert budget.acquire("분봉 조회") == 0.0
+
+    assert budget.acquire("카드 현재가") > 0.0
+    assert budget.acquire("경계 수집") == 0.0
+    assert budget.snapshot().minute_used == 3
