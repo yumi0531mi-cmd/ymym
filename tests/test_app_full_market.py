@@ -223,6 +223,14 @@ def test_empty_us_rankings_expose_cached_fallback_funnel_without_extra_candidate
     assert "대체 가격 상한 통과 2" in candidate_pool_diagnostic_text(diagnostics)
 
 
+def test_validation_ui_separates_twenty_case_score_gate_from_candidate_rotation_queue():
+    source = APP_PATH.read_text(encoding="utf-8")
+
+    assert '완료 표본 {complete}/20' in source
+    assert '고정 예측 순환 대기열 · v{APP_VERSION} · 후보 최대 {len(batch_candidates)}개' in source
+    assert '100개 예측 검증 진행' not in source
+
+
 def _quote(*_args, **_kwargs) -> Quote:
     return Quote(
         symbol="005930", market=Market.KR, price=70000, previous_close=69000,

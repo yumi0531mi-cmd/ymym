@@ -1728,7 +1728,7 @@ def run_free_validation_batch(
     ]
     complete = sum(case.data_completeness == "COMPLETE" for case in cases)
     st.caption(
-        f"100개 예측 검증 진행 · v{APP_VERSION} · 시작 {len(cases)}/{len(batch_candidates)} · "
+        f"고정 예측 순환 대기열 · v{APP_VERSION} · 후보 최대 {len(batch_candidates)}개 · 시작 {len(cases)}건 · "
         f"30분 완료 {complete}/{len(batch_candidates)} · 이번 분 시작 {started}개 · "
         f"순환 {start + 1 if batch_candidates else 0}/{len(batch_candidates)} · 화면을 열어 두면 다음 표본을 이어 기록합니다."
     )
@@ -2103,7 +2103,7 @@ if candidates and event_store.configured and not audit_only:
 elif audit_only:
     st.caption("감사 전용 모드 · 신규 검증 표본 생성·사후 채점·자동 기록을 실행하지 않습니다.")
 elif candidates:
-    st.caption("100개 예측 검증은 영구 저장 연결이 필요합니다. 현재는 앱 재시작 시 기록이 사라질 수 있어 시작하지 않습니다.")
+    st.caption("고정 예측 순환은 영구 저장 연결이 필요합니다. 현재는 앱 재시작 시 기록이 사라질 수 있어 시작하지 않습니다.")
 
 if audit_only:
     render_versioned_forecast_trace(store, market.value, audit_version)
