@@ -279,6 +279,18 @@ def default_market_label() -> str:
     return "국내"
 
 
+def market_session_reopened(market: Market) -> bool:
+    """Return whether a previously closed market screen should resume full analysis."""
+    return market_session(market) in ACTIVE_CARD_SESSIONS
+
+
+@st.fragment(run_every=60.0)
+def resume_closed_market_screen(market_value: str) -> None:
+    """Re-run the dashboard once a page kept open across a session boundary becomes active."""
+    if market_session_reopened(Market(market_value)):
+        st.rerun()
+
+
 def capture_integrity_enabled(value: Any) -> bool:
     """Enable the collection-only screen path from an explicit diagnostic URL flag."""
     return str(value).strip().lower() in {"1", "true", "yes", "5"}
@@ -1831,6 +1843,7 @@ if not audit_only:
 if audit_only:
     st.caption("감사 전용 모드 · 후보 분석·경계 수집·신규 표본 생성·사후 채점을 실행하지 않습니다.")
 elif current_session not in ACTIVE_CARD_SESSIONS:
+    resume_closed_market_screen(market.value)
     closed_message = (
         "국내 정규장이 종료되었습니다. 다음 정규장에는 분석이 완료된 후보 카드만 표시합니다."
         if market == Market.KR

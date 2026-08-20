@@ -115,6 +115,16 @@ def test_default_market_uses_active_us_session_after_korean_close():
         assert default_market_label() == "국내"
 
 
+def test_closed_market_session_reopens_only_when_the_selected_market_becomes_active():
+    from app import market_session_reopened
+
+    with patch("app.market_session", return_value="US_PRE"):
+        assert market_session_reopened(Market.US) is True
+
+    with patch("app.market_session", return_value="US_CLOSED"):
+        assert market_session_reopened(Market.US) is False
+
+
 def test_capture_integrity_flag_requires_explicit_enabled_value():
     from app import capture_integrity_enabled
 
