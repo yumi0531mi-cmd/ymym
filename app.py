@@ -2045,50 +2045,53 @@ elif not kis_connected:
 else:
     try:
         candidates, candidate_load_diagnostics = load_dashboard_candidate_snapshot(market.value, APP_VERSION)
-        requests: list[dict[str, Any]] = []
-        if direct_request is not None:
-            requests.append({**direct_request, "candidate_source": "관심 종목 직접 검색"})
-        fast_shortlist = fast_shortlist_candidates(candidates, market)
-        auto_slots = max(0, MAX_ANALYSIS_CANDIDATES - (1 if direct_request is not None else 0))
-        for candidate in fast_shortlist[:auto_slots]:
-            if direct_request is not None and str(candidate["symbol"]) == direct_request["symbol"]:
-                continue
-            requests.append(candidate)
-        visible_requests = requests[:MAX_ANALYSIS_CANDIDATES]
-        analysis_total = len(visible_requests)
-        analysis_status = st.status(
-            f"정밀 분석 준비 · 거래량·거래대금 후보에서 {analysis_total}종목의 완료 분봉 구조를 확인합니다.",
-            expanded=False,
-        )
-        analysis_preview = st.empty()
-        for index, candidate in enumerate(visible_requests, start=1):
-            symbol = str(candidate["symbol"])
-            exchange = str(candidate.get("exchange") or ("NAS" if market == Market.US else ""))
-            try:
-                card = analyze_card(
-                    symbol, market, exchange, float(cost_pct), int(min_score), store,
-                    request_purpose="카드 현재가", record_validation=not audit_only, record_forecast_audit=False,
-                )
-                card["name"] = str(candidate.get("name") or symbol)
-                card["candidate_source"] = str(candidate.get("candidate_source") or "거래량 TOP100 ∪ 거래대금 TOP100")
-                cards.append(card)
-                with analysis_preview.container():
-                    st.caption(f"정밀 분석 진행 {index}/{analysis_total} · 준비된 카드 {min(len(cards), MAX_LIVE_CARDS)}개를 먼저 표시합니다.")
-                    for preview in sorted(cards, key=mixed_card_priority, reverse=True)[:MAX_LIVE_CARDS]:
-                        preview_quote: Quote = preview["quote"]
-                        with st.container(border=True):
-                            st.markdown(f"**{preview_quote.symbol} · {preview.get('name') or preview_quote.market.value}**")
-                            st.caption(f"{card_stage(preview)} · {observation_reason(preview) if card_stage(preview) == 'OBSERVATION' else '카드 조건 재확인'}")
-                            render_plan_fields(preview)
-                analysis_status.update(label=f"정밀 분석 진행 {index}/{analysis_total} · {symbol} 완료 분봉 구조 확인", state="running")
-            except KISError as exc:
-                errors.append(f"{symbol}: {str(exc)[:180]}")
-            except (ValueError, KeyError, OSError) as exc:
-                errors.append(f"{symbol}: {type(exc).__name__}")
-            except Exception as exc:
-                errors.append(f"{symbol}: {type(exc).__name__}")
-        analysis_preview.empty()
-        analysis_status.update(label=f"정밀 분석 완료 · {len(cards)}/{analysis_total}종목", state="complete")
+        if capture_integrity:
+            st.caption("수집 안정성 전용 모드 · 후보풀만 갱신하고 카드 정밀 분석·현재가 갱신은 중지합니다.")
+        else:
+            requests: list[dict[str, Any]] = []
+            if direct_request is not None:
+                requests.append({**direct_request, "candidate_source": "관심 종목 직접 검색"})
+            fast_shortlist = fast_shortlist_candidates(candidates, market)
+            auto_slots = max(0, MAX_ANALYSIS_CANDIDATES - (1 if direct_request is not None else 0))
+            for candidate in fast_shortlist[:auto_slots]:
+                if direct_request is not None and str(candidate["symbol"]) == direct_request["symbol"]:
+                    continue
+                requests.append(candidate)
+            visible_requests = requests[:MAX_ANALYSIS_CANDIDATES]
+            analysis_total = len(visible_requests)
+            analysis_status = st.status(
+                f"정밀 분석 준비 · 거래량·거래대금 후보에서 {analysis_total}종목의 완료 분봉 구조를 확인합니다.",
+                expanded=False,
+            )
+            analysis_preview = st.empty()
+            for index, candidate in enumerate(visible_requests, start=1):
+                symbol = str(candidate["symbol"])
+                exchange = str(candidate.get("exchange") or ("NAS" if market == Market.US else ""))
+                try:
+                    card = analyze_card(
+                        symbol, market, exchange, float(cost_pct), int(min_score), store,
+                        request_purpose="카드 현재가", record_validation=not audit_only, record_forecast_audit=False,
+                    )
+                    card["name"] = str(candidate.get("name") or symbol)
+                    card["candidate_source"] = str(candidate.get("candidate_source") or "거래량 TOP100 ∪ 거래대금 TOP100")
+                    cards.append(card)
+                    with analysis_preview.container():
+                        st.caption(f"정밀 분석 진행 {index}/{analysis_total} · 준비된 카드 {min(len(cards), MAX_LIVE_CARDS)}개를 먼저 표시합니다.")
+                        for preview in sorted(cards, key=mixed_card_priority, reverse=True)[:MAX_LIVE_CARDS]:
+                            preview_quote: Quote = preview["quote"]
+                            with st.container(border=True):
+                                st.markdown(f"**{preview_quote.symbol} · {preview.get('name') or preview_quote.market.value}**")
+                                st.caption(f"{card_stage(preview)} · {observation_reason(preview) if card_stage(preview) == 'OBSERVATION' else '카드 조건 재확인'}")
+                                render_plan_fields(preview)
+                    analysis_status.update(label=f"정밀 분석 진행 {index}/{analysis_total} · {symbol} 완료 분봉 구조 확인", state="running")
+                except KISError as exc:
+                    errors.append(f"{symbol}: {str(exc)[:180]}")
+                except (ValueError, KeyError, OSError) as exc:
+                    errors.append(f"{symbol}: {type(exc).__name__}")
+                except Exception as exc:
+                    errors.append(f"{symbol}: {type(exc).__name__}")
+            analysis_preview.empty()
+            analysis_status.update(label=f"정밀 분석 완료 · {len(cards)}/{analysis_total}종목", state="complete")
     except KISError:
         st.error("실시간 후보를 가져오지 못했습니다. 잠시 뒤 화면이 자동으로 다시 확인합니다.")
 

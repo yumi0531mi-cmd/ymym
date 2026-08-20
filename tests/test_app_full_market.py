@@ -91,6 +91,17 @@ def test_background_validation_rendering_follows_observation_cards_in_normal_sca
     assert observation_cards < validation_status
 
 
+def test_capture_integrity_mode_skips_card_analysis_but_keeps_candidate_pool_for_batch_collection():
+    source = APP_PATH.read_text(encoding="utf-8")
+
+    integrity_guard = source.index('if capture_integrity:\n            st.caption("수집 안정성 전용 모드')
+    card_analysis = source.index("for index, candidate in enumerate(visible_requests, start=1):")
+    validation_batch = source.index("run_free_validation_batch(market.value, candidates")
+
+    assert integrity_guard < card_analysis < validation_batch
+    assert "수집 안정성 전용 모드 · 후보풀만 갱신하고 카드 정밀 분석·현재가 갱신은 중지합니다." in source
+
+
 def test_validation_batch_keeps_its_initial_candidate_snapshot_when_rankings_refresh():
     from app import free_validation_batch_state
 
