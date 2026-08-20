@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime
 from copy import deepcopy
 import os
@@ -177,6 +178,35 @@ def test_price_level_wait_exposes_raw_ordering_and_entry_location_without_recomm
     assert diagnostic["required"] == "상방 경로 확인 · Hard < Soft < 진입 < 1차 < 2차 · 진입은 현재가 +0.2% 이내"
     assert "상방 경로 미확인" in rows[0]["관문 실제값 / 요구"]
     assert rows[0]["매수가 / 1·2차 목표"] == "구조 재확인 / 구조 재확인 / 구조 재확인"
+
+
+def test_empty_us_rankings_expose_cached_fallback_funnel_without_extra_candidate_call():
+    from app import candidate_pool_diagnostic_text, load_dashboard_candidate_snapshot
+
+    liquid = [
+        SimpleNamespace(symbol="GOOD", name="Good", exchange="NAS"),
+        SimpleNamespace(symbol="FLAT", name="Flat", exchange="NAS"),
+    ]
+    def quote(symbol, *_args, **_kwargs):
+        previous_close = 49 if symbol == "GOOD" else 51
+        return Quote(symbol, Market.US, 50, previous_close, datetime(2026, 8, 20, 16, 0), volume=10_000, turnover=500_000)
+    client = SimpleNamespace(
+        request_scope=lambda _purpose: nullcontext(),
+        market_rankings=lambda _market: {"거래량 TOP100": [], "거래대금 TOP100": []},
+        quote=quote,
+    )
+
+    st.cache_data.clear()
+    with patch("app.get_client", return_value=client), patch("app.US_LIQUID", liquid):
+        candidates, diagnostics = load_dashboard_candidate_snapshot("US", "candidate-diagnostics-test")
+
+    assert [candidate["symbol"] for candidate in candidates] == ["GOOD"]
+    assert diagnostics == {
+        "순위 행": 0, "병합 후보": 0, "가격 상한 통과": 0,
+        "대체 시세 성공": 2, "상승·상한 통과": 1, "순위 오류": "없음",
+    }
+    assert "순위 행 0" in candidate_pool_diagnostic_text(diagnostics)
+    assert "상승·상한 통과 1" in candidate_pool_diagnostic_text(diagnostics)
 
 
 def _quote(*_args, **_kwargs) -> Quote:

@@ -394,20 +394,31 @@ def fast_shortlist_candidates(candidates: list[dict[str, Any]], market: Market) 
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_dashboard_candidates(market_value: str, cache_version: str) -> list[dict[str, Any]]:
-    """Return the price-eligible TOP100 volume/turnover union without signal filtering."""
+def load_dashboard_candidate_snapshot(market_value: str, cache_version: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Return one cached candidate load plus non-sensitive funnel counts for empty-pool diagnosis."""
     market = Market(market_value)
     client = get_client(CLIENT_CACHE_VERSION, current_secret_fingerprint())
+    diagnostics: dict[str, Any] = {
+        "순위 행": 0,
+        "병합 후보": 0,
+        "가격 상한 통과": 0,
+        "대체 시세 성공": 0,
+        "상승·상한 통과": 0,
+        "순위 오류": "없음",
+    }
     try:
         # The v12 KIS client defaults to 100 rank rows. Calling without the
         # optional keyword also keeps a live Streamlit worker safe if it is
         # briefly finishing a rerun that still holds the prior method shape.
         with client.request_scope("후보검색"):
             rankings = client.market_rankings(market)
+        diagnostics["순위 행"] = sum(len(rows) for rows in rankings.values() if isinstance(rows, list))
         candidates = [candidate.to_dict() for candidate in merge_rankings(market, rankings, limit=MAX_CANDIDATE_LIST)]
+        diagnostics["병합 후보"] = len(candidates)
         for candidate in candidates:
             candidate["candidate_source"] = "거래량 TOP100 ∪ 거래대금 TOP100"
         pool = [candidate for candidate in candidates if candidate_pool_price_eligible(candidate, market)]
+        diagnostics["가격 상한 통과"] = len(pool)
         if pool:
             return sorted(
                 pool,
@@ -417,11 +428,11 @@ def load_dashboard_candidates(market_value: str, cache_version: str) -> list[dic
                     float(candidate.get("volume") or 0.0),
                 ),
                 reverse=True,
-            )
-    except KISError:
+            ), diagnostics
+    except KISError as exc:
         # Ranking availability differs by market session and account entitlement.
         # A transparent liquid-list fallback avoids a blank first screen.
-        pass
+        diagnostics["순위 오류"] = type(exc).__name__
 
     items = KR_LIQUID if market == Market.KR else US_LIQUID
     fallback: list[dict[str, Any]] = []
@@ -433,6 +444,7 @@ def load_dashboard_candidates(market_value: str, cache_version: str) -> list[dic
                 quote = client.quote(item.symbol, market, item.exchange, include_orderbook=False)
         except KISError:
             continue
+        diagnostics["대체 시세 성공"] += 1
         fallback.append({
             "symbol": quote.symbol,
             "name": item.name,
@@ -444,7 +456,26 @@ def load_dashboard_candidates(market_value: str, cache_version: str) -> list[dic
             "turnover": quote.turnover,
             "candidate_source": "유동성 시작목록 자동 대체",
         })
-    return sort_rising_candidates(fallback, market)[:MAX_CANDIDATE_LIST]
+    filtered = sort_rising_candidates(fallback, market)[:MAX_CANDIDATE_LIST]
+    diagnostics["상승·상한 통과"] = len(filtered)
+    return filtered, diagnostics
+
+
+def load_dashboard_candidates(market_value: str, cache_version: str) -> list[dict[str, Any]]:
+    """Return the price-eligible TOP100 volume/turnover union without signal filtering."""
+    return load_dashboard_candidate_snapshot(market_value, cache_version)[0]
+
+
+def candidate_pool_diagnostic_text(diagnostics: dict[str, Any]) -> str:
+    """Format cached candidate funnel counts without claiming a strategy failure."""
+    return (
+        f"후보 수집 진단 · 순위 행 {int(diagnostics.get('순위 행', 0))} · "
+        f"병합 후보 {int(diagnostics.get('병합 후보', 0))} · "
+        f"가격 상한 통과 {int(diagnostics.get('가격 상한 통과', 0))} · "
+        f"대체 시세 성공 {int(diagnostics.get('대체 시세 성공', 0))} · "
+        f"상승·상한 통과 {int(diagnostics.get('상승·상한 통과', 0))} · "
+        f"순위 오류 {diagnostics.get('순위 오류', '없음')}"
+    )
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1934,6 +1965,7 @@ st.markdown("<div class='mobile-head'><h1>실시간 상승 차트 스캐너</h1>
 cards: list[dict[str, Any]] = []
 errors: list[str] = []
 candidates: list[dict[str, Any]] = []
+candidate_load_diagnostics: dict[str, Any] = {}
 visible_requests: list[dict[str, Any]] = []
 fixed_symbols: tuple[str, ...] = ()
 direct_request: dict[str, str] | None = None
@@ -1976,7 +2008,7 @@ elif not kis_connected:
     st.info("연결 확인 — " + " · ".join(f"{name}: {value}" for name, value in client.connection_diagnostics.items()))
 else:
     try:
-        candidates = load_dashboard_candidates(market.value, APP_VERSION)
+        candidates, candidate_load_diagnostics = load_dashboard_candidate_snapshot(market.value, APP_VERSION)
         requests: list[dict[str, Any]] = []
         if direct_request is not None:
             requests.append({**direct_request, "candidate_source": "관심 종목 직접 검색"})
@@ -2082,6 +2114,8 @@ if cards:
 elif kis_connected and not errors and not candidates:
     limit_text = "30만 원 미만" if market == Market.KR else "200달러 미만"
     st.info(f"현재 {limit_text} 가격 상한 안의 거래량·거래대금 후보풀을 받지 못했습니다. 순위 API를 다음 갱신 때 다시 확인합니다.")
+    if candidate_load_diagnostics:
+        st.caption(candidate_pool_diagnostic_text(candidate_load_diagnostics))
 
 if candidates and not cards:
     st.info("현재 상승 차트에서 지금 1회 진입 조건을 모두 통과한 종목은 없습니다.")
