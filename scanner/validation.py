@@ -420,8 +420,17 @@ class ValidationStore:
                     if row.get("case_id"):
                         by_id[str(row["case_id"])] = row
                 self.last_persistence_error = None
-            except PersistenceError as exc:
-                self.last_persistence_error = str(exc)
+            except Exception as exc:
+                # Streamlit hot reload can retain an EventStore created by the
+                # previous module generation.  Its PersistenceError is a distinct
+                # class object even though the error name is identical.  Keep a
+                # genuine programming error visible, but treat either generation
+                # of the storage transport error as non-fatal so local fixed
+                # forecasts continue through their 5/15/30-minute boundaries.
+                if isinstance(exc, PersistenceError) or type(exc).__name__ == "PersistenceError":
+                    self.last_persistence_error = str(exc)
+                else:
+                    raise
         return sorted(by_id.values(), key=lambda row: str(row.get("signal_time", "")))
 
     def cases(self) -> list[ValidationCase]:

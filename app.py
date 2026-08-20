@@ -23,13 +23,14 @@ from scanner.sessions import market_session
 from scanner.universe import KR_LIQUID, US_LIQUID, rank_quotes
 from scanner.validation import ValidationCase, ValidationStore
 
-APP_VERSION = "6.20-domestic-history-rollover"
+APP_VERSION = "6.21-persistence-safe-domestic-validation"
 # Bump this whenever the cached KISClient interface changes. Streamlit can retain a
 # resource through a hot code update, so a new contract must never reuse an old client.
 CLIENT_CACHE_VERSION = "client-contract-v16-kr-us-720-minute-history-rollover"
 # The market-data connection has its own lifecycle. Bump this only when the
 # WebSocket protocol or recovery contract changes, without issuing a new REST token.
 REALTIME_HUB_CACHE_VERSION = "realtime-hub-v4-ranked-five"
+EVENT_STORE_CACHE_VERSION = "event-store-v2-persistence-guard"
 VALIDATION_ROOT = Path(".scanner_data/validation")
 MAX_LIVE_CARDS = 5
 MAX_ANALYSIS_CANDIDATES = 8
@@ -135,14 +136,33 @@ def current_realtime_hub() -> KISRealtimeHub:
 
 
 @st.cache_resource
-def get_event_store(secret_fingerprint: str) -> EventStore:
-    """Recreate the persistent event store whenever Streamlit Secrets change."""
+def get_event_store(cache_version: str, secret_fingerprint: str) -> EventStore:
+    """Recreate the persistent event store whenever its contract or secrets change."""
+    del cache_version
     return EventStore(st.secrets)
 
 
 @st.cache_resource
-def get_cycle_store(secret_fingerprint: str) -> CycleStore:
-    return CycleStore(get_event_store(secret_fingerprint))
+def get_cycle_store(cache_version: str, secret_fingerprint: str) -> CycleStore:
+    return CycleStore(get_event_store(cache_version, secret_fingerprint))
+
+
+def current_event_store() -> EventStore:
+    fingerprint = current_secret_fingerprint()
+    store = get_event_store(EVENT_STORE_CACHE_VERSION, fingerprint)
+    if not isinstance(store, EventStore) or not callable(getattr(store, "list", None)):
+        get_event_store.clear()
+        store = get_event_store(EVENT_STORE_CACHE_VERSION, fingerprint)
+    return store
+
+
+def current_cycle_store() -> CycleStore:
+    fingerprint = current_secret_fingerprint()
+    store = get_cycle_store(EVENT_STORE_CACHE_VERSION, fingerprint)
+    if not isinstance(store, CycleStore) or not callable(getattr(store, "get", None)):
+        get_cycle_store.clear()
+        store = get_cycle_store(EVENT_STORE_CACHE_VERSION, fingerprint)
+    return store
 
 
 def _quote_to_cache_record(quote: Quote) -> dict[str, object]:
@@ -1751,8 +1771,8 @@ def render_chart(bars: pd.DataFrame, plan: Any, key: str) -> None:
 client = current_client()
 realtime_hub = current_realtime_hub()
 active_secret_fingerprint = current_secret_fingerprint()
-event_store = get_event_store(active_secret_fingerprint)
-cycle_store = get_cycle_store(active_secret_fingerprint)
+event_store = current_event_store()
+cycle_store = current_cycle_store()
 store = ValidationStore(VALIDATION_ROOT, event_store=event_store)
 
 with st.sidebar:
@@ -1800,6 +1820,8 @@ with st.sidebar:
         st.caption(f"실시간 연결 원인: {realtime_hub.last_error[:160]}")
     if event_store.configured:
         st.caption("검증 성과 저장: 영구 보관 연결됨")
+        if store.last_persistence_error:
+            st.warning(f"검증 영속 저장소 일시 오류 · 로컬 표본으로 수집을 계속합니다: {store.last_persistence_error[:160]}")
     else:
         st.caption("검증 성과 저장: 앱 재시작 시 초기화될 수 있음 · [한 번만 설정하는 안내](https://github.com/yumi0531mi-cmd/ymym/blob/main/docs/supabase_persistent_validation_setup.md)")
     st.caption(f"화면 현재가 {refresh_seconds}초 확인 · KIS WebSocket 체결 우선 · 미연결 시 REST 5분 안전 대체 · 완료봉 구조 1분")

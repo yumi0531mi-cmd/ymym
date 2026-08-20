@@ -17,6 +17,25 @@ class RowsOnlyStore:
         return self.rows
 
 
+def test_validation_store_keeps_local_cases_when_hot_reloaded_persistence_error_is_raised(tmp_path):
+    class LegacyPersistenceError(Exception):
+        pass
+
+    LegacyPersistenceError.__name__ = "PersistenceError"
+
+    class LegacyEventStore:
+        configured = True
+        status = "Supabase 영속 저장"
+
+        def list(self, _kind):
+            raise LegacyPersistenceError("영속 저장소 조회 오류: ConnectionError")
+
+    store = ValidationStore(tmp_path, event_store=LegacyEventStore())
+
+    assert store.load_all() == []
+    assert store.last_persistence_error == "영속 저장소 조회 오류: ConnectionError"
+
+
 def test_cycle_real_breakdown_is_counted_once_per_completed_bar():
     cycle_store = CycleStore(EventStore({}))
     state = cycle_store.get("005930", Market.KR, datetime(2026, 1, 2, 10, 0))
