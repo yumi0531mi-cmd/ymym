@@ -199,3 +199,4 @@
 - [x] 동적 후보 순위가 바뀌어도 진행 중인 고정 예측 배치의 batch_id·후보 스냅샷·인덱스가 재설정되지 않도록 회귀 검증
 - [x] capture_integrity 수집 안정성 URL에서 카드 정밀 분석·현재가 갱신을 중지해 경계 수집 호출 여유를 유지하는지 회귀 검증
 - [x] capture_integrity 수집 안정성 화면에 같은 버전의 COMPLETE·PENDING·DATA_MISSING 누적을 표시해 10건 수집 판정을 검증
+- [x] 이전 DATA_MISSING과 새 수집 안정성 보정 표본을 별도 버전 코호트로 분리해 완료·누락을 혼합하지 않고 재확인
