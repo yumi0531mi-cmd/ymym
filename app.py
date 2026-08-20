@@ -1555,6 +1555,26 @@ def render_data_missing_forecast_cases(store: ValidationStore, market_value: str
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 
+def capture_integrity_status_counts(store: ValidationStore, market_value: str) -> dict[str, int]:
+    """Count active-version collection outcomes without showing prediction performance."""
+    cases = [
+        case for case in store.cases()
+        if (
+            case.market == market_value
+            and case.version == APP_VERSION
+            and case.validation_kind == "FORECAST_AUDIT"
+        )
+    ]
+    complete = sum(case.data_completeness == "COMPLETE" for case in cases)
+    missing = sum(case.data_completeness == "DATA_MISSING" for case in cases)
+    return {
+        "started": len(cases),
+        "complete": complete,
+        "pending": len(cases) - complete - missing,
+        "data_missing": missing,
+    }
+
+
 def render_versioned_forecast_summary(store: ValidationStore, market_value: str) -> None:
     """Display performance only after a fixed-version cohort has enough complete paths."""
     summary = store.versioned_validation_summary(APP_VERSION, market_value)
@@ -2137,6 +2157,13 @@ elif audit_only:
     st.caption("감사 전용 모드 · 신규 검증 표본 생성·사후 채점·자동 기록을 실행하지 않습니다.")
 elif candidates:
     st.caption("고정 예측 순환은 영구 저장 연결이 필요합니다. 현재는 앱 재시작 시 기록이 사라질 수 있어 시작하지 않습니다.")
+
+if capture_integrity and not audit_only:
+    integrity_counts = capture_integrity_status_counts(store, market.value)
+    st.caption(
+        f"수집 안정성 누적 · 시작 {integrity_counts['started']}건 · COMPLETE {integrity_counts['complete']}건 · "
+        f"PENDING {integrity_counts['pending']}건 · DATA_MISSING {integrity_counts['data_missing']}건"
+    )
 
 if audit_only:
     render_versioned_forecast_trace(store, market.value, audit_version)

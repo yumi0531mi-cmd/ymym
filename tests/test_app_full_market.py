@@ -102,6 +102,22 @@ def test_capture_integrity_mode_skips_card_analysis_but_keeps_candidate_pool_for
     assert "수집 안정성 전용 모드 · 후보풀만 갱신하고 카드 정밀 분석·현재가 갱신은 중지합니다." in source
 
 
+def test_capture_integrity_status_counts_keep_complete_pending_and_missing_separate():
+    from app import APP_VERSION, capture_integrity_status_counts
+
+    store = SimpleNamespace(cases=lambda: [
+        SimpleNamespace(market="US", version=APP_VERSION, validation_kind="FORECAST_AUDIT", data_completeness="COMPLETE"),
+        SimpleNamespace(market="US", version=APP_VERSION, validation_kind="FORECAST_AUDIT", data_completeness="PENDING"),
+        SimpleNamespace(market="US", version=APP_VERSION, validation_kind="FORECAST_AUDIT", data_completeness="DATA_MISSING"),
+        SimpleNamespace(market="KR", version=APP_VERSION, validation_kind="FORECAST_AUDIT", data_completeness="COMPLETE"),
+        SimpleNamespace(market="US", version="older", validation_kind="FORECAST_AUDIT", data_completeness="COMPLETE"),
+    ])
+
+    assert capture_integrity_status_counts(store, "US") == {
+        "started": 3, "complete": 1, "pending": 1, "data_missing": 1,
+    }
+
+
 def test_validation_batch_keeps_its_initial_candidate_snapshot_when_rankings_refresh():
     from app import free_validation_batch_state
 
