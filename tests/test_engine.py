@@ -2,17 +2,18 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+from unittest.mock import patch
 
 from scanner.engine import _classify_trade_type, analyze
 from scanner.forecast import (
-    apply_risk_persistence_to_forecast, cap_downside_forecast_path, cap_upside_forecast_path,
+    ForecastPath, apply_risk_persistence_to_forecast, cap_downside_forecast_path, cap_upside_forecast_path,
     constrain_unconfirmed_range_thirty_minute_upside, forecast_path,
 )
 from scanner.indicators import enrich, resample, resample_completed
 from scanner.models import Market, Quote, Regime, Signal
 from scanner.models import ForecastPoint
 from scanner.persistence import EventStore, ManualTrade
-from scanner.strategy import confirmed_levels, fake_signal_flags, repeat_box, trade_levels
+from scanner.strategy import TimeframeState, confirmed_levels, fake_signal_flags, repeat_box, trade_levels
 from scanner.validation import ValidationCase
 from scanner.universe import rank_quotes
 
@@ -38,6 +39,60 @@ def test_insufficient_bars_hides_plan():
     plan = analyze(quote(), bars(10))
     assert plan.entry is None
     assert "충분한 완료 1분봉" in plan.missing
+
+
+def test_engine_excludes_live_final_minute_from_structure_box_and_forecast_inputs():
+    from scanner import engine
+
+    frame = bars(961)
+    captured: dict[str, pd.DataFrame] = {}
+    states = {
+        minutes: TimeframeState(minutes, Regime.TRANSITION, 0.0, 100.0, 100.0, 100.0)
+        for minutes in (1, 5, 15, 30)
+    }
+    points = [ForecastPoint(minutes, 99.0, 100.0, 101.0, Regime.RANGE, "test") for minutes in (5, 15, 30)]
+    diagnostics = {
+        "direction_engines": {
+            str(minutes): {"input_ready": True, "score": 0.0}
+            for minutes in (5, 15, 30)
+        }
+    }
+
+    def capture_multi_timeframe(value):
+        captured["states"] = value
+        return states
+
+    def capture_repeat_box(value, _price):
+        captured["box"] = value
+        return None
+
+    def capture_forecast(value, _regime, reference_price=None):
+        captured["forecast"] = value
+        return ForecastPath(points, diagnostics)
+
+    with (
+        patch.object(engine, "multi_timeframe", side_effect=capture_multi_timeframe),
+        patch.object(engine, "repeat_box", side_effect=capture_repeat_box),
+        patch.object(engine, "forecast_path", side_effect=capture_forecast),
+    ):
+        analyze(quote(float(frame.close.iloc[-1])), frame)
+
+    expected_last_completed = frame.index[-2]
+    assert {value.index[-1] for value in captured.values()} == {expected_last_completed}
+
+
+def test_trade_levels_ignore_an_extreme_live_minute_on_a_five_minute_boundary():
+    frame = bars(181, slope=0.0)
+    entry = float(frame.close.iloc[-2])
+    baseline = trade_levels(frame, entry)
+    live_extreme = frame.copy()
+    live_extreme.iloc[-1, live_extreme.columns.get_loc("high")] = entry * 1.50
+    live_extreme.iloc[-1, live_extreme.columns.get_loc("low")] = entry * 0.50
+    live_extreme.iloc[-1, live_extreme.columns.get_loc("close")] = entry * 1.25
+
+    protected = trade_levels(live_extreme, entry)
+
+    assert protected == baseline
 
 
 def test_levels_are_observed_bars():

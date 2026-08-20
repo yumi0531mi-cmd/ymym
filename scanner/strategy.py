@@ -152,7 +152,11 @@ def trade_levels(
     support = supports[0] if supports else None
     support_basis = "완료 1분봉 스윙 저점" if support else "지지 미확인"
 
-    grouped = resample_completed(frame, 5)
+    # The caller's raw frame can contain the currently forming final minute.  Use
+    # the same completed one-minute population as the support calculation before
+    # constructing target resistance, including when that minute lands exactly on
+    # a five-minute aggregation boundary.
+    grouped = resample_completed(completed_1m, 5)
     completed_5m = enrich(grouped).tail(60) if len(grouped) else grouped.iloc[0:0]
     highs_5m = completed_5m.high[
         (completed_5m.high.shift(1) < completed_5m.high)

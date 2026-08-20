@@ -241,11 +241,16 @@ def analyze(
             missing=missing + ["완료 1분봉"],
         )
 
-    states = multi_timeframe(df)
+    # `bars` ends with the current KIS minute, which may be written exactly on a
+    # higher-timeframe boundary while the candle is still forming.  Every
+    # structural input below therefore starts from the completed one-minute set.
+    # Passing the raw frame here can otherwise promote that live final minute into
+    # a nominally complete 5/15/30-minute aggregation at the boundary.
+    states = multi_timeframe(completed)
     # 15분 구조가 상승이면 5분 하락은 즉시 하락 추세가 아니라 정상 눌림일 수 있다.
     # 5분은 전략의 진입 타이밍으로 별도 판정한다.
     trend_confirmed = states[15].regime == Regime.UP
-    box = repeat_box(df, quote.price)
+    box = repeat_box(completed, quote.price)
     zone = price_zone_in_box(box, quote.price)
     if trend_confirmed:
         regime, strategy = Regime.UP, "TREND_SWING · 상승 추세 눌림"
@@ -260,7 +265,7 @@ def analyze(
     entry, entry_basis = chart_entry_level(df, quote.price, regime, box)
     entry = entry or quote.price
     target1, target2, support, target1_basis, target2_basis, support_basis = trade_levels(df, entry, box)
-    raw_forecast_points = forecast_path(df, regime, reference_price=quote.price)
+    raw_forecast_points = forecast_path(completed, regime, reference_price=quote.price)
     if regime == Regime.RANGE:
         raw_forecast_points = constrain_unconfirmed_range_thirty_minute_upside(raw_forecast_points, latest, quote.price)
     forecast_engine_diagnostics = dict(getattr(raw_forecast_points, "diagnostics", {}))
