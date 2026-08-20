@@ -538,6 +538,29 @@ def test_elapsed_boundary_attempts_rest_before_marking_data_missing():
     budget.release.assert_called_once_with("경계 수집", 1)
 
 
+def test_pending_boundary_reservations_are_replenished_before_they_expire():
+    from app import replenish_pending_boundary_reservations
+
+    budget = SimpleNamespace(
+        renew=Mock(return_value=0),
+        snapshot=Mock(return_value=SimpleNamespace(reserved_by_purpose={"경계 수집": 2})),
+        reserve=Mock(return_value=True),
+    )
+    client = SimpleNamespace(request_budget=budget)
+    pending = [
+        SimpleNamespace(horizons=[Mock(), Mock(), Mock()]),
+        SimpleNamespace(horizons=[Mock(), Mock(), Mock()]),
+    ]
+    store = SimpleNamespace(pending_forecast_audits=Mock(return_value=pending))
+
+    with patch("app.current_client", return_value=client):
+        result = replenish_pending_boundary_reservations(store, "US")
+
+    budget.renew.assert_called_once_with("경계 수집", 35 * 60)
+    budget.reserve.assert_called_once_with("경계 수집", 4, 35 * 60)
+    assert result == {"pending": 2, "expected": 6, "active": 6, "added": 4}
+
+
 def test_actionable_levels_do_not_create_buy_levels_for_unconfirmed_path():
     from app import actionable_display_levels
 

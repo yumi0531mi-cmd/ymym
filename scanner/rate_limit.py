@@ -127,6 +127,23 @@ class RequestBudget:
                 if not self._consume_reservation(str(purpose)):
                     break
 
+    def renew(self, purpose: str, ttl_seconds: float) -> int:
+        """Extend active reservations for a still-pending critical workflow without changing their count."""
+        with self._lock:
+            now = self._clock()
+            self._prune(now)
+            renewed = 0
+            renewed_rows: deque[tuple[float, str, int]] = deque()
+            expires_at = now + max(1.0, float(ttl_seconds))
+            for saved_expires_at, saved_purpose, count in self._reservations:
+                if saved_purpose == str(purpose) and count > 0:
+                    renewed_rows.append((max(saved_expires_at, expires_at), saved_purpose, count))
+                    renewed += count
+                else:
+                    renewed_rows.append((saved_expires_at, saved_purpose, count))
+            self._reservations = renewed_rows
+            return renewed
+
     def acquire(self, purpose: str = "기타") -> float:
         """Count one request or return the conservative wait time in seconds."""
         with self._lock:

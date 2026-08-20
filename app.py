@@ -1442,11 +1442,28 @@ def capture_forecast_boundary_case(store: ValidationStore, market: Market, case:
     )
 
 
+def replenish_pending_boundary_reservations(store: ValidationStore, market_value: str) -> dict[str, int]:
+    """Keep real 5·15·30-minute boundary capacity reserved while persisted audits remain pending."""
+    pending = store.pending_forecast_audits(
+        market_value, version=APP_VERSION, limit=MAX_PENDING_FORECAST_WATCHES,
+    )
+    expected = sum(len(getattr(case, "horizons", [])) for case in pending)
+    budget = current_client().request_budget
+    budget.renew("경계 수집", VALIDATION_BOUNDARY_RESERVATION_TTL_SECONDS)
+    active = int(budget.snapshot().reserved_by_purpose.get("경계 수집", 0))
+    missing = max(0, expected - active)
+    added = 0
+    if missing and budget.reserve("경계 수집", missing, VALIDATION_BOUNDARY_RESERVATION_TTL_SECONDS):
+        added = missing
+    return {"pending": len(pending), "expected": expected, "active": active + added, "added": added}
+
+
 @st.fragment(run_every=15.0)
 def capture_pending_forecast_paths(store: ValidationStore, market_value: str) -> None:
     """Capture only 5·15·30-minute boundaries due in this minute."""
     market = Market(market_value)
     observed_at = datetime.now().astimezone()
+    replenish_pending_boundary_reservations(store, market.value)
     for case in store.due_forecast_audits(
         market.value, observed_at, version=APP_VERSION, limit=MAX_PENDING_FORECAST_WATCHES
     ):
