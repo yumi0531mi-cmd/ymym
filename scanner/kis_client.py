@@ -514,6 +514,7 @@ class KISClient:
                 "FID_FAKE_TICK_INCU_YN": "",
             }
             rows: list[dict[str, Any]] = []
+            seen_page_keys: set[datetime] = set()
             # The official domestic daily-minute endpoint returns at most 120 rows
             # but accepts a prior date and time on every call.  Continue from the
             # oldest returned completed minute to warm the 15/30-minute engines;
@@ -540,7 +541,17 @@ class KISClient:
                         continue
                 if not keys:
                     break
+                # A pre-open same-day cursor can be ignored by the domestic
+                # endpoint, returning the opening rows again.  Stop a duplicate
+                # page and move an opening-boundary cursor to the preceding
+                # calendar date's close so the official past-data flag can find
+                # the previous available trading session.
+                if set(keys).issubset(seen_page_keys):
+                    break
+                seen_page_keys.update(keys)
                 cursor = min(keys) - timedelta(minutes=1)
+                if cursor.hour < 9:
+                    cursor = (cursor - timedelta(days=1)).replace(hour=15, minute=30, second=0, microsecond=0)
                 params = {
                     **params,
                     "FID_INPUT_DATE_1": cursor.strftime("%Y%m%d"),

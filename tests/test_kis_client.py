@@ -180,10 +180,35 @@ def test_kr_intraday_collects_six_official_date_time_pages_for_higher_timeframe_
 
     assert len(calls) == 6
     assert len(bars) == 12
-    assert calls[1][2]["FID_INPUT_DATE_1"] == "20260819"
-    assert calls[1][2]["FID_INPUT_HOUR_1"] == "085900"
+    assert calls[1][2]["FID_INPUT_DATE_1"] == "20260818"
+    assert calls[1][2]["FID_INPUT_HOUR_1"] == "153000"
     assert calls[2][2]["FID_INPUT_DATE_1"] == "20260818"
     assert calls[2][2]["FID_INPUT_HOUR_1"] == "152800"
+
+
+def test_kr_intraday_stops_when_api_repeats_the_same_opening_page(tmp_path):
+    client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
+    calls = []
+    opening_rows = [
+        {
+            "stck_bsop_date": "20260819", "stck_cntg_hour": value,
+            "stck_oprc": "100", "stck_hgpr": "101", "stck_lwpr": "99",
+            "stck_prpr": "100", "cntg_vol": "1000",
+        }
+        for value in ("090100", "090000")
+    ]
+
+    def fake_get(path, tr_id, params):
+        calls.append((path, tr_id, dict(params)))
+        return {"output2": opening_rows}
+
+    client._get = fake_get  # type: ignore[method-assign]
+    bars = client.intraday("005930", Market.KR)
+
+    assert len(calls) == 2
+    assert len(bars) == 2
+    assert calls[1][2]["FID_INPUT_DATE_1"] == "20260818"
+    assert calls[1][2]["FID_INPUT_HOUR_1"] == "153000"
 
 
 def test_missing_live_price_is_an_error_not_a_fake_plan():
