@@ -135,7 +135,7 @@ def test_kr_intraday_uses_official_120_record_daily_minute_endpoint(tmp_path):
             for offset in range(30)
         ]
 
-    responses = [{"output2": rows(0)}]
+    responses = [{"output2": rows(0)}, {"output2": []}]
 
     def fake_get(path, tr_id, params):
         calls.append((path, tr_id, params))
@@ -144,11 +144,46 @@ def test_kr_intraday_uses_official_120_record_daily_minute_endpoint(tmp_path):
     client._get = fake_get  # type: ignore[method-assign]
     bars = client.intraday("036930", Market.KR)
 
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert calls[0][0].endswith("inquire-time-dailychartprice")
     assert calls[0][1] == "FHKST03010230"
     assert calls[0][2]["FID_PW_DATA_INCU_YN"] == "Y"
     assert len(bars) == 30
+
+
+def test_kr_intraday_collects_six_official_date_time_pages_for_higher_timeframe_warmup(tmp_path):
+    client = KISClient({"KIS_ACCESS_TOKEN": "daily-token"}, cache_dir=tmp_path)
+    pages = [
+        [("20260819", "090100"), ("20260819", "090000")],
+        [("20260818", "153000"), ("20260818", "152900")],
+        [("20260818", "152800"), ("20260818", "152700")],
+        [("20260818", "152600"), ("20260818", "152500")],
+        [("20260818", "152400"), ("20260818", "152300")],
+        [("20260818", "152200"), ("20260818", "152100")],
+    ]
+    calls = []
+
+    def fake_get(path, tr_id, params):
+        calls.append((path, tr_id, dict(params)))
+        values = pages.pop(0)
+        return {"output2": [
+            {
+                "stck_bsop_date": date, "stck_cntg_hour": clock,
+                "stck_oprc": "100", "stck_hgpr": "101", "stck_lwpr": "99",
+                "stck_prpr": "100", "cntg_vol": "1000",
+            }
+            for date, clock in values
+        ]}
+
+    client._get = fake_get  # type: ignore[method-assign]
+    bars = client.intraday("005930", Market.KR)
+
+    assert len(calls) == 6
+    assert len(bars) == 12
+    assert calls[1][2]["FID_INPUT_DATE_1"] == "20260819"
+    assert calls[1][2]["FID_INPUT_HOUR_1"] == "085900"
+    assert calls[2][2]["FID_INPUT_DATE_1"] == "20260818"
+    assert calls[2][2]["FID_INPUT_HOUR_1"] == "152800"
 
 
 def test_missing_live_price_is_an_error_not_a_fake_plan():

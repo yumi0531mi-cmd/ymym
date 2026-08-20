@@ -24,6 +24,7 @@ class KISError(RuntimeError):
 
 
 US_INTRADAY_HISTORY_PAGES = 6
+KR_INTRADAY_HISTORY_PAGES = 6
 
 
 def _secret_with_source(
@@ -503,6 +504,7 @@ class KISClient:
         symbol = symbol.strip().upper()
         now = datetime.now(tz=KST)
         if market == Market.KR:
+            path = "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice"
             params = {
                 "FID_COND_MRKT_DIV_CODE": "J",
                 "FID_INPUT_ISCD": symbol,
@@ -511,15 +513,40 @@ class KISClient:
                 "FID_PW_DATA_INCU_YN": "Y",
                 "FID_FAKE_TICK_INCU_YN": "",
             }
-            payload = self._get(
-                "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice",
-                "FHKST03010230",
-                params,
-            )
-            rows = list(payload.get("output2") or [])
-            # The official daily-minute endpoint returns up to 120 records in one
-            # call and can include prior data. This replaces the old 30+30 paging
-            # path that left the higher-timeframe analysis chronically starved.
+            rows: list[dict[str, Any]] = []
+            # The official domestic daily-minute endpoint returns at most 120 rows
+            # but accepts a prior date and time on every call.  Continue from the
+            # oldest returned completed minute to warm the 15/30-minute engines;
+            # this intentionally consumes one budgeted REST call per page.
+            for _page in range(KR_INTRADAY_HISTORY_PAGES):
+                try:
+                    payload = self._get(path, "FHKST03010230", params)
+                except KISError:
+                    if rows:
+                        break
+                    raise
+                page_rows = [row for row in list(payload.get("output2") or []) if isinstance(row, dict)]
+                rows.extend(page_rows)
+                if not page_rows:
+                    break
+                keys: list[datetime] = []
+                for row in page_rows:
+                    try:
+                        keys.append(datetime.strptime(
+                            f"{str(row.get('stck_bsop_date') or '')}{str(row.get('stck_cntg_hour') or '').zfill(6)[:6]}",
+                            "%Y%m%d%H%M%S",
+                        ))
+                    except ValueError:
+                        continue
+                if not keys:
+                    break
+                cursor = min(keys) - timedelta(minutes=1)
+                params = {
+                    **params,
+                    "FID_INPUT_DATE_1": cursor.strftime("%Y%m%d"),
+                    "FID_INPUT_HOUR_1": cursor.strftime("%H%M%S"),
+                    "FID_PW_DATA_INCU_YN": "Y",
+                }
             mapping = {
                 "date": "stck_bsop_date", "time": "stck_cntg_hour", "open": "stck_oprc", "high": "stck_hgpr",
                 "low": "stck_lwpr", "close": "stck_prpr", "volume": "cntg_vol",
