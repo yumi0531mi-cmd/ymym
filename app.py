@@ -1153,10 +1153,26 @@ def observation_rows(items: list[dict[str, Any]], display_limit: int = 10) -> li
             continue
         quote: Quote = item["quote"]
         plan = item["plan"]
+        levels = actionable_display_levels(plan, quote)
+        prices_ready = bool(item.get("chart_aligned", True)) and bool(levels.get("available"))
+        def level_text(key: str) -> str:
+            return price_text(float(levels[key])) if prices_ready and isinstance(levels.get(key), (int, float)) else "구조 재확인"
+
+        forecast_ranges = []
+        for minutes in (5, 15, 30):
+            point = forecast_point_for(plan, minutes)
+            if point is None:
+                forecast_ranges.append(f"{minutes}분 대기")
+            else:
+                forecast_ranges.append(f"{minutes}분 {price_text(point.low)}~{price_text(point.high)}")
         rows.append({
             "종목": f"{quote.symbol} · {item.get('name') or quote.market.value}",
+            "현재가": price_text(quote.price),
+            "매수가 / 1·2차 목표": f"{level_text('entry')} / {level_text('target1')} / {level_text('target2')}",
+            "Soft / Hard Stop": f"{level_text('support')} / {level_text('stop')}",
             "구조": regime_text(plan.regime),
             "5·15·30분": compact_directions(plan),
+            "예상 범위": " · ".join(forecast_ranges),
             "주요 사유": observation_reason(item),
         })
         if len(rows) >= max(1, int(display_limit)):
@@ -2049,6 +2065,10 @@ if observation_cards:
     st.caption("현재 진입 카드는 아니지만, 각 종목의 실제 차단 관문·계산값·요구 기준을 바로 확인합니다.")
     for card_item in observation_cards:
         render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "OBSERVATION", not capture_integrity)
+    observation_summary = observation_rows(observation_cards, display_limit=5)
+    if observation_summary:
+        st.caption("관찰 후보 가격·방향 교차 점검 · 카드와 같은 완료 차트 가격 구조만 표시하며, 구조가 확정되지 않은 가격은 추천가로 보이지 않게 처리합니다.")
+        st.dataframe(pd.DataFrame(observation_summary), hide_index=True, width="stretch")
 
 st.divider()
 st.caption("백그라운드 검증 상태 · 스캐너 카드 선정과 독립적으로 고정 예측의 실제 가격 경계만 수집합니다.")

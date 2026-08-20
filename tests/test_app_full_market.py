@@ -105,6 +105,26 @@ def test_cold_candidate_analysis_renders_prepared_cards_before_all_eight_complet
     assert candidate_loop < incremental_preview < final_preview_clear
 
 
+def test_observation_summary_rows_use_card_price_levels_and_forecast_ranges():
+    from app import observation_rows
+
+    plan = _plan()
+    plan.signal = Signal.WAIT
+    item = {
+        "quote": _quote(), "plan": plan, "name": "삼성전자", "chart_aligned": True,
+        "bars": _bars(), "fast_rank": 1,
+    }
+
+    rows = observation_rows([item], display_limit=5)
+
+    assert len(rows) == 1
+    assert rows[0]["현재가"] == "70,000"
+    assert rows[0]["매수가 / 1·2차 목표"] == "69,900 / 71,000 / 72,000"
+    assert rows[0]["Soft / Hard Stop"] == "69,600 / 69,400"
+    assert rows[0]["5·15·30분"] == "5분 + · 15분 + · 30분 +"
+    assert "5분 70,000~71,500" in rows[0]["예상 범위"]
+
+
 def _quote(*_args, **_kwargs) -> Quote:
     return Quote(
         symbol="005930", market=Market.KR, price=70000, previous_close=69000,
