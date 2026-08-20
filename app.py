@@ -1653,16 +1653,29 @@ def render_versioned_forecast_trace(store: ValidationStore, market_value: str, v
 
 
 def free_validation_batch_state(market: Market, candidates: list[dict[str, Any]]) -> dict[str, Any]:
-    """Create one browser-open, persistent-session batch from the market candidate pool."""
+    """Create one browser-open batch with an immutable candidate snapshot for that session."""
     key = f"free_validation_batch_{market.value}"
-    current_symbols = [str(item.get("symbol") or "").upper() for item in candidates[:FREE_VALIDATION_BATCH_SIZE]]
+    candidate_snapshot = [
+        {
+            "symbol": str(item.get("symbol") or "").upper(),
+            "exchange": str(item.get("exchange") or ("NAS" if market == Market.US else "")),
+        }
+        for item in candidates[:FREE_VALIDATION_BATCH_SIZE]
+        if str(item.get("symbol") or "").strip()
+    ]
     state = st.session_state.get(key)
-    if not isinstance(state, dict) or state.get("symbols") != current_symbols:
+    if not isinstance(state, dict):
         state = {
             "batch_id": f"free-{market.value.lower()}-{datetime.now().astimezone().strftime('%Y%m%dT%H%M%S')}",
-            "symbols": current_symbols,
+            "symbols": [item["symbol"] for item in candidate_snapshot],
+            "candidates": candidate_snapshot,
             "next_index": 0,
         }
+        st.session_state[key] = state
+    elif not isinstance(state.get("candidates"), list):
+        # Preserve a legacy in-progress batch id and index across a code reload.
+        state["candidates"] = candidate_snapshot
+        state.setdefault("symbols", [item["symbol"] for item in candidate_snapshot])
         st.session_state[key] = state
     return state
 
@@ -1675,7 +1688,7 @@ def run_free_validation_batch(
     """Start a small new cohort each minute while the free Streamlit screen stays open."""
     market = Market(market_value)
     state = free_validation_batch_state(market, candidates)
-    batch_candidates = candidates[:FREE_VALIDATION_BATCH_SIZE]
+    batch_candidates = list(state.get("candidates") or [])
     start = int(state.get("next_index", 0))
     active_cases = store.pending_forecast_audits(market.value, version=APP_VERSION, limit=100)
     if len(active_cases) >= BACKGROUND_VALIDATION_MAX_PENDING:

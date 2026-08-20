@@ -91,6 +91,28 @@ def test_background_validation_rendering_follows_observation_cards_in_normal_sca
     assert observation_cards < validation_status
 
 
+def test_validation_batch_keeps_its_initial_candidate_snapshot_when_rankings_refresh():
+    from app import free_validation_batch_state
+
+    initial = [
+        {"symbol": "FIRST", "exchange": "NAS"},
+        {"symbol": "SECOND", "exchange": "NYS"},
+    ]
+    refreshed = [
+        {"symbol": "NEWTOP", "exchange": "NAS"},
+        {"symbol": "FIRST", "exchange": "NAS"},
+    ]
+
+    with patch("app.st.session_state", {}):
+        started = free_validation_batch_state(Market.US, initial)
+        started["next_index"] = 1
+        continued = free_validation_batch_state(Market.US, refreshed)
+
+    assert continued["batch_id"] == started["batch_id"]
+    assert continued["next_index"] == 1
+    assert continued["candidates"] == initial
+
+
 def test_live_card_snapshot_uses_one_page_refresh_when_realtime_tick_is_missing():
     from app import live_card_snapshot
 
