@@ -135,6 +135,18 @@ def test_observation_price_summary_precedes_individual_observation_cards():
     assert section < summary < card_loop < background
 
 
+def test_observation_reason_rows_keep_data_and_strategy_gates_as_recorded():
+    from app import observation_reason_rows
+
+    rows = observation_reason_rows({"reasons": {"RR_FAIL": 2, "MINUTE_DATA_WAIT": 1, "PRICE_LEVEL_WAIT": 1}})
+
+    assert rows == [
+        {"주요 탈락 관문": "RR_FAIL", "종목 수": 2},
+        {"주요 탈락 관문": "MINUTE_DATA_WAIT", "종목 수": 1},
+        {"주요 탈락 관문": "PRICE_LEVEL_WAIT", "종목 수": 1},
+    ]
+
+
 def _quote(*_args, **_kwargs) -> Quote:
     return Quote(
         symbol="005930", market=Market.KR, price=70000, previous_close=69000,

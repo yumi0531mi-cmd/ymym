@@ -1145,6 +1145,15 @@ def candidate_stage_summary(items: list[dict[str, Any]], candidate_pool: int) ->
     }
 
 
+def observation_reason_rows(stage_summary: dict[str, Any], display_limit: int = 5) -> list[dict[str, int | str]]:
+    """Return the actual observation-gate count without mixing data readiness with strategy failure."""
+    reasons = stage_summary.get("reasons") or {}
+    return [
+        {"주요 탈락 관문": str(reason), "종목 수": int(count)}
+        for reason, count in sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[:max(1, int(display_limit))]
+    ]
+
+
 def observation_rows(items: list[dict[str, Any]], display_limit: int = 10) -> list[dict[str, str]]:
     """Return compact, data-backed observation rows for candidates not ready to trade."""
     rows: list[dict[str, str]] = []
@@ -2053,6 +2062,10 @@ if candidates:
         f"정밀 분석 {stage_summary['funnel']['정밀 분석']}종목 · 1차 목표 가능 {stage_summary['funnel']['1차 목표 가능']}종목 · "
         f"현재 1회 진입 {stage_summary['stages']['FINAL_BUY']}종목"
     )
+    stage_reason_rows = observation_reason_rows(stage_summary)
+    if stage_reason_rows:
+        st.caption("정밀 분석 탈락 관문 집계 · 데이터 준비 부족과 전략 관문을 같은 실패로 섞지 않습니다.")
+        st.dataframe(pd.DataFrame(stage_reason_rows), hide_index=True, width="stretch")
 
 if entry_wait_cards:
     st.subheader(f"1차 익절 가능 · 현재 진입 대기 {len(entry_wait_cards)}종목")
@@ -2082,10 +2095,7 @@ with st.expander("검증·관찰 상세", expanded=False):
     if stage_summary["funnel"]:
         funnel = " → ".join(f"{label} {count}" for label, count in stage_summary["funnel"].items())
         st.caption(f"단계 통과 현황 · {funnel}")
-        reason_rows = [
-            {"주요 탈락 이유": reason, "종목 수": count}
-            for reason, count in sorted(stage_summary["reasons"].items(), key=lambda item: (-item[1], item[0]))[:5]
-        ]
+        reason_rows = observation_reason_rows(stage_summary)
         if reason_rows:
             st.subheader(f"관찰 후보 · {stage_summary['stages']['OBSERVATION']}종목")
             st.dataframe(pd.DataFrame(reason_rows), hide_index=True, width="stretch")
