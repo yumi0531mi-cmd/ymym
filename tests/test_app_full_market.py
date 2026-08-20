@@ -118,6 +118,17 @@ def test_capture_integrity_status_counts_keep_complete_pending_and_missing_separ
     }
 
 
+def test_capture_integrity_renders_pending_and_missing_rows_before_card_sections():
+    source = APP_PATH.read_text(encoding="utf-8")
+
+    integrity_counts = source.index("integrity_counts = capture_integrity_status_counts")
+    integrity_pending = source.index("render_pending_forecast_progress(store, market.value)", integrity_counts)
+    integrity_missing = source.index("render_data_missing_forecast_cases(store, market.value)", integrity_pending)
+    card_sections = source.index("if cards:", integrity_missing)
+
+    assert integrity_counts < integrity_pending < integrity_missing < card_sections
+
+
 def test_validation_batch_keeps_its_initial_candidate_snapshot_when_rankings_refresh():
     from app import free_validation_batch_state
 

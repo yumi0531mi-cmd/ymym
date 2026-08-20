@@ -200,3 +200,4 @@
 - [x] capture_integrity 수집 안정성 URL에서 카드 정밀 분석·현재가 갱신을 중지해 경계 수집 호출 여유를 유지하는지 회귀 검증
 - [x] capture_integrity 수집 안정성 화면에 같은 버전의 COMPLETE·PENDING·DATA_MISSING 누적을 표시해 10건 수집 판정을 검증
 - [x] 이전 DATA_MISSING과 새 수집 안정성 보정 표본을 별도 버전 코호트로 분리해 완료·누락을 혼합하지 않고 재확인
+- [x] capture_integrity 수집 안정성 화면에서 PENDING·DATA_MISSING 원인을 상단에 직접 표시해 실패 표본의 최초 원인을 즉시 확인

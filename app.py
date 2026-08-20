@@ -2164,6 +2164,8 @@ if capture_integrity and not audit_only:
         f"수집 안정성 누적 · 시작 {integrity_counts['started']}건 · COMPLETE {integrity_counts['complete']}건 · "
         f"PENDING {integrity_counts['pending']}건 · DATA_MISSING {integrity_counts['data_missing']}건"
     )
+    render_pending_forecast_progress(store, market.value)
+    render_data_missing_forecast_cases(store, market.value)
 
 if audit_only:
     render_versioned_forecast_trace(store, market.value, audit_version)
@@ -2229,12 +2231,13 @@ if observation_cards:
     for card_item in observation_cards:
         render_live_card(card_item, float(cost_pct), int(min_score), store, refresh_seconds, "OBSERVATION", not capture_integrity)
 
-st.divider()
-st.caption("백그라운드 검증 상태 · 스캐너 카드 선정과 독립적으로 고정 예측의 실제 가격 경계만 수집합니다.")
-render_pending_forecast_progress(store, market.value)
-render_data_missing_forecast_cases(store, market.value)
-render_versioned_forecast_summary(store, market.value)
-render_versioned_failure_breakdown(store, market.value)
+if not capture_integrity:
+    st.divider()
+    st.caption("백그라운드 검증 상태 · 스캐너 카드 선정과 독립적으로 고정 예측의 실제 가격 경계만 수집합니다.")
+    render_pending_forecast_progress(store, market.value)
+    render_data_missing_forecast_cases(store, market.value)
+    render_versioned_forecast_summary(store, market.value)
+    render_versioned_failure_breakdown(store, market.value)
 
 with st.expander("검증·관찰 상세", expanded=False):
     render_latest_forecast_result(store)
