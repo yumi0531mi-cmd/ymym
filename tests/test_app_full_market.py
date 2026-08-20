@@ -160,6 +160,25 @@ def test_candidate_stage_summary_uses_card_diagnostic_gate_code_for_observations
     assert summary["reasons"] == {"MINUTE_DATA_WAIT · KIS 완료 1분봉·방향 경로 재수신 대기": 1}
 
 
+def test_price_level_wait_exposes_raw_ordering_and_entry_location_without_recommending_invalid_levels():
+    from app import observation_diagnostic, observation_rows
+
+    plan = _plan()
+    plan.signal = Signal.WAIT
+    plan.diagnostics["long_price_path_confirmed"] = False
+    item = {"quote": _quote(), "plan": plan, "name": "삼성전자", "chart_aligned": True, "bars": _bars()}
+
+    diagnostic = observation_diagnostic(item)
+    rows = observation_rows([item])
+
+    assert diagnostic["stage"] == "PRICE_LEVEL_WAIT"
+    assert "상방 경로 미확인" in diagnostic["actual"]
+    assert "Hard 69,400 < Soft 69,600 < 진입 69,900 < 1차 71,000 < 2차 72,000" in diagnostic["actual"]
+    assert diagnostic["required"] == "상방 경로 확인 · Hard < Soft < 진입 < 1차 < 2차 · 진입은 현재가 +0.2% 이내"
+    assert "상방 경로 미확인" in rows[0]["관문 실제값 / 요구"]
+    assert rows[0]["매수가 / 1·2차 목표"] == "구조 재확인 / 구조 재확인 / 구조 재확인"
+
+
 def _quote(*_args, **_kwargs) -> Quote:
     return Quote(
         symbol="005930", market=Market.KR, price=70000, previous_close=69000,

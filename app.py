@@ -1064,6 +1064,32 @@ def observation_reason(item: dict[str, Any]) -> str:
     return "재진입 구간 대기"
 
 
+def price_level_gate_diagnostic(plan: Any, quote: Quote) -> tuple[str, str]:
+    """Describe the exact structural price gate without exposing an invalid level as a recommendation."""
+    def valid(value: Any) -> float | None:
+        return float(value) if isinstance(value, (int, float)) and float(value) > 0 else None
+
+    hard = valid(plan.hard_stop or plan.stop or plan.invalidation)
+    soft = valid(plan.soft_stop)
+    entry = valid(plan.entry)
+    target1 = valid(plan.target)
+    target2 = valid(plan.target2)
+    values = (hard, soft, entry, target1, target2)
+    ordering_ready = all(value is not None for value in values)
+    ordering_ok = bool(ordering_ready and hard < soft < entry < target1 < target2)
+    path_ok = bool(plan.diagnostics.get("long_price_path_confirmed"))
+    entry_ok = bool(entry is not None and quote.price > 0 and entry <= quote.price * 1.002)
+    actual = (
+        f"상방 경로 {'확인' if path_ok else '미확인'} · "
+        f"Hard {price_text(hard)} < Soft {price_text(soft)} < 진입 {price_text(entry)} < "
+        f"1차 {price_text(target1)} < 2차 {price_text(target2)} · "
+        f"순서 {'정상' if ordering_ok else '불일치'} · "
+        f"진입 위치 {'적합' if entry_ok else '현재가 대비 재확인'}"
+    )
+    required = "상방 경로 확인 · Hard < Soft < 진입 < 1차 < 2차 · 진입은 현재가 +0.2% 이내"
+    return actual, required
+
+
 def observation_diagnostic(item: dict[str, Any]) -> dict[str, str]:
     """Expose the first blocking gate with observed values; never treat data wait as score zero."""
     quote = item.get("quote")
@@ -1085,7 +1111,8 @@ def observation_diagnostic(item: dict[str, Any]) -> dict[str, str]:
     if bool(diagnostics.get("has_downward_forecast")):
         return {"stage": "STRUCTURE_DOWN", "reason": "15·30분 구조 하방", "actual": compact_directions(plan), "required": "TREND는 15·30분 상승, RANGE는 상승·박스"}
     if not bool(levels.get("available")):
-        return {"stage": "PRICE_LEVEL_WAIT", "reason": "구조 가격대 재확인", "actual": "매수가·1차 목표·손절 중 일부 미확인", "required": "손절 < 매수가 < 1차 목표"}
+        actual, required = price_level_gate_diagnostic(plan, quote)
+        return {"stage": "PRICE_LEVEL_WAIT", "reason": "구조 가격대 재확인", "actual": actual, "required": required}
     try:
         rr = float(diagnostics.get("reward_risk_net"))
         if rr < MIN_NET_REWARD_RISK:
@@ -1163,6 +1190,7 @@ def observation_rows(items: list[dict[str, Any]], display_limit: int = 10) -> li
             continue
         quote: Quote = item["quote"]
         plan = item["plan"]
+        diagnostic = observation_diagnostic(item)
         levels = actionable_display_levels(plan, quote)
         prices_ready = bool(item.get("chart_aligned", True)) and bool(levels.get("available"))
         def level_text(key: str) -> str:
@@ -1183,6 +1211,7 @@ def observation_rows(items: list[dict[str, Any]], display_limit: int = 10) -> li
             "구조": regime_text(plan.regime),
             "5·15·30분": compact_directions(plan),
             "예상 범위": " · ".join(forecast_ranges),
+            "관문 실제값 / 요구": f"{diagnostic['actual']} / {diagnostic['required']}",
             "주요 사유": observation_reason(item),
         })
         if len(rows) >= max(1, int(display_limit)):
