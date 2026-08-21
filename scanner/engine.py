@@ -265,7 +265,7 @@ def analyze(
     entry, entry_basis = chart_entry_level(df, quote.price, regime, box)
     entry = entry or quote.price
     target1, target2, support, target1_basis, target2_basis, support_basis = trade_levels(df, entry, box)
-    raw_forecast_points = forecast_path(completed, regime, reference_price=quote.price)
+    raw_forecast_points = forecast_path(completed, reference_price=quote.price)
     if regime == Regime.RANGE:
         raw_forecast_points = constrain_unconfirmed_range_thirty_minute_upside(raw_forecast_points, latest, quote.price)
     forecast_engine_diagnostics = dict(getattr(raw_forecast_points, "diagnostics", {}))

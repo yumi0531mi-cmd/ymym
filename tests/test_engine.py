@@ -66,7 +66,7 @@ def test_engine_excludes_live_final_minute_from_structure_box_and_forecast_input
         captured["box"] = value
         return None
 
-    def capture_forecast(value, _regime, reference_price=None):
+    def capture_forecast(value, reference_price=None):
         captured["forecast"] = value
         return ForecastPath(points, diagnostics)
 
@@ -184,7 +184,7 @@ def test_range_bottom_rebound_does_not_keep_thirty_minute_up_without_continuatio
 
     assert constrained[0].direction == Regime.UP
     assert constrained[1].direction == Regime.UP
-    assert constrained[2].direction == Regime.UP
+    assert constrained[2].direction == Regime.RANGE
     assert constrained[2].base == 100.0
     assert "지속 증거 미확인" in constrained[2].basis
 
@@ -484,7 +484,7 @@ def test_indicator_enrichment_adds_role_separated_direction_inputs():
 
 
 def test_forecast_path_keeps_horizon_specific_direction_engine_details():
-    forecast = forecast_path(bars(960, slope=.08), Regime.UP, reference_price=108.0)
+    forecast = forecast_path(bars(960, slope=.08), reference_price=108.0)
 
     assert [point.minutes for point in forecast] == [5, 15, 30]
     assert getattr(forecast, "diagnostics")["market_state"] in {"TREND", "BREAKOUT", "TRANSITION", "RANGE"}
@@ -498,7 +498,7 @@ def test_forecast_path_keeps_horizon_specific_direction_engine_details():
 
 
 def test_forecast_path_refuses_underwarmed_higher_timeframe_directions():
-    forecast = forecast_path(bars(120, slope=.08), Regime.UP, reference_price=108.0)
+    forecast = forecast_path(bars(120, slope=.08), reference_price=108.0)
 
     assert [point.minutes for point in forecast] == [5]
     engines = getattr(forecast, "diagnostics")["direction_engines"]
@@ -511,7 +511,7 @@ def test_forecast_path_refuses_underwarmed_higher_timeframe_directions():
 
 
 def test_forecast_path_requires_warmed_twenty_period_flow_history_for_fifteen_and_thirty_minutes():
-    forecast = forecast_path(bars(360, slope=.08), Regime.UP, reference_price=108.0)
+    forecast = forecast_path(bars(360, slope=.08), reference_price=108.0)
 
     assert [point.minutes for point in forecast] == [5]
     engines = getattr(forecast, "diagnostics")["direction_engines"]

@@ -19,6 +19,20 @@ class Regime(str, Enum):
     UNKNOWN = "미확인"
 
 
+DIRECTION_DEADBAND_FRACTION = 0.0005
+
+
+def direction_from_prices(reference_price: float, projected_price: float) -> Regime:
+    """Classify a projected move with the same neutral band used by audit scoring."""
+    if reference_price <= 0 or projected_price <= 0:
+        return Regime.RANGE
+    if projected_price > reference_price * (1.0 + DIRECTION_DEADBAND_FRACTION):
+        return Regime.UP
+    if projected_price < reference_price * (1.0 - DIRECTION_DEADBAND_FRACTION):
+        return Regime.DOWN
+    return Regime.RANGE
+
+
 class Signal(str, Enum):
     BUY = "진입 고려"
     WAIT = "대기"

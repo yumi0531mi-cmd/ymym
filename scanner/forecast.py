@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from .indicators import enrich, resample_completed
-from .models import ForecastPoint, Regime
+from .models import ForecastPoint, Regime, direction_from_prices
 
 
 def _bound(value: float, low: float, high: float) -> float:
@@ -17,6 +17,16 @@ class ForecastPath(list[ForecastPoint]):
     def __init__(self, points: list[ForecastPoint], diagnostics: dict[str, object]):
         super().__init__(points)
         self.diagnostics = diagnostics
+
+
+def _finalize_direction(point: ForecastPoint, reference_price: float, basis_suffix: str = "") -> ForecastPoint:
+    """Publish a price-consistent direction after any structural or risk adjustment."""
+    direction = direction_from_prices(reference_price, float(point.base))
+    suffix = f" · {basis_suffix}" if basis_suffix else ""
+    return ForecastPoint(
+        point.minutes, point.low, point.base, point.high, direction,
+        f"{point.basis}{suffix}", point.direction_confidence_pct, point.structure_level,
+    )
 
 
 HORIZON_WEIGHTS: dict[int, dict[str, dict[str, float]]] = {
@@ -107,7 +117,7 @@ def _direction_basis(latest: pd.Series, regime: Regime, flow_score: float) -> st
     return f"완료봉 박스·전환 구조 · {flow}"
 
 
-def _common_range_context(recent: pd.DataFrame, price: float) -> dict[str, object]:
+def _common_range_context(recent: pd.DataFrame) -> dict[str, object]:
     """Compute the shared chart inputs once before horizon-specific weighting.
 
     The 5·15·30-minute engines use different weights, but must start from one
@@ -129,7 +139,6 @@ def _common_range_context(recent: pd.DataFrame, price: float) -> dict[str, objec
     notional_component = _bound(float(latest.notional_rvol) - 1.0, -1.0, 1.5) if flow_ready else 0.0
     return {
         "latest": latest,
-        "price": price,
         "atr_fraction": atr_fraction,
         "realized_sigma": realized_sigma,
         "flow_score": (rvol_component + notional_component) / 2.0,
@@ -189,10 +198,10 @@ def cap_upside_forecast_path(
         base = min(float(point.base), horizon_cap)
         high = min(max(base, float(point.high)), ceiling)
         low = min(float(point.low), base)
-        result.append(ForecastPoint(
+        result.append(_finalize_direction(ForecastPoint(
             point.minutes, max(0.0, low), base, high, point.direction, f"{point.basis} · {label}",
             point.direction_confidence_pct, ceiling,
-        ))
+        ), reference_price, "구조 상한 반영"))
     return result
 
 
@@ -217,10 +226,10 @@ def cap_downside_forecast_path(
         base = max(float(point.base), horizon_floor)
         low = max(min(base, float(point.low)), float(primary_support))
         high = max(float(point.high), base)
-        result.append(ForecastPoint(
+        result.append(_finalize_direction(ForecastPoint(
             point.minutes, low, base, high, point.direction, f"{point.basis} · 기본 구조 지지 하한",
             point.direction_confidence_pct, float(primary_support),
-        ))
+        ), reference_price, "구조 하한 반영"))
     return result
 
 
@@ -245,7 +254,7 @@ def constrain_unconfirmed_range_thirty_minute_upside(
             result.append(point)
             continue
         band = max(abs(float(point.high) - float(point.low)) / 2.0, reference_price * 0.0005)
-        result.append(ForecastPoint(
+        result.append(_finalize_direction(ForecastPoint(
             point.minutes,
             max(0.0, reference_price - band),
             reference_price,
@@ -254,7 +263,7 @@ def constrain_unconfirmed_range_thirty_minute_upside(
             f"{point.basis} · 30분 지속 증거 미확인 · 가격 경로만 중립화",
             point.direction_confidence_pct,
             point.structure_level,
-        ))
+        ), reference_price, "중립 경로 반영"))
     return result
 
 
@@ -276,7 +285,7 @@ def apply_risk_persistence_to_forecast(
         return points
     if risk_state in {"REAL_BREAKDOWN", "HARD_EXIT"}:
         return [
-            ForecastPoint(
+            _finalize_direction(ForecastPoint(
                 point.minutes,
                 max(0.0, min(point.low, reference_price * 0.985)),
                 min(point.base, reference_price * (0.996 if point.minutes == 5 else 0.990)),
@@ -285,7 +294,7 @@ def apply_risk_persistence_to_forecast(
                 f"{point.basis} · {risk_state} 방향 무효화",
                 point.direction_confidence_pct,
                 point.structure_level,
-            )
+            ), reference_price, "위험 무효화 반영")
             for point in points
         ]
 
@@ -300,21 +309,22 @@ def apply_risk_persistence_to_forecast(
         base = reference_price + (float(point.base) - reference_price) * damping
         high = reference_price + (float(point.high) - reference_price) * damping
         low = reference_price + (float(point.low) - reference_price) * damping
-        direction = point.direction
         if risk_state == "SHAKEOUT" and point.minutes == 5:
-            direction = Regime.RANGE
-        elif point.minutes == 5 and abs(base / reference_price - 1.0) < 0.0005:
-            direction = Regime.RANGE
-        result.append(ForecastPoint(
-            point.minutes, max(0.0, low), base, max(base, high), direction,
+            neutral_band = max(abs(high - low) / 2.0, reference_price * 0.0005)
+            low, base, high = (
+                max(0.0, reference_price - neutral_band),
+                reference_price,
+                reference_price + neutral_band,
+            )
+        result.append(_finalize_direction(ForecastPoint(
+            point.minutes, max(0.0, low), base, max(base, high), point.direction,
             f"{point.basis} · {risk_state}·지속성 보정", point.direction_confidence_pct, point.structure_level,
-        ))
+        ), reference_price, "위험·지속성 반영"))
     return result
 
 
 def forecast_path(
     frame: pd.DataFrame,
-    regime: Regime,
     reference_price: float | None = None,
 ) -> list[ForecastPoint]:
     """Return horizon-specific direction scenarios from completed-chart conditions.
@@ -323,8 +333,7 @@ def forecast_path(
     turning one short-lived minute-bar drift into a mechanically compounded 30-minute
     target. The result remains a scenario, not a promise.
     """
-    df = enrich(frame)
-    if len(df) < 30:
+    if len(frame) < 30:
         return []
     price = float(reference_price or df.close.iloc[-1])
     result: list[ForecastPoint] = []
@@ -342,7 +351,7 @@ def forecast_path(
             continue
         recent = enrich(completed).tail(min(30, len(completed)))
         latest = recent.iloc[-1]
-        context = _common_range_context(recent, price)
+        context = _common_range_context(recent)
         atr_fraction = float(context["atr_fraction"])
         sigma = float(context["realized_sigma"])
         flow_score = float(context["flow_score"])
@@ -357,11 +366,12 @@ def forecast_path(
         expected_move = score * max(sigma, atr_fraction * 0.55) * horizon_scale[horizon]
         band = price * max(sigma * np.sqrt(horizon) * 0.72, atr_fraction * np.sqrt(horizon) * 0.42)
         base = price * (1 + expected_move)
-        direction = Regime.UP if score >= 0.16 else Regime.DOWN if score <= -0.16 else Regime.RANGE
+        score_direction = Regime.UP if score >= 0.16 else Regime.DOWN if score <= -0.16 else Regime.RANGE
+        direction = direction_from_prices(price, base)
         confidence = _bound(50.0 + abs(score) * 27.0 + max(flow_score, 0.0) * 6.0, 50.0, 82.0)
         result.append(ForecastPoint(
             horizon, max(0, base - band), base, base + band, direction,
-            f"{horizon}분 {state} Direction Engine · {basis}", round(confidence, 1), None,
+            f"{horizon}분 {state} Direction Engine · {basis} · 원점수 {score_direction.value}", round(confidence, 1), None,
         ))
         diagnostics["direction_engines"][str(horizon)] = {
             "state": state,
@@ -372,6 +382,8 @@ def forecast_path(
             "last_completed_timeframe_bar_at": str(completed.index[-1]),
             "input_ready": True,
             "score": round(float(score), 4),
+            "raw_score_direction": score_direction.value,
+            "published_direction": direction.value,
             "weights": weights,
             "components": {key: round(float(value), 4) for key, value in components.items()},
             "expected_move_pct": round(float(expected_move) * 100, 4),

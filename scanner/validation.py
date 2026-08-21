@@ -10,7 +10,7 @@ from typing import Any
 
 import pandas as pd
 
-from .models import Regime, TradePlan
+from .models import Regime, TradePlan, direction_from_prices
 from .persistence import EventStore, PersistenceError
 
 
@@ -188,11 +188,7 @@ class ValidationCase:
                 continue
             horizon.range_pass = horizon.predicted_low <= actual <= horizon.predicted_high
             horizon.price_error_pct = (actual / horizon.predicted_base - 1.0) * 100 if horizon.predicted_base > 0 else None
-            actual_direction = (
-                Regime.UP.value if actual > origin * 1.0005
-                else Regime.DOWN.value if actual < origin * 0.9995
-                else Regime.RANGE.value
-            )
+            actual_direction = direction_from_prices(origin, actual).value
             horizon.direction_pass = actual_direction == horizon.predicted_direction
             horizon.pass_all = bool(horizon.range_pass and horizon.direction_pass)
             horizon.representative_reached = (
@@ -254,11 +250,7 @@ class ValidationCase:
         if len(actual_prices) != len(self.horizons):
             return False
         final_price = actual_prices[max(actual_prices)]
-        actual_regime = (
-            Regime.UP if final_price > self.quote_price * 1.0005
-            else Regime.DOWN if final_price < self.quote_price * 0.9995
-            else Regime.RANGE
-        )
+        actual_regime = direction_from_prices(self.quote_price, final_price)
         self.score_path(actual_prices, actual_regime)
         return self.data_completeness == "COMPLETE"
 
@@ -843,13 +835,6 @@ class ValidationStore:
             and (market is None or row.get("market") == market)
         ]
 
-        def actual_direction(origin: float, actual: float) -> str:
-            if actual > origin * 1.0005:
-                return Regime.UP.value
-            if actual < origin * 0.9995:
-                return Regime.DOWN.value
-            return Regime.RANGE.value
-
         counts: dict[tuple[int, str, str], int] = {}
         for row in rows:
             try:
@@ -865,7 +850,7 @@ class ValidationStore:
                 except (TypeError, ValueError):
                     continue
                 predicted = str(point.get("predicted_direction") or "미기록")
-                key = (minutes, predicted, actual_direction(origin, actual))
+                key = (minutes, predicted, direction_from_prices(origin, actual).value)
                 counts[key] = counts.get(key, 0) + 1
         return [
             {
@@ -930,13 +915,6 @@ class ValidationStore:
             and (market is None or row.get("market") == market)
         ]
 
-        def actual_direction(origin: float, actual: float) -> str:
-            if actual > origin * 1.0005:
-                return Regime.UP.value
-            if actual < origin * 0.9995:
-                return Regime.DOWN.value
-            return Regime.RANGE.value
-
         buckets: dict[tuple[int, str, str, str], list[dict[str, Any]]] = {}
         for row in rows:
             snapshot = row.get("analysis_snapshot") or {}
@@ -957,7 +935,7 @@ class ValidationStore:
                 if not isinstance(engine, dict) or engine.get("input_ready") is not True:
                     continue
                 predicted = str(point.get("predicted_direction") or "미기록")
-                realised = actual_direction(origin, actual)
+                realised = direction_from_prices(origin, actual).value
                 state = str(engine.get("state") or "미기록")
                 buckets.setdefault((minutes, state, predicted, realised), []).append(engine)
 
@@ -997,13 +975,6 @@ class ValidationStore:
             and (market is None or row.get("market") == market)
         ]
 
-        def actual_direction(origin: float, actual: float) -> str:
-            if actual > origin * 1.0005:
-                return Regime.UP.value
-            if actual < origin * 0.9995:
-                return Regime.DOWN.value
-            return Regime.RANGE.value
-
         buckets: dict[tuple[int, str, str, str, str], list[dict[str, Any]]] = {}
         for row in rows:
             snapshot = row.get("analysis_snapshot") or {}
@@ -1028,7 +999,7 @@ class ValidationStore:
                 raw_direction = Regime.UP.value if score >= 0.16 else Regime.DOWN.value if score <= -0.16 else Regime.RANGE.value
                 final_direction = str(point.get("predicted_direction") or "미기록")
                 risk = str(invalidation.get("risk_state") or "미기록")
-                realised = actual_direction(origin, actual)
+                realised = direction_from_prices(origin, actual).value
                 buckets.setdefault((minutes, raw_direction, final_direction, risk, realised), []).append({
                     "score": score,
                     "fatigue": invalidation.get("pattern_fatigue"),
@@ -1065,13 +1036,6 @@ class ValidationStore:
             and (market is None or row.get("market") == market)
         ]
 
-        def actual_direction(origin: float, actual: float) -> str:
-            if actual > origin * 1.0005:
-                return Regime.UP.value
-            if actual < origin * 0.9995:
-                return Regime.DOWN.value
-            return Regime.RANGE.value
-
         stats: dict[int, dict[str, int]] = {minutes: {"total": 0, "raw": 0, "final": 0, "changed": 0, "improved": 0, "worsened": 0} for minutes in (5, 15, 30)}
         for row in rows:
             snapshot = row.get("analysis_snapshot") or {}
@@ -1096,7 +1060,7 @@ class ValidationStore:
                 score = float(engine["score"])
                 raw = Regime.UP.value if score >= 0.16 else Regime.DOWN.value if score <= -0.16 else Regime.RANGE.value
                 final = str(point.get("predicted_direction") or "미기록")
-                realised = actual_direction(origin, actual)
+                realised = direction_from_prices(origin, actual).value
                 item = stats[minutes]
                 item["total"] += 1
                 raw_pass = raw == realised
