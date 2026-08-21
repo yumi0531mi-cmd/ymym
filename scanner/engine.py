@@ -280,6 +280,20 @@ def analyze(
     displayed_stop = float(raw_hard_stop) if raw_hard_stop is not None and 0 < float(raw_hard_stop) < entry else fallback_stop
     soft_stop = float(risk.soft_stop) if risk.soft_stop is not None and 0 < float(risk.soft_stop) < entry else displayed_stop
     stop_basis = f"{support_basis} 기반 Hard Stop" if raw_hard_stop is not None and 0 < float(raw_hard_stop) < entry else "완료봉 ATR 기반 구조 손절"
+    reference_levels_valid = bool(
+        target1 is not None and target2 is not None and support is not None
+        and 0 < displayed_stop < entry < float(target1) < float(target2)
+        and displayed_stop < float(support) < entry
+    )
+    reference_levels = {
+        "available": reference_levels_valid,
+        "entry": float(entry),
+        "target1": float(target1) if target1 is not None else None,
+        "target2": float(target2) if target2 is not None else None,
+        "support": float(support) if support is not None else None,
+        "stop": float(displayed_stop),
+        "basis": "완료 차트의 지지·저항 구조 참고값 · 5·15·30분 경로 완성 전 신규 진입 판단 금지",
+    }
     spread = quote.spread_pct
     max_spread = _max_spread(quote)
     spread_ok = spread is not None and spread <= max_spread
@@ -543,6 +557,7 @@ def analyze(
         "breakout_extension_confirmed": breakout_extension_confirmed,
         "reward_risk_net": reward_risk,
         "price_structure_valid": structure_ok,
+        "reference_levels": reference_levels,
         "long_price_path_confirmed": long_price_path_confirmed,
         "has_downward_forecast": has_downward_forecast,
         "forecast_path_ready": forecast_path_ready,

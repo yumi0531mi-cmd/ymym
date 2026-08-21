@@ -374,6 +374,49 @@ def test_actionable_levels_hide_card_prices_without_completed_chart_stop_structu
     assert "완료 차트" in str(levels["basis"])
 
 
+def test_missing_horizon_shows_completed_bar_reason_and_next_calculation_boundary():
+    from app import forecast_readiness_text, forecast_wait_text
+
+    plan = _plan()
+    plan.forecasts = plan.forecasts[:2]
+    plan.diagnostics.update({
+        "forecast_path_ready": False,
+        "direction_engines": {
+            "30": {
+                "input_ready": False,
+                "completed_timeframe_bars": 19,
+                "minimum_completed_timeframe_bars": 20,
+            },
+        },
+    })
+
+    assert "19/20" in forecast_wait_text(plan, 30)
+    assert "다음 30분봉 마감" in forecast_readiness_text(plan)
+
+
+def test_reference_levels_stay_non_actionable_while_forecast_path_is_incomplete():
+    from app import actionable_display_levels, reference_display_levels
+
+    plan = _plan()
+    plan.diagnostics.update({
+        "long_price_path_confirmed": False,
+        "forecast_path_ready": False,
+        "reference_levels": {
+            "available": True,
+            "entry": 69900,
+            "target1": 71000,
+            "target2": 72000,
+            "support": 69600,
+            "stop": 69400,
+        },
+    })
+
+    assert actionable_display_levels(plan, _quote())["available"] is False
+    reference = reference_display_levels(plan)
+    assert reference["available"] is True
+    assert reference["entry"] == 69900
+
+
 def test_default_market_uses_active_us_session_after_korean_close():
     from app import default_market_label
 

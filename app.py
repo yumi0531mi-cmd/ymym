@@ -589,6 +589,26 @@ def forecast_direction_text(point: Any | None) -> str:
     return mapping.get(point.direction, "방향 확인 중")
 
 
+def forecast_wait_text(plan: Any, minutes: int) -> str:
+    """Explain a missing horizon from completed-bar readiness instead of a vague spinner."""
+    engines = plan.diagnostics.get("direction_engines") or {}
+    detail = engines.get(str(minutes)) or engines.get(minutes) or {}
+    completed = detail.get("completed_timeframe_bars")
+    required = detail.get("minimum_completed_timeframe_bars")
+    if isinstance(completed, (int, float)) and isinstance(required, (int, float)) and completed < required:
+        return f"완료 {minutes}분봉 {int(completed)}/{int(required)}개 · 다음 {minutes}분봉 마감 뒤 자동 계산"
+    if detail.get("input_ready") is False:
+        return f"{minutes}분 완료봉 경로 수신 대기 · 다음 완료 1분봉 반영 때 재계산"
+    return f"{minutes}분 구조 조건 확인 중 · 다음 완료 1분봉 반영 때 재계산"
+
+
+def forecast_readiness_text(plan: Any) -> str:
+    missing = [minutes for minutes in (5, 15, 30) if forecast_point_for(plan, minutes) is None]
+    if not missing:
+        return "5·15·30분 경로 계산 완료"
+    return " / ".join(forecast_wait_text(plan, minutes) for minutes in missing)
+
+
 def forecast_range_text(point: Any | None) -> str:
     if point is None:
         return "완료봉 추가 확인 필요"
@@ -646,6 +666,23 @@ def actionable_display_levels(plan: Any, quote: Quote) -> dict[str, float | str 
     }
 
 
+def reference_display_levels(plan: Any) -> dict[str, float | str | bool]:
+    """Return non-actionable completed-chart levels while a forecast horizon warms up."""
+    reference = plan.diagnostics.get("reference_levels") or {}
+    required = ("entry", "target1", "target2", "support", "stop")
+    if not bool(reference.get("available")) or not all(isinstance(reference.get(key), (int, float)) for key in required):
+        return {"available": False, "basis": "완료 차트 구조 레벨 계산 대기"}
+    return {
+        "available": True,
+        "entry": float(reference["entry"]),
+        "target1": float(reference["target1"]),
+        "target2": float(reference["target2"]),
+        "support": float(reference["support"]),
+        "stop": float(reference["stop"]),
+        "basis": str(reference.get("basis") or "완료 차트 구조 참고값"),
+    }
+
+
 def regime_text(regime: Regime) -> str:
     return {
         Regime.UP: "상승 추세",
@@ -688,7 +725,7 @@ def dashboard_structure(item: dict[str, Any]) -> dict[str, str]:
     elif bool(plan.diagnostics.get("has_downward_forecast")):
         current_state = "하방 경로 관찰"
     elif not bool(plan.diagnostics.get("forecast_path_ready")):
-        current_state = "방향 재계산 중"
+        current_state = forecast_readiness_text(plan)
     return {
         "유형": kind,
         "큰 추세": trend_label,
@@ -1350,24 +1387,27 @@ def render_plan_fields(item: dict[str, Any]) -> None:
     structure = dashboard_structure(item)
     chart_aligned = bool(item.get("chart_aligned", True))
     levels = actionable_display_levels(plan, quote)
+    reference_levels = reference_display_levels(plan)
     show_price_structure = chart_aligned and bool(levels.get("available"))
-    target_1 = float(levels["target1"]) if show_price_structure else None
-    target_2 = float(levels["target2"]) if show_price_structure else None
-    support = float(levels["support"]) if show_price_structure else None
-    stop = float(levels["stop"]) if show_price_structure else None
+    show_reference_structure = chart_aligned and not show_price_structure and bool(reference_levels.get("available"))
+    display_levels = levels if show_price_structure else reference_levels if show_reference_structure else {}
+    target_1 = float(display_levels["target1"]) if display_levels else None
+    target_2 = float(display_levels["target2"]) if display_levels else None
+    support = float(display_levels["support"]) if display_levels else None
+    stop = float(display_levels["stop"]) if display_levels else None
     has_downward_forecast = bool(plan.diagnostics.get("has_downward_forecast"))
     forecast_path_ready = bool(plan.diagnostics.get("forecast_path_ready"))
     if chart_aligned and has_downward_forecast:
         observation_text = "하방 예상 · 상방 가격 추천 없음"
     elif chart_aligned and not forecast_path_ready:
-        observation_text = "방향 재계산 중"
+        observation_text = forecast_readiness_text(plan)
     else:
         observation_text = "현재가 위 목표 구조 재확인 중"
     st.markdown(structure_strip_html(structure), unsafe_allow_html=True)
     forecast_columns = st.columns(3)
     for column, minutes in zip(forecast_columns, (5, 15, 30)):
         point = forecast_point_for(plan, minutes) if chart_aligned else None
-        column.metric(f"{minutes}분 대표 예상", price_text(point.base if point else None))
+        column.metric(f"{minutes}분 대표 예상", price_text(point.base) if point else "준비 중")
         direction = forecast_direction_text(point)
         if point is not None and point.direction == Regime.DOWN:
             direction = f"▼ {direction}"
@@ -1379,19 +1419,21 @@ def render_plan_fields(item: dict[str, Any]) -> None:
             confidence_text = f" · 방향 신뢰도 {confidence:.0f}%" if isinstance(confidence, (int, float)) else ""
             column.caption(f"{direction} · {range_text}{confidence_text}")
         else:
-            column.caption(direction)
+            column.caption(forecast_wait_text(plan, minutes) if chart_aligned else "완료 1분봉 확인 중")
     prices = st.columns(2)
     prices[0].metric(
-        "추천 매수가",
-        price_text(float(levels["entry"])) if show_price_structure else (observation_text if chart_aligned else "완료 분봉 확인 중"),
+        "추천 매수가" if show_price_structure else "구조 참고 매수가",
+        price_text(float(display_levels["entry"])) if display_levels else (observation_text if chart_aligned else "완료 분봉 확인 중"),
     )
-    prices[1].metric("추천 매도가 1차", price_text(target_1) if show_price_structure else observation_text)
+    prices[1].metric("추천 매도가 1차" if show_price_structure else "구조 참고 목표 1차", price_text(target_1) if target_1 is not None else observation_text)
     exits = st.columns(3)
-    exits[0].metric("추천 매도가 2차", price_text(target_2) if show_price_structure else observation_text)
-    exits[1].metric("현재 차트 지지", price_text(support) if show_price_structure else observation_text)
-    exits[2].metric("손절가", price_text(stop) if show_price_structure else observation_text)
+    exits[0].metric("추천 매도가 2차" if show_price_structure else "구조 참고 목표 2차", price_text(target_2) if target_2 is not None else observation_text)
+    exits[1].metric("현재 차트 지지", price_text(support) if support is not None else observation_text)
+    exits[2].metric("손절가" if show_price_structure else "구조 참고 손절", price_text(stop) if stop is not None else observation_text)
     if show_price_structure:
         st.caption(str(levels["basis"]))
+    elif show_reference_structure:
+        st.caption(f"{reference_levels['basis']} · {forecast_readiness_text(plan)}")
 
 
 @st.fragment(run_every=60.0)
