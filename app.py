@@ -1289,7 +1289,12 @@ def visible_observation_cards(items: list[dict[str, Any]], display_limit: int = 
 
 
 def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, store: ValidationStore) -> dict[str, Any]:
-    """Recalculate from the selected bounded 1-minute source without KIS polling."""
+    """Recalculate structure only when a newer completed minute exists.
+
+    WebSocket price rendering is independent.  Rebuilding the full chart engine for
+    every visible card while its completed bar is unchanged only consumes CPU and
+    REST fallback capacity without changing an entry, target, stop or forecast.
+    """
     base_quote: Quote = item["quote"]
     quote = quote_with_live_tick(base_quote)
     if display_tick(base_quote.market, base_quote.symbol) is None:
@@ -1306,6 +1311,15 @@ def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, st
             bars = merge_completed_bar_frames(bars, recent)
         except (KISError, OSError, ValueError):
             pass
+    previous_marker = str(item["plan"].diagnostics.get("completed_bar_at") or "")
+    current_marker = str(bars.index[-2]) if len(bars) >= 2 else ""
+    if previous_marker and current_marker and previous_marker == current_marker:
+        return {
+            **item, "quote": quote, "bars": bars,
+            "validation_scored": 0,
+            "validation_recorded": False,
+            "forecast_validation_recorded": False,
+        }
     chart_aligned, chart_alignment_reason = completed_bar_alignment(quote, bars)
     cycle = cycle_store.get(quote.symbol, quote.market, quote.timestamp)
     previous_plan = item["plan"]
@@ -1316,9 +1330,9 @@ def live_card_snapshot(item: dict[str, Any], cost_pct: float, min_score: int, st
         calibration_samples=previous_plan.calibration_samples,
         calibration_expectancy_pct=previous_plan.diagnostics.get("calibration_expectancy_pct"),
     )
-    actionable_scored, actionable_recorded = record_and_score_live_validation(
-        store, plan, quote, bars, chart_aligned, float(cost_pct)
-    )
+    # Live cards are a manual-trading view.  Background collection runs only from
+    # the explicit capture-integrity route, keeping normal card latency isolated.
+    actionable_scored, actionable_recorded = 0, False
     forecast_scored, forecast_recorded = 0, False
     return {
         **item, "quote": quote, "bars": bars, "plan": plan,
@@ -2048,7 +2062,7 @@ current_session = "AUDIT_ONLY" if audit_only else market_session(market)
 # Start the lightweight 15-second boundary collector before any rank/quote/bar
 # analysis. Its fragment then continues independently while the main screen
 # performs slower candidate work.
-if not audit_only:
+if capture_integrity and not audit_only:
     capture_pending_forecast_paths(store, market.value)
 if audit_only:
     st.caption("감사 전용 모드 · 후보 분석·경계 수집·신규 표본 생성·사후 채점을 실행하지 않습니다.")
@@ -2084,7 +2098,7 @@ else:
                 f"정밀 분석 준비 · 거래량·거래대금 후보에서 {analysis_total}종목의 완료 분봉 구조를 확인합니다.",
                 expanded=False,
             )
-            analysis_preview = st.empty()
+            preview_slots = [st.empty() for _ in range(MAX_LIVE_CARDS)]
             for index, candidate in enumerate(visible_requests, start=1):
                 symbol = str(candidate["symbol"])
                 exchange = str(candidate.get("exchange") or ("NAS" if market == Market.US else ""))
@@ -2096,14 +2110,14 @@ else:
                     card["name"] = str(candidate.get("name") or symbol)
                     card["candidate_source"] = str(candidate.get("candidate_source") or "거래량 TOP100 ∪ 거래대금 TOP100")
                     cards.append(card)
-                    with analysis_preview.container():
-                        st.caption(f"정밀 분석 진행 {index}/{analysis_total} · 준비된 카드 {min(len(cards), MAX_LIVE_CARDS)}개를 먼저 표시합니다.")
-                        for preview in sorted(cards, key=mixed_card_priority, reverse=True)[:MAX_LIVE_CARDS]:
-                            preview_quote: Quote = preview["quote"]
+                    if index <= MAX_LIVE_CARDS:
+                        preview_quote: Quote = card["quote"]
+                        with preview_slots[index - 1].container():
+                            st.caption(f"정밀 분석 {index}/{analysis_total} · 즉시 미리보기")
                             with st.container(border=True):
-                                st.markdown(f"**{preview_quote.symbol} · {preview.get('name') or preview_quote.market.value}**")
-                                st.caption(f"{card_stage(preview)} · {observation_reason(preview) if card_stage(preview) == 'OBSERVATION' else '카드 조건 재확인'}")
-                                render_plan_fields(preview)
+                                st.markdown(f"**{preview_quote.symbol} · {card.get('name') or preview_quote.market.value}**")
+                                st.caption(f"{card_stage(card)} · {observation_reason(card) if card_stage(card) == 'OBSERVATION' else '카드 조건 재확인'}")
+                                render_plan_fields(card)
                     analysis_status.update(label=f"정밀 분석 진행 {index}/{analysis_total} · {symbol} 완료 분봉 구조 확인", state="running")
                 except KISError as exc:
                     errors.append(f"{symbol}: {str(exc)[:180]}")
@@ -2111,7 +2125,8 @@ else:
                     errors.append(f"{symbol}: {type(exc).__name__}")
                 except Exception as exc:
                     errors.append(f"{symbol}: {type(exc).__name__}")
-            analysis_preview.empty()
+            for slot in preview_slots:
+                slot.empty()
             analysis_status.update(label=f"정밀 분석 완료 · {len(cards)}/{analysis_total}종목", state="complete")
     except KISError:
         st.error("실시간 후보를 가져오지 못했습니다. 잠시 뒤 화면이 자동으로 다시 확인합니다.")
@@ -2152,7 +2167,7 @@ realtime_hub.configure(
     for card in analysis_cards
 )
 
-if candidates and event_store.configured and not audit_only:
+if candidates and event_store.configured and capture_integrity and not audit_only:
     run_free_validation_batch(market.value, candidates, float(cost_pct), int(min_score), store, capture_integrity)
 elif audit_only:
     st.caption("감사 전용 모드 · 신규 검증 표본 생성·사후 채점·자동 기록을 실행하지 않습니다.")

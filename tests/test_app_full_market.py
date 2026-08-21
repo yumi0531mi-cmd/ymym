@@ -166,13 +166,33 @@ def test_live_card_snapshot_uses_one_page_refresh_when_realtime_tick_is_missing(
     assert "load_recent_completed_bars" in live_card_snapshot.__doc__ or "load_recent_completed_bars" in APP_PATH.read_text(encoding="utf-8").split("def live_card_snapshot", 1)[1].split("def render_plan_fields", 1)[0]
 
 
-def test_cold_candidate_analysis_renders_prepared_cards_before_all_eight_complete():
+def test_cold_candidate_analysis_renders_one_prepared_card_per_slot_before_all_eight_complete():
     source = APP_PATH.read_text(encoding="utf-8")
 
     candidate_loop = source.index("for index, candidate in enumerate(visible_requests, start=1):")
-    incremental_preview = source.index("with analysis_preview.container():")
-    final_preview_clear = source.index("analysis_preview.empty()")
-    assert candidate_loop < incremental_preview < final_preview_clear
+    preview_slots = source.index("preview_slots = [st.empty() for _ in range(MAX_LIVE_CARDS)]")
+    incremental_preview = source.index("with preview_slots[index - 1].container():")
+    final_preview_clear = source.index("for slot in preview_slots:")
+    assert preview_slots < candidate_loop < incremental_preview < final_preview_clear
+
+
+def test_normal_scanner_keeps_background_collection_off_and_integrity_route_keeps_it_explicit():
+    source = APP_PATH.read_text(encoding="utf-8")
+
+    capture_fragment_guard = source.index("if capture_integrity and not audit_only:\n    capture_pending_forecast_paths")
+    batch_guard = source.index("if candidates and event_store.configured and capture_integrity and not audit_only:")
+
+    assert capture_fragment_guard < batch_guard
+
+
+def test_live_card_snapshot_skips_engine_rebuild_without_a_new_completed_bar():
+    source = APP_PATH.read_text(encoding="utf-8")
+
+    previous_marker = source.index('previous_marker = str(item["plan"].diagnostics.get("completed_bar_at") or "")')
+    same_completed_bar_return = source.index("if previous_marker and current_marker and previous_marker == current_marker:", previous_marker)
+    engine_rebuild = source.index("plan = analyze(", same_completed_bar_return)
+
+    assert previous_marker < same_completed_bar_return < engine_rebuild
 
 
 def test_observation_summary_rows_use_card_price_levels_and_forecast_ranges():
