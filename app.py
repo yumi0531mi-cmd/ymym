@@ -1575,16 +1575,17 @@ def capture_integrity_status_counts(store: ValidationStore, market_value: str) -
     }
 
 
-def render_versioned_forecast_summary(store: ValidationStore, market_value: str) -> None:
+def render_versioned_forecast_summary(store: ValidationStore, market_value: str, version: str | None = None) -> None:
     """Display performance only after a fixed-version cohort has enough complete paths."""
-    summary = store.versioned_validation_summary(APP_VERSION, market_value)
+    report_version = version or APP_VERSION
+    summary = store.versioned_validation_summary(report_version, market_value)
     forecast = summary["forecast"]
     complete = int(forecast["complete_paths"])
     if complete < 20:
-        st.caption(f"1차 성능 집계 대기 · 같은 v{APP_VERSION} 완료 표본 {complete}/20 · DATA_MISSING은 성능 통계에서 제외")
+        st.caption(f"1차 성능 집계 대기 · 같은 v{report_version} 완료 표본 {complete}/20 · DATA_MISSING은 성능 통계에서 제외")
         return
     st.subheader(f"고정 버전 1차 실측 요약 · 완료 {complete}건")
-    repeated_failure = store.versioned_repeated_failure_insight(APP_VERSION, market_value)
+    repeated_failure = store.versioned_repeated_failure_insight(report_version, market_value)
     if repeated_failure is not None:
         st.warning(
             f"반복 저적중 구간: {repeated_failure['dimension']} · {repeated_failure['구분']} · "
@@ -2168,6 +2169,7 @@ if capture_integrity and not audit_only:
     render_data_missing_forecast_cases(store, market.value)
 
 if audit_only:
+    render_versioned_forecast_summary(store, market.value, version=audit_version)
     render_versioned_forecast_trace(store, market.value, audit_version)
     st.stop()
 

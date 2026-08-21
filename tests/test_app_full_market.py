@@ -129,6 +129,15 @@ def test_capture_integrity_renders_pending_and_missing_rows_before_card_sections
     assert integrity_counts < integrity_pending < integrity_missing < card_sections
 
 
+def test_audit_version_renders_the_same_versioned_performance_summary_before_trace():
+    source = APP_PATH.read_text(encoding="utf-8")
+
+    audit_summary = source.index("render_versioned_forecast_summary(store, market.value, version=audit_version)")
+    audit_trace = source.index("render_versioned_forecast_trace(store, market.value, audit_version)")
+
+    assert audit_summary < audit_trace
+
+
 def test_validation_batch_keeps_its_initial_candidate_snapshot_when_rankings_refresh():
     from app import free_validation_batch_state
 
